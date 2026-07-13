@@ -1,0 +1,7 @@
+opencv-python
+mediapipe
+numpy
+Pillow
+openai
+PyQt5
+python-dotenv
