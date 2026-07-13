@@ -1,14 +1,18 @@
 # -*- coding: utf-8 -*-
 """
 pose_tracker.py
-v0.1 基础视觉捕捉阶段脚本
+v0.2 体育力学诊断引擎阶段脚本（在 v0.1 基础视觉捕捉之上迭代）
 
 功能说明：
     1. 使用 OpenCV 打开电脑默认摄像头，读取实时视频流；
     2. 使用 Google MediaPipe 最新的 Tasks API
        （mediapipe.tasks.python.vision.PoseLandmarker）对每一帧画面进行人体姿态检测；
     3. 检测得到人体 33 个关键点后，使用 OpenCV 手动将骨架连线实时绘制在画面上；
-    4. 按下键盘上的 'q' 键即可退出程序并关闭窗口。
+    4. 【v0.2 新增】提取右髋(24)-右膝(26)-右踝(28) 三点坐标，用通用的空间向量
+       夹角公式实时计算右膝关节屈曲角度，并按文档规定的三级容错阈值
+       （Green/Yellow/Red）判定当前动作质量，将结果以颜色骨骼连线 + 大号文字
+       的形式实时叠加渲染在画面上；
+    5. 按下键盘上的 'q' 键即可退出程序并关闭窗口。
 
 【重要说明】
     新版 mediapipe（0.10.x 及以上）已经彻底移除了 `mp.solutions.pose` 这种旧写法，
@@ -21,14 +25,16 @@ v0.1 基础视觉捕捉阶段脚本
     并下载 pose_landmarker_full.task（对应旧版 model_complexity=1，
     即精度与速度均衡的"full"模型）到脚本所在目录下。
 
-这是整个"小学足球AI可视化反馈系统"五阶段开发蓝图中的第一步：
-跑通本地摄像头 + MediaPipe Pose 实时绘制 33 点火柴人骨架，建立基础开发环境。
+这是整个"小学足球AI可视化反馈系统"五阶段开发蓝图中的第二步：
+在 v0.1 跑通的摄像头 + 33 点骨架基础上，编写向量数学计算模块，
+实时输出膝关节角度并渲染红/黄/绿三色容错框。
 """
 
 import os
 import urllib.request
 
 import cv2
+import numpy as np
 import mediapipe as mp
 from mediapipe.tasks import python as mp_tasks_python
 from mediapipe.tasks.python import vision as mp_vision
@@ -118,6 +124,91 @@ POSE_CONNECTIONS = [
 LANDMARK_COLOR = (0, 255, 0)    # 关键点：绿色
 CONNECTION_COLOR = (255, 255, 255)  # 连线：白色
 
+# --------------------------------------------------------------------------
+# 【v0.2 新增】体育力学诊断引擎：右膝关节屈曲角度计算与三级容错阈值判定
+# --------------------------------------------------------------------------
+
+# MediaPipe 33 个关键点中，右腿三个关键点的编号：
+#   24 = 右髋（RIGHT_HIP）
+#   26 = 右膝（RIGHT_KNEE）
+#   28 = 右踝（RIGHT_ANKLE）
+RIGHT_HIP_IDX = 24
+RIGHT_KNEE_IDX = 26
+RIGHT_ANKLE_IDX = 28
+
+# 三种诊断状态对应的 BGR 颜色（用于骨骼连线染色 + 文字提示）
+COLOR_GREEN = (0, 255, 0)      # 达标：绿色
+COLOR_YELLOW = (0, 255, 255)   # 接近：黄色
+COLOR_RED = (0, 0, 255)        # 错误：红色
+
+
+def calculate_angle(a, b, c):
+    """通用的空间夹角计算函数：给定三个空间坐标点 a、b、c，计算出以 b 为顶点、
+    由 a→b 和 c→b 两条向量夹出的角度（单位：度）。
+
+    这是一个纯数学函数，不依赖 MediaPipe 或 OpenCV，可以用来计算人体任意
+    三个关键点组成的关节角度（例如膝关节角度：a=髋，b=膝，c=踝）。
+
+    参数：
+        a, b, c：三个坐标点，可以是 (x, y) 二维坐标，也可以是 (x, y, z) 三维坐标，
+                 类型可以是列表、元组或 numpy 数组。
+
+    返回：
+        角度值（0~180 之间的浮点数，单位：度）。
+    """
+    # 统一转换成 numpy 数组，方便做向量运算
+    a = np.array(a, dtype=np.float64)
+    b = np.array(b, dtype=np.float64)
+    c = np.array(c, dtype=np.float64)
+
+    # 构造以 b（关节顶点）为起点，分别指向 a 和 c 的两个向量
+    vector_ba = a - b
+    vector_bc = c - b
+
+    # 用向量点积公式反推夹角：
+    #   cos(θ) = (ba · bc) / (|ba| * |bc|)
+    dot_product = np.dot(vector_ba, vector_bc)
+    norm_product = np.linalg.norm(vector_ba) * np.linalg.norm(vector_bc)
+
+    # 极端情况下（两点重合导致向量长度为 0）避免除以零
+    if norm_product == 0:
+        return 0.0
+
+    cos_angle = dot_product / norm_product
+    # 由于浮点数计算误差，cos_angle 可能会略微超出 [-1, 1] 的合法范围，
+    # 这里用 np.clip 做一次安全裁剪，避免 arccos 报错
+    cos_angle = np.clip(cos_angle, -1.0, 1.0)
+
+    # arccos 得到的是弧度（radians），再转换成角度（degrees）
+    angle_rad = np.arccos(cos_angle)
+    angle_deg = np.degrees(angle_rad)
+
+    return angle_deg
+
+
+def judge_knee_status(angle):
+    """根据文档规定的三级容错阈值，判定当前膝关节角度所处的状态。
+
+    判定规则（严格按照 project_plan.md 中"核心生物力学诊断参数"章节）：
+        Green（达标）：140° <= 角度 <= 160°
+        Yellow（接近）：130° <= 角度 < 140° 或 160° < 角度 <= 170°
+        Red（错误）：角度 < 130° 或 角度 > 170°
+
+    参数：
+        angle：当前实时计算出的膝关节屈曲角度（度）
+
+    返回：
+        一个二元组 (status_text, status_color)：
+            status_text：字符串 "Green" / "Yellow" / "Red"
+            status_color：对应的 BGR 颜色元组，用于绘制文字和骨骼连线
+    """
+    if 140 <= angle <= 160:
+        return "Green", COLOR_GREEN
+    elif (130 <= angle < 140) or (160 < angle <= 170):
+        return "Yellow", COLOR_YELLOW
+    else:
+        return "Red", COLOR_RED
+
 
 def draw_pose_landmarks(image, pose_landmarks_list):
     """手动使用 OpenCV 把检测到的关键点和骨架连线画在画面上（不依赖 mp.solutions）。
@@ -141,6 +232,70 @@ def draw_pose_landmarks(image, pose_landmarks_list):
         for landmark in single_person_landmarks:
             center = (int(landmark.x * width), int(landmark.y * height))
             cv2.circle(image, center, 4, LANDMARK_COLOR, -1)
+
+
+def diagnose_and_draw_right_knee(image, single_person_landmarks):
+    """【v0.2 核心新增】提取右腿三点坐标，计算右膝角度，并把诊断结果渲染到画面上。
+
+    具体做法：
+        1. 从 33 个关键点中取出右髋(24)、右膝(26)、右踝(28) 三个点；
+        2. 调用 calculate_angle() 算出右膝关节的实时屈曲角度；
+        3. 调用 judge_knee_status() 按三级容错阈值判定 Green/Yellow/Red；
+        4. 用 cv2.line 把"右髋-右膝"和"右膝-右踝"这两根骨骼连线，重新画成
+           对应的红/黄/绿色，覆盖掉前面 draw_pose_landmarks 画的白色默认连线；
+        5. 在画面左上角用大号字体显示当前角度数值与状态文字。
+
+    参数：
+        image：要绘制的目标 BGR 画面（会被直接就地修改）
+        single_person_landmarks：某一个人的 33 个关键点（归一化坐标 0~1）
+
+    返回：
+        (angle, status_text)：本次计算出的角度值与状态文字，方便调用方做其他扩展
+        （例如后续 v0.3 阶段把这个结果传给 AIGC 转译模块）
+    """
+    height, width = image.shape[:2]
+
+    hip = single_person_landmarks[RIGHT_HIP_IDX]
+    knee = single_person_landmarks[RIGHT_KNEE_IDX]
+    ankle = single_person_landmarks[RIGHT_ANKLE_IDX]
+
+    # 用 (x, y, z) 三维归一化坐标计算角度，z 轴（深度信息）能让角度计算
+    # 在身体侧对镜头等场景下更加准确，不会因为只看二维投影而失真
+    hip_point = (hip.x, hip.y, hip.z)
+    knee_point = (knee.x, knee.y, knee.z)
+    ankle_point = (ankle.x, ankle.y, ankle.z)
+
+    # 计算右膝关节屈曲角度（以膝盖为顶点，髋-膝-踝三点夹角）
+    knee_angle = calculate_angle(hip_point, knee_point, ankle_point)
+
+    # 按三级容错阈值判定当前状态与对应颜色
+    status_text, status_color = judge_knee_status(knee_angle)
+
+    # 把归一化坐标换算成像素坐标，用于绘制
+    hip_px = (int(hip.x * width), int(hip.y * height))
+    knee_px = (int(knee.x * width), int(knee.y * height))
+    ankle_px = (int(ankle.x * width), int(ankle.y * height))
+
+    # 【重点 UI 修改】用诊断出的颜色重新画一遍右腿的两根骨骼连线，
+    # 线条加粗（厚度 6），盖住 draw_pose_landmarks 之前画的白色细线，
+    # 让学生一眼就能看出自己右腿姿态是"对/接近/错"
+    cv2.line(image, hip_px, knee_px, status_color, 6)
+    cv2.line(image, knee_px, ankle_px, status_color, 6)
+
+    # 在左上角用大号字体实时显示角度数值与状态文字，颜色与状态保持一致
+    angle_text = f"Right Knee Angle: {knee_angle:.1f} deg"
+    status_line = f"Status: {status_text}"
+
+    cv2.putText(
+        image, angle_text, (20, 50),
+        cv2.FONT_HERSHEY_SIMPLEX, 1.2, status_color, 3, cv2.LINE_AA,
+    )
+    cv2.putText(
+        image, status_line, (20, 100),
+        cv2.FONT_HERSHEY_SIMPLEX, 1.4, status_color, 3, cv2.LINE_AA,
+    )
+
+    return knee_angle, status_text
 
 
 # --------------------------------------------------------------------------
@@ -199,8 +354,12 @@ while cap.isOpened():
     if results.pose_landmarks:
         draw_pose_landmarks(frame, results.pose_landmarks)
 
+        # 【v0.2 新增】num_poses=1，最多只有一个人，取第一个人的 33 个关键点，
+        # 提取右腿三点坐标、计算右膝角度，并把红/黄/绿诊断结果实时叠加到画面上
+        diagnose_and_draw_right_knee(frame, results.pose_landmarks[0])
+
     # 将处理好（画上骨架）的画面显示在一个窗口中
-    cv2.imshow("Pose Tracker - v0.1 (press 'q' to quit)", frame)
+    cv2.imshow("Pose Tracker - v0.2 (press 'q' to quit)", frame)
 
     # cv2.waitKey(1) 会等待 1 毫秒，检测是否有键盘按键被按下
     # 0xFF 是为了兼容不同操作系统的按键编码写法
