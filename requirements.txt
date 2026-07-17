@@ -5,3 +5,9 @@ Pillow
 openai
 PyQt5
 python-dotenv
+python-docx
+fastapi
+uvicorn[standard]
+python-multipart
+pandas
+openpyxl
