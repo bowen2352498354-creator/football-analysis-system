@@ -6,7 +6,6 @@ import {
   Square,
   ScanFace,
   Bone,
-  Sparkles,
   Camera,
   FileVideo,
   UploadCloud,
@@ -31,6 +30,9 @@ import {
   getSmoothAngleBackground,
   LEVEL_COLOR_MAP,
   LEVEL_LABEL_MAP,
+  MOCK_RADAR_SCORES,
+  MOCK_RADAR_SCORES_COMPARE,
+  MOCK_SCORE_DETAIL_V31,
 } from '../mockData'
 import type {
   AnalysisStatus,
@@ -41,6 +43,12 @@ import type {
   ThresholdLevel,
   VideoSourceMode,
 } from '../types'
+import MetricPanel from './MetricPanel'
+import SynchronizedVideoWorkspace, {
+  type SyncVelocityPoint,
+} from './SynchronizedVideoWorkspace'
+import AIAssistantPanel from './AIAssistantPanel'
+import { TRAFFIC_LIGHT } from '../theme/trafficLight'
 
 interface RealtimeWorkspaceProps {
   /** 来自 Navbar 的全局教学环境设置（学校 + 班级/组别），本工作台只读消费 */
@@ -103,18 +111,18 @@ interface WordSaveToastState {
 
 let wordSaveToastSeq = 0
 
-/** 三级阈值命中次数柱状条对应的背景色类名 */
+/** 三级阈值命中次数柱状条对应的背景色类名（对齐 Traffic-Light） */
 const HIT_BAR_BG: Record<ThresholdLevel, string> = {
-  green: 'bg-emerald-400',
-  yellow: 'bg-amber-400',
-  red: 'bg-rose-400',
+  green: 'bg-[var(--GREEN_OPTIMAL)]',
+  yellow: 'bg-[var(--YELLOW_APPROACHING)]',
+  red: 'bg-[var(--RED_DEVIATED)]',
 }
 
 /** 环形图各分段对应的描边颜色（十六进制，供 SVG stroke 使用） */
 const RING_STROKE: Record<ThresholdLevel, string> = {
-  green: '#34d399',
-  yellow: '#fbbf24',
-  red: '#fb7185',
+  green: TRAFFIC_LIGHT.GREEN_OPTIMAL,
+  yellow: TRAFFIC_LIGHT.YELLOW_APPROACHING,
+  red: TRAFFIC_LIGHT.RED_DEVIATED,
 }
 
 /** 运行状态展示文案与颜色映射 */
@@ -131,27 +139,6 @@ function statusToLevel(status: BackendStatus | null): ThresholdLevel | null {
   if (status === 'Yellow') return 'yellow'
   if (status === 'Red') return 'red'
   return null
-}
-
-/** 「实时动力链角速度监控」单个采样点：客户端接收时间戳 + 后端计算出的角速度值 */
-interface VelocitySample {
-  t: number
-  v: number
-}
-
-/** 波形图展示的滚动时间窗口长度（毫秒），对应需求中的「5 秒时序波形」 */
-const VELOCITY_WINDOW_MS = 5000
-
-/** 波形纵轴裁剪范围（deg/s）：超出该范围的偶发异常尖峰会被裁剪，避免压扁整张图 */
-const VELOCITY_CLAMP_RANGE = 420
-
-/** 动平衡稳定指数分级展示文案与颜色（对应右上角「XX/100 优秀」徽标） */
-function getStabilityMeta(index: number | null): { text: string; className: string } {
-  if (index === null) return { text: '--/100', className: 'text-white/40' }
-  if (index >= 90) return { text: `${index}/100 优秀`, className: 'text-emerald-300' }
-  if (index >= 75) return { text: `${index}/100 良好`, className: 'text-sky-300' }
-  if (index >= 60) return { text: `${index}/100 一般`, className: 'text-amber-300' }
-  return { text: `${index}/100 待提升`, className: 'text-rose-300' }
 }
 
 /**
@@ -186,13 +173,19 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
   const [backendStatus, setBackendStatus] = useState<BackendStatus | null>(null)
 
   /* ---------------------------- 实时动力链角速度监控状态 ---------------------------- */
-  const [velocityHistory, setVelocityHistory] = useState<VelocitySample[]>([])
+  /** 全程角速度轨迹（frame_index 递增），供 Kinovea 联动波形图使用 */
+  const [omegaSeries, setOmegaSeries] = useState<SyncVelocityPoint[]>([])
+  const omegaFrameRef = useRef(0)
   const [stabilityIndex, setStabilityIndex] = useState<number | null>(null)
+  /** 本地视频 blob URL，供 HTML5 Video 与波形图毫秒级 scrub */
+  const [localVideoObjectUrl, setLocalVideoObjectUrl] = useState<string | null>(null)
 
   /* ---------------------------- 诊断统计与最终报告状态 ---------------------------- */
   const [hitStats, setHitStats] = useState<ThresholdHitStats>({ green: 0, yellow: 0, red: 0 })
   const [finalReport, setFinalReport] = useState<FinalDiagnosisReport | null>(null)
   const [isGeneratingReport, setIsGeneratingReport] = useState(false)
+  /** 最近一次分析会话 ID，供手绘批注归档关联 */
+  const [lastSessionId, setLastSessionId] = useState<string | null>(null)
 
   /* ---------------------------- 本地归档 + Word 报告生成状态 ---------------------------- */
   const [wordSaveStatus, setWordSaveStatus] = useState<WordSaveStatus>('idle')
@@ -207,6 +200,20 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
   const { displayText: reportDisplayText, isDone: isReportDone } = useTypewriter(finalReport?.fullText ?? '', 22)
 
   const totalAttempts = hitStats.green + hitStats.yellow + hitStats.red
+
+  /** 报告返回的触球窗口内索引；分析中仍用全程绝对帧 */
+  const impactIndexInWindow = useMemo(() => {
+    const idx = finalReport?.impact_index_in_window ?? finalReport?.impactIndexInWindow
+    return typeof idx === 'number' && Number.isFinite(idx) ? idx : null
+  }, [finalReport])
+
+  /** 窗口序列第 0 帧对应的绝对视频帧 = t_impact - impact_index_in_window */
+  const seriesFrameOffset = useMemo(() => {
+    if (impactIndexInWindow === null) return 0
+    const tAbs = finalReport?.t_impact ?? finalReport?.tImpact
+    if (typeof tAbs !== 'number' || !Number.isFinite(tAbs)) return 0
+    return Math.max(0, Math.round(tAbs) - Math.round(impactIndexInWindow))
+  }, [finalReport, impactIndexInWindow])
 
   /**
    * 统一的 WebSocket 消息处理：每一条推理帧都会实时更新角度/状态/画面，
@@ -239,18 +246,12 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
         }
       }
 
-      // 实时动力链角速度监控：把新样本追加进滚动窗口，并淘汰掉 5 秒之前的旧样本。
-      // 【容错防呆】额外用 Number.isFinite 校验，避免后端在极端情况下（例如第一帧
-      // 尚未计算出角速度、或除法结果出现 NaN/Infinity）推来非法数值，导致后续
-      // SVG 波形图渲染出无法解析的坐标，静默影响整张卡片渲染。
+      // Kinovea 联动：累积全程角速度时序（横轴 = frame_index）
       if (typeof message.angular_velocity === 'number' && Number.isFinite(message.angular_velocity)) {
-        const now = Date.now()
         const nextVelocity = message.angular_velocity
-        setVelocityHistory((prev) => {
-          const next = [...prev, { t: now, v: nextVelocity }]
-          const cutoff = now - VELOCITY_WINDOW_MS
-          return next.filter((sample) => sample.t >= cutoff)
-        })
+        const frameIndex = omegaFrameRef.current
+        omegaFrameRef.current = frameIndex + 1
+        setOmegaSeries((prev) => [...prev, { frame_index: frameIndex, omega: nextVelocity }])
       }
       if (typeof message.stability_index === 'number' && Number.isFinite(message.stability_index)) {
         setStabilityIndex(message.stability_index)
@@ -258,10 +259,16 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
       return
     }
 
+    if (message.type === 'started') {
+      setLastSessionId(message.session_id)
+      return
+    }
+
     if (message.type === 'stopped') {
       wsRef.current?.close()
       wsRef.current = null
       setIsConnected(false)
+      setLastSessionId(message.session_id)
       void fetchGeneratedReport(message.session_id)
       return
     }
@@ -295,6 +302,17 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
       const report = (await response.json()) as FinalDiagnosisReport & { hitStats: ThresholdHitStats }
       setFinalReport(report)
       setHitStats(report.hitStats)
+
+      // Sprint 1：用 Action ROI 鞭打发力窗口替换实时累积的全程序列
+      const windowSeries = report.time_series_velocity ?? report.timeSeriesVelocity
+      if (Array.isArray(windowSeries) && windowSeries.length > 0) {
+        setOmegaSeries(
+          windowSeries.map((omega, index) => ({
+            frame_index: index,
+            omega: typeof omega === 'number' && Number.isFinite(omega) ? omega : 0,
+          })),
+        )
+      }
     } catch (error) {
       setConnectionError(error instanceof Error ? error.message : '生成诊断报告失败，请检查后端服务是否已启动。')
     } finally {
@@ -310,6 +328,19 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
       wsRef.current = null
     }
   }, [])
+
+  /** 本地视频文件 → Object URL，供 HTML5 Video 与波形图 scrub 同步 */
+  useEffect(() => {
+    if (!localVideoFile) {
+      setLocalVideoObjectUrl(null)
+      return
+    }
+    const url = URL.createObjectURL(localVideoFile)
+    setLocalVideoObjectUrl(url)
+    return () => {
+      URL.revokeObjectURL(url)
+    }
+  }, [localVideoFile])
 
   /**
    * 【全局归档总闸】只要 Navbar 全局环境设置中的「本地落盘归档」开关处于开启状态，
@@ -357,7 +388,8 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
     setKneeAngle(null)
     setBackendStatus(null)
     setFrameImage(null)
-    setVelocityHistory([])
+    setOmegaSeries([])
+    omegaFrameRef.current = 0
     setStabilityIndex(null)
     setWordSaveStatus('idle')
 
@@ -445,8 +477,19 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
           prescription: finalReport.prescription,
           generatedAt: finalReport.generatedAt,
           impactFrameImage: finalReport.impactFrameImage ?? null,
+          heatmapBase64:
+            finalReport.heatmap_base64 ??
+            finalReport.heatmapBase64 ??
+            finalReport.scoreDetail?.heatmap_base64 ??
+            null,
+          heatmap_base64:
+            finalReport.heatmap_base64 ??
+            finalReport.heatmapBase64 ??
+            finalReport.scoreDetail?.heatmap_base64 ??
+            null,
           hitStats: finalReport.hitStats ?? hitStats,
           kneeFlexionAngle: finalReport.avgKneeAngle ?? null,
+          scoreDetail: finalReport.scoreDetail ?? null,
         }),
       })
       const data = (await response.json()) as {
@@ -476,16 +519,15 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
     (videoSourceMode === 'file' && (!uploadedVideoPath || isUploading))
 
   return (
-    <div className="mx-auto flex max-w-7xl flex-col gap-6 px-4 py-6 sm:px-6 lg:px-8">
-      {/* ============================ 顶栏控制区 ============================ */}
-      <section className="flex flex-col gap-4 rounded-3xl border border-white/10 bg-white/5 p-4 backdrop-blur-xl sm:flex-row sm:flex-wrap sm:items-center sm:justify-between">
-        <div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center sm:gap-3">
-          {/* 视频源分段控制器 */}
-          <div className="inline-flex items-center gap-1 self-start rounded-full bg-black/30 p-1">
+    <div className="flex h-full min-h-0 flex-col overflow-hidden">
+      {/* ============================ 顶栏控制区（紧凑工具条） ============================ */}
+      <section className="workbench-toolbar workbench-card mx-3 mt-2 flex flex-shrink-0 flex-col gap-2 px-3 py-2 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between">
+        <div className="flex min-w-0 flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center sm:gap-2">
+          <div className="inline-flex items-center gap-1 self-start rounded-full bg-slate-900/60 p-0.5">
             {(
               [
                 { id: 'webcam' as VideoSourceMode, label: '实时摄像头', icon: Camera },
-                { id: 'file' as VideoSourceMode, label: '本地视频分析', icon: FileVideo },
+                { id: 'file' as VideoSourceMode, label: '本地视频', icon: FileVideo },
               ] as const
             ).map((option) => {
               const active = option.id === videoSourceMode
@@ -496,14 +538,14 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
                   type="button"
                   disabled={isAnalyzing}
                   onClick={() => setVideoSourceMode(option.id)}
-                  className={`relative rounded-full px-3.5 py-2 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50 sm:text-sm ${
-                    active ? 'text-white' : 'text-white/50 hover:text-white/80'
+                  className={`relative rounded-full px-2.5 py-1.5 text-[11px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50 sm:text-xs ${
+                    active ? 'text-slate-100' : 'text-slate-400 hover:text-slate-200'
                   }`}
                 >
                   {active && (
                     <motion.span
                       layoutId="video-source-pill"
-                      className="absolute inset-0 rounded-full bg-emerald-500/25 ring-1 ring-emerald-400/40"
+                      className="absolute inset-0 rounded-full bg-[color-mix(in_srgb,var(--GREEN_OPTIMAL)_22%,transparent)] ring-1 ring-[color-mix(in_srgb,var(--GREEN_OPTIMAL)_40%,transparent)]"
                       transition={{ type: 'spring', stiffness: 400, damping: 32 }}
                     />
                   )}
@@ -518,28 +560,27 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
             })}
           </div>
 
-          {/* 本地 MP4 文件选择胶囊：仅在「本地视频分析」模式下显示，选中文件后会立即真实上传到后端 */}
           {videoSourceMode === 'file' && (
             <>
               <button
                 type="button"
                 disabled={isAnalyzing || isUploading}
                 onClick={() => fileInputRef.current?.click()}
-                className="flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-4 py-2 text-xs text-white/70 backdrop-blur-xl transition hover:bg-white/10 active:scale-95 disabled:cursor-not-allowed disabled:opacity-50 sm:text-sm"
+                className="flex items-center gap-2 rounded-full border border-slate-700 bg-slate-900/40 px-3 py-1.5 text-[11px] text-slate-300 transition hover:bg-slate-800 active:scale-95 disabled:cursor-not-allowed disabled:opacity-50 sm:text-xs"
               >
                 <span className="inline-flex flex-shrink-0">
                   {isUploading ? (
-                    <Loader2 className="h-4 w-4 animate-spin text-sky-400" />
+                    <Loader2 className="h-3.5 w-3.5 animate-spin text-sky-400" />
                   ) : (
-                    <UploadCloud className="h-4 w-4 text-sky-400" />
+                    <UploadCloud className="h-3.5 w-3.5 text-sky-400" />
                   )}
                 </span>
-                <span className="max-w-[10rem] truncate sm:max-w-[16rem]">
+                <span className="max-w-[9rem] truncate sm:max-w-[14rem]">
                   {isUploading
-                    ? '正在上传至后端…'
+                    ? '上传中…'
                     : localVideoFile
-                      ? `${localVideoFile.name}${uploadedVideoPath ? '（已上传）' : ''}`
-                      : '点击选择本地 MP4 文件（如 test_video.mp4）'}
+                      ? `${localVideoFile.name}${uploadedVideoPath ? ' ✓' : ''}`
+                      : '选择本地 MP4'}
                 </span>
               </button>
               <input
@@ -552,385 +593,318 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
             </>
           )}
 
-          {/* 受试者编号/姓名自由输入：100% 自定义文本，支持任意格式（如 "NO. 07" / "实验测试张同学"），
-              全程实时透传给全页各卡片与最终诊断报告，不做任何格式限制或校验 */}
-          <div className="flex items-center gap-2 rounded-2xl border border-white/10 bg-white/5 px-4 py-2 backdrop-blur-xl">
-            <User className="h-4 w-4 flex-shrink-0 text-white/40" />
+          <div className="flex items-center gap-2 rounded-xl border border-slate-700 bg-slate-900/40 px-3 py-1.5">
+            <User className="h-3.5 w-3.5 flex-shrink-0 text-slate-500" />
             <input
               type="text"
               value={studentNumber}
               onChange={(e) => setStudentNumber(e.target.value)}
-              placeholder='自由填写编号/姓名，如 "NO. 07"'
-              className="w-36 bg-transparent text-sm text-white outline-none placeholder:text-white/30 sm:w-48"
+              placeholder='编号/姓名'
+              className="w-28 bg-transparent text-xs text-slate-100 outline-none placeholder:text-slate-500 sm:w-40"
             />
           </div>
+
+          <span className={`text-[11px] ${STATUS_META[analysisStatus].className}`}>
+            {STATUS_META[analysisStatus].label}
+          </span>
         </div>
 
-        {/* 操作主按钮 */}
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-2">
           {!isAnalyzing && analysisStatus !== 'stopping' ? (
             <button
               type="button"
               onClick={handleStart}
               disabled={isStartDisabled}
               title={isStartDisabled ? '请先选择并等待本地 MP4 文件上传完成' : undefined}
-              className="flex items-center gap-2 rounded-full bg-emerald-500 px-5 py-2.5 text-sm font-semibold text-black transition hover:bg-emerald-400 active:scale-95 disabled:cursor-not-allowed disabled:bg-white/10 disabled:text-white/30"
+              className="flex items-center gap-1.5 rounded-full bg-[var(--GREEN_OPTIMAL)] px-4 py-1.5 text-xs font-semibold text-slate-950 transition hover:brightness-110 active:scale-95 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-400"
             >
-              <span className="inline-flex flex-shrink-0">
-                <Play className="h-4 w-4" />
-              </span>
-              开始分析 / 训练
+              <Play className="h-3.5 w-3.5" />
+              开始分析
             </button>
           ) : (
             <button
               type="button"
               onClick={handleStop}
               disabled={analysisStatus === 'stopping'}
-              className="flex items-center gap-2 rounded-full bg-rose-500 px-5 py-2.5 text-sm font-semibold text-white transition hover:bg-rose-400 active:scale-95 disabled:cursor-not-allowed disabled:opacity-60"
+              className="flex items-center gap-1.5 rounded-full bg-[var(--RED_DEVIATED)] px-4 py-1.5 text-xs font-semibold text-white transition hover:brightness-110 active:scale-95 disabled:cursor-not-allowed disabled:opacity-60"
             >
-              <span className="inline-flex flex-shrink-0">
-                {analysisStatus === 'stopping' ? (
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                ) : (
-                  <Square className="h-4 w-4" />
-                )}
-              </span>
+              {analysisStatus === 'stopping' ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Square className="h-3.5 w-3.5" />
+              )}
               结束分析
             </button>
           )}
         </div>
       </section>
 
-      {/* 后端连接错误提示条 */}
-      {connectionError && (
-        <div className="flex items-center gap-2 rounded-2xl border border-rose-400/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">
-          <span className="inline-flex flex-shrink-0">
-            <AlertTriangle className="h-4 w-4" />
-          </span>
-          <p>{connectionError}</p>
+      {(connectionError || diagnosticNotice) && (
+        <div className="mx-3 mt-2 flex flex-shrink-0 flex-col gap-1.5">
+          {connectionError && (
+            <div className="flex items-center gap-2 rounded-xl border border-[color-mix(in_srgb,var(--RED_DEVIATED)_35%,transparent)] bg-[color-mix(in_srgb,var(--RED_DEVIATED)_12%,transparent)] px-3 py-2 text-xs text-[var(--RED_DEVIATED)]">
+              <AlertTriangle className="h-3.5 w-3.5 flex-shrink-0" />
+              <p className="min-w-0 truncate">{connectionError}</p>
+            </div>
+          )}
+          {diagnosticNotice && (
+            <div className="flex items-start gap-2 rounded-xl border border-[color-mix(in_srgb,var(--YELLOW_APPROACHING)_35%,transparent)] bg-[color-mix(in_srgb,var(--YELLOW_APPROACHING)_12%,transparent)] px-3 py-2 text-xs text-[var(--YELLOW_APPROACHING)]">
+              <AlertTriangle className="mt-0.5 h-3.5 w-3.5 flex-shrink-0" />
+              <p className="min-w-0 leading-relaxed">{diagnosticNotice}</p>
+            </div>
+          )}
         </div>
       )}
 
-      {/* 【新增】非致命诊断提醒条：例如自动检测到摄像头持续输出全黑画面，
-          用黄色样式与上方红色的连接错误条区分，且不会中断当前分析会话 */}
-      {diagnosticNotice && (
-        <div className="flex items-start gap-2 rounded-2xl border border-amber-400/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-200">
-          <span className="mt-0.5 inline-flex flex-shrink-0">
-            <AlertTriangle className="h-4 w-4" />
-          </span>
-          <p className="leading-relaxed">{diagnosticNotice}</p>
-        </div>
-      )}
+      {/* ============================ V2.5 三栏沉浸式 Grid：28% / 44% / 28% ============================ */}
+      <div className="workbench-grid">
+        <MetricPanel
+          renderMode="GROUP_B"
+          scoreDetail={finalReport?.scoreDetail ?? MOCK_SCORE_DETAIL_V31}
+          metrics={null}
+          errorCodes={null}
+          radarScores={finalReport?.scoreDetail?.radar_scores ?? MOCK_RADAR_SCORES}
+          compareRadarScores={MOCK_RADAR_SCORES_COMPARE}
+          tImpact={finalReport?.tImpact ?? finalReport?.t_impact ?? null}
+          heatmapBase64={
+            finalReport?.heatmap_base64 ??
+            finalReport?.heatmapBase64 ??
+            finalReport?.scoreDetail?.heatmap_base64 ??
+            null
+          }
+        />
 
-      {/* ============================ 主体左右分栏 ============================ */}
-      <div className="flex flex-col gap-6 lg:flex-row lg:items-start">
-        {/* -------- 左侧：视觉分析展示区（约 62% 宽度） -------- */}
-        <div className="w-full lg:w-[62%] lg:flex-shrink-0">
-          <div className="relative min-h-[520px] overflow-hidden rounded-3xl bg-gradient-to-br from-zinc-900 via-black to-zinc-900 shadow-2xl">
-            {/* 画面渲染主体：真实订阅 api_server.py 通过 WebSocket 推来的、
-                已经在后端完成骨骼渲染 + 三级染色 + 面部打码的 Base64 JPEG 帧 */}
+        <SynchronizedVideoWorkspace
+          videoSrc={videoSourceMode === 'file' ? localVideoObjectUrl : null}
+          velocitySeries={omegaSeries}
+          tImpact={finalReport?.tImpact ?? finalReport?.t_impact ?? null}
+          impactIndexInWindow={impactIndexInWindow}
+          seriesFrameOffset={seriesFrameOffset}
+          fps={30}
+          preferLiveOverlay={isAnalyzing || analysisStatus === 'stopping'}
+          title="Video Workspace"
+          subtitle="鞭打发力角速度时序 · 触球窗口 t_impact±30 · 教练手绘电烙铁"
+          studentNumber={studentNumber}
+          attemptId={lastSessionId}
+          overlay={
+            <>
+              <motion.div
+                animate={{ backgroundColor: smoothBackground }}
+                transition={{ duration: 0.8, ease: 'easeInOut' }}
+                className={`pointer-events-auto absolute top-3 left-3 rounded-xl border border-white/10 px-3 py-2.5 shadow-lg backdrop-blur-xl ${
+                  level ? LEVEL_COLOR_MAP[level].glow : ''
+                }`}
+              >
+                <p className="text-[10px] font-medium text-white/70">右膝角度</p>
+                <p className="text-2xl font-bold tabular-nums text-white">
+                  {kneeAngle !== null ? `${kneeAngle}°` : '--'}
+                </p>
+                <span className="mt-0.5 inline-block rounded-full bg-black/30 px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-white/85">
+                  {level ? LEVEL_LABEL_MAP[level] : '等待人体'}
+                </span>
+              </motion.div>
+
+              <div className="absolute top-3 right-3 flex flex-col items-end gap-1.5">
+                <span className="flex items-center gap-1.5 rounded-full border border-white/10 bg-[color-mix(in_srgb,var(--GREEN_OPTIMAL)_18%,transparent)] px-2.5 py-1 text-[10px] text-[var(--GREEN_OPTIMAL)] backdrop-blur-xl">
+                  <ScanFace className="h-3 w-3" />
+                  隐私打码
+                </span>
+                <span className="flex items-center gap-1.5 rounded-full border border-white/10 bg-sky-500/20 px-2.5 py-1 text-[10px] text-sky-300 backdrop-blur-xl">
+                  <Bone className="h-3 w-3" />
+                  骨骼渲染
+                </span>
+                <span
+                  className={`flex items-center gap-1.5 rounded-full border border-white/10 px-2.5 py-1 text-[10px] backdrop-blur-xl ${
+                    isConnected
+                      ? 'bg-[color-mix(in_srgb,var(--GREEN_OPTIMAL)_12%,transparent)] text-[var(--GREEN_OPTIMAL)]'
+                      : 'bg-black/30 text-slate-400'
+                  }`}
+                >
+                  {isConnected ? <Wifi className="h-3 w-3" /> : <WifiOff className="h-3 w-3" />}
+                  {isConnected ? '已连接' : '未连接'}
+                </span>
+                {stabilityIndex !== null && (
+                  <span className="flex items-center gap-1.5 rounded-full border border-white/10 bg-black/40 px-2.5 py-1 text-[10px] text-slate-300 backdrop-blur-xl">
+                    <Gauge className="h-3 w-3 text-[var(--GREEN_OPTIMAL)]" />
+                    稳定指数 {stabilityIndex}
+                  </span>
+                )}
+              </div>
+
+              {finalReport?.impactFrameImage && (
+                <div className="absolute bottom-3 left-3 w-28 overflow-hidden rounded-lg border border-slate-600/60 bg-black/70 shadow-lg">
+                  <img
+                    src={finalReport.impactFrameImage}
+                    alt="击球关键帧"
+                    className="aspect-video w-full object-cover"
+                  />
+                  <span className="absolute left-1 top-1 flex items-center gap-1 rounded bg-black/70 px-1.5 py-0.5 text-[8px] text-[var(--GREEN_OPTIMAL)]">
+                    <Crosshair className="h-2.5 w-2.5" />
+                    Impact
+                  </span>
+                </div>
+              )}
+
+              <AnimatePresence>
+                {isGeneratingReport && (
+                  <motion.div
+                    initial={{ opacity: 0, y: 20, scale: 0.9 }}
+                    animate={{ opacity: 1, y: 0, scale: 1 }}
+                    exit={{ opacity: 0, y: 20, scale: 0.9 }}
+                    transition={{ type: 'spring', stiffness: 260, damping: 24 }}
+                    className="pointer-events-auto absolute bottom-4 left-1/2 flex w-[88%] max-w-md -translate-x-1/2 items-center gap-2 rounded-full border border-white/10 bg-black/75 px-4 py-2.5 shadow-2xl backdrop-blur-xl"
+                  >
+                    <Loader2 className="h-3.5 w-3.5 flex-shrink-0 animate-spin text-[var(--GREEN_OPTIMAL)]" />
+                    <p className="text-xs text-slate-100">DeepSeek 正在生成诊断报告…</p>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </>
+          }
+        >
+          <div className="relative h-full min-h-0 w-full overflow-hidden bg-gradient-to-br from-slate-900 via-black to-slate-950">
             {frameImage ? (
               <img
                 src={frameImage}
                 alt="实时推理画面"
                 className="absolute inset-0 h-full w-full bg-black object-contain"
-                // 【容错防呆】万一某一帧的 Base64 数据在传输/解码过程中意外损坏，
-                // 浏览器会触发 onError；此时主动清空 frameImage 回退到占位提示，
-                // 避免长期停留在一张"损坏的图片图标"上，被误认为是黑屏卡死。
                 onError={() => setFrameImage(null)}
               />
             ) : (
-              <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 text-white/30">
+              <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 text-slate-500">
                 <span className="inline-flex flex-shrink-0">
-                  {videoSourceMode === 'file' ? <FileVideo className="h-16 w-16" /> : <Camera className="h-16 w-16" />}
+                  {videoSourceMode === 'file' ? (
+                    <FileVideo className="h-12 w-12" />
+                  ) : (
+                    <Camera className="h-12 w-12" />
+                  )}
                 </span>
-                <p className="max-w-sm text-center text-sm">
+                <p className="max-w-xs px-4 text-center text-xs leading-relaxed">
                   {videoSourceMode === 'file'
                     ? uploadedVideoPath
-                      ? '视频已就绪，点击「开始分析 / 训练」后将显示后端实时推理画面'
-                      : '请先在上方选择本地 MP4 文件并等待上传完成'
-                    : '点击「开始分析 / 训练」后，后端将打开本机摄像头并推送实时推理画面'}
+                      ? localVideoObjectUrl && analysisStatus === 'finished'
+                        ? '分析结束：可在下方波形图拖拽/点击，同步跳转视频帧'
+                        : '视频已就绪，点击「开始分析」后显示后端实时推理画面'
+                      : '请先选择本地 MP4 并等待上传完成'
+                    : '点击「开始分析」后，后端将推送实时推理画面'}
                 </p>
               </div>
             )}
-
-            {/* 右膝角度监控卡：直接绑定后端实时计算出的真实角度与状态 */}
-            <motion.div
-              animate={{ backgroundColor: smoothBackground }}
-              transition={{ duration: 0.8, ease: 'easeInOut' }}
-              className="absolute top-5 left-5 rounded-2xl border border-white/10 px-5 py-4 shadow-lg backdrop-blur-xl"
-            >
-              <p className="text-xs font-medium text-white/70">右膝角度监控（后端实时计算）</p>
-              <p className="mt-1 text-4xl font-bold tabular-nums text-white">
-                {kneeAngle !== null ? `${kneeAngle}°` : '--'}
-              </p>
-              <span className="mt-1 inline-block rounded-full bg-black/30 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-white/85">
-                {level ? LEVEL_LABEL_MAP[level] : '等待检测到人体'}
-              </span>
-            </motion.div>
-
-            {/* 后端强制开启的隐私保护 / 骨骼渲染状态徽标（伦理红线，不可由前端关闭） */}
-            <div className="absolute top-5 right-5 flex flex-col items-end gap-2">
-              <span className="flex items-center gap-2 rounded-full border border-white/10 bg-emerald-500/20 px-3 py-1.5 text-xs text-emerald-300 backdrop-blur-xl">
-                <span className="inline-flex flex-shrink-0">
-                  <ScanFace className="h-3.5 w-3.5" />
-                </span>
-                后端强制隐私打码
-              </span>
-              <span className="flex items-center gap-2 rounded-full border border-white/10 bg-sky-500/20 px-3 py-1.5 text-xs text-sky-300 backdrop-blur-xl">
-                <span className="inline-flex flex-shrink-0">
-                  <Bone className="h-3.5 w-3.5" />
-                </span>
-                后端实时骨骼渲染
-              </span>
-              <span
-                className={`flex items-center gap-2 rounded-full border border-white/10 px-3 py-1.5 text-xs backdrop-blur-xl ${
-                  isConnected ? 'bg-emerald-500/10 text-emerald-300' : 'bg-black/30 text-white/40'
-                }`}
-              >
-                <span className="inline-flex flex-shrink-0">
-                  {isConnected ? <Wifi className="h-3.5 w-3.5" /> : <WifiOff className="h-3.5 w-3.5" />}
-                </span>
-                {isConnected ? '已连接后端服务' : '未连接'}
-              </span>
-            </div>
-
-            {/* 灵动岛风格提示：正在等待后端生成真实诊断报告时的加载态 */}
-            <AnimatePresence>
-              {isGeneratingReport && (
-                <motion.div
-                  initial={{ opacity: 0, y: 20, scale: 0.9 }}
-                  animate={{ opacity: 1, y: 0, scale: 1 }}
-                  exit={{ opacity: 0, y: 20, scale: 0.9 }}
-                  transition={{ type: 'spring', stiffness: 260, damping: 24 }}
-                  className="absolute bottom-6 left-1/2 flex w-[88%] max-w-md -translate-x-1/2 items-center gap-3 rounded-full border border-white/10 bg-black/70 px-5 py-3 shadow-2xl backdrop-blur-xl"
-                >
-                  <span className="inline-flex flex-shrink-0">
-                    <Loader2 className="h-4 w-4 animate-spin text-emerald-400" />
-                  </span>
-                  <p className="text-sm text-white/90">正在请求 DeepSeek 大模型生成真实诊断报告……</p>
-                </motion.div>
-              )}
-            </AnimatePresence>
           </div>
+        </SynchronizedVideoWorkspace>
 
-          {/* 【核心新增】实时动力链角速度 (deg/s) 与动平衡稳定指数监控卡片：
-              随视频推移实时滚动的 5 秒时序波形，右上角同步给出动平衡稳定指数评级 */}
-          <KineticChainMonitor history={velocityHistory} stabilityIndex={stabilityIndex} />
-        </div>
-
-        {/* -------- 右侧：反馈报告与诊断中心 Bento Grid（约 38% 宽度） -------- */}
-        <aside className="flex w-full flex-col gap-5 lg:w-[38%]">
-          {/* 便当盒一：档案与状态 */}
-          <section className="rounded-3xl border border-white/10 bg-white/5 p-5 backdrop-blur-xl">
-            <div className="mb-4 flex items-center gap-2">
-              <span className="inline-flex flex-shrink-0">
-                <GraduationCap className="h-4 w-4 text-emerald-400" />
-              </span>
-              <h3 className="text-sm font-semibold text-white/80">档案与状态</h3>
-            </div>
-            <div className="grid grid-cols-2 gap-3">
-              <InfoCell label="学生编号" value={studentNumber || '未填写'} />
-              <InfoCell
-                label="运行状态"
-                value={STATUS_META[analysisStatus].label}
-                valueClassName={STATUS_META[analysisStatus].className}
-              />
-              <InfoCell label="所属学校" value={getSchoolDisplayName(globalSettings)} />
-              <InfoCell label="所属班级" value={getClassGroupDisplayName(globalSettings)} />
-            </div>
-          </section>
-
-          {/* 便当盒二：实时动作指标 */}
-          <section className="rounded-3xl border border-white/10 bg-white/5 p-5 backdrop-blur-xl">
-            <h3 className="mb-4 text-sm font-semibold text-white/80">实时动作指标</h3>
-
-            {/* 三色命中占比环形图 */}
-            <div className="mb-5 flex items-center justify-center">
-              <ThresholdRing stats={hitStats} />
-            </div>
-
-            {/* 各等级命中次数进度条 */}
-            <div className="flex flex-col gap-3">
-              {(['green', 'yellow', 'red'] as ThresholdLevel[]).map((lvl) => {
-                const count = hitStats[lvl]
-                const ratio = totalAttempts > 0 ? (count / totalAttempts) * 100 : 0
-                const colorStyle = LEVEL_COLOR_MAP[lvl]
-                return (
-                  <div key={lvl}>
-                    <div className="mb-1 flex items-center justify-between text-xs">
-                      <span className={`font-medium ${colorStyle.text}`}>{LEVEL_LABEL_MAP[lvl]}</span>
-                      <span className="text-white/40">
-                        {count} 次 · {ratio.toFixed(0)}%
-                      </span>
-                    </div>
-                    <div className="h-2 overflow-hidden rounded-full bg-black/30">
-                      <motion.div
-                        animate={{ width: `${ratio}%` }}
-                        transition={{ duration: 0.6, ease: 'easeOut' }}
-                        className={`h-full rounded-full ${HIT_BAR_BG[lvl]}`}
-                      />
-                    </div>
+        <AIAssistantPanel
+          report={finalReport}
+          hitStats={hitStats}
+          errorCodes={null}
+          displayText={
+            finalReport
+              ? reportDisplayText
+              : isAnalyzing
+                ? level
+                  ? `右膝角度 ${kneeAngle}°，判定为「${LEVEL_LABEL_MAP[level]}」，累计已采集 ${totalAttempts} 次有效数据。`
+                  : '正在等待后端检测到完整人体姿态……'
+                : undefined
+          }
+          isTyping={!!finalReport && !isReportDone}
+          actions={
+            finalReport ? (
+              <div className="flex flex-col gap-2">
+                <button
+                  type="button"
+                  onClick={handleSaveWordReport}
+                  disabled={wordSaveStatus === 'saving'}
+                  className={`flex items-center justify-center gap-2 rounded-xl py-2.5 text-xs font-bold transition active:scale-95 disabled:cursor-not-allowed disabled:opacity-70 ${
+                    wordSaveStatus === 'success'
+                      ? 'bg-[var(--GREEN_OPTIMAL)] text-slate-950'
+                      : wordSaveStatus === 'error'
+                        ? 'bg-[var(--RED_DEVIATED)] text-white'
+                        : 'bg-[var(--GREEN_OPTIMAL)] text-slate-950 hover:brightness-110'
+                  }`}
+                >
+                  {wordSaveStatus === 'saving' ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : wordSaveStatus === 'success' ? (
+                    <CheckCircle2 className="h-3.5 w-3.5" />
+                  ) : wordSaveStatus === 'error' ? (
+                    <XCircle className="h-3.5 w-3.5" />
+                  ) : (
+                    <Save className="h-3.5 w-3.5" />
+                  )}
+                  {wordSaveStatus === 'saving'
+                    ? '写入 Word…'
+                    : wordSaveStatus === 'success'
+                      ? '已归档 Word'
+                      : wordSaveStatus === 'error'
+                        ? '归档失败，重试'
+                        : '归档 Word 报告'}
+                </button>
+                <button
+                  type="button"
+                  onClick={handleExportReport}
+                  className="flex items-center justify-center gap-2 rounded-xl bg-slate-700/60 py-2 text-xs font-semibold text-slate-200 transition hover:bg-slate-600/70 active:scale-95"
+                >
+                  <Download className="h-3.5 w-3.5" />
+                  导出 JSON
+                </button>
+                <div className="rounded-xl border border-slate-700/70 bg-slate-900/35 p-2.5">
+                  <p className="mb-2 text-[10px] font-semibold text-slate-500">档案快照</p>
+                  <div className="grid grid-cols-2 gap-1.5 text-[10px]">
+                    <span className="text-slate-500">学号</span>
+                    <span className="truncate text-right text-slate-200">{studentNumber || '未填写'}</span>
+                    <span className="text-slate-500">学校</span>
+                    <span className="truncate text-right text-slate-200">
+                      {getSchoolDisplayName(globalSettings)}
+                    </span>
+                    <span className="text-slate-500">班级</span>
+                    <span className="truncate text-right text-slate-200">
+                      {getClassGroupDisplayName(globalSettings)}
+                    </span>
                   </div>
-                )
-              })}
-            </div>
-          </section>
-        </aside>
+                  <div className="mt-2 flex justify-center">
+                    <ThresholdRing stats={hitStats} />
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <div className="rounded-xl border border-slate-700/70 bg-slate-900/35 p-2.5">
+                <div className="mb-2 flex items-center gap-1.5 text-[10px] font-semibold text-slate-500">
+                  <GraduationCap className="h-3 w-3" />
+                  实时命中分布
+                </div>
+                <div className="flex justify-center">
+                  <ThresholdRing stats={hitStats} />
+                </div>
+                <div className="mt-2 flex flex-col gap-1.5">
+                  {(['green', 'yellow', 'red'] as ThresholdLevel[]).map((lvl) => {
+                    const count = hitStats[lvl]
+                    const ratio = totalAttempts > 0 ? (count / totalAttempts) * 100 : 0
+                    const colorStyle = LEVEL_COLOR_MAP[lvl]
+                    return (
+                      <div key={lvl}>
+                        <div className="mb-0.5 flex items-center justify-between text-[10px]">
+                          <span className={`font-medium ${colorStyle.text}`}>{LEVEL_LABEL_MAP[lvl]}</span>
+                          <span className="text-slate-500">
+                            {count} · {ratio.toFixed(0)}%
+                          </span>
+                        </div>
+                        <div className="h-1.5 overflow-hidden rounded-full bg-slate-900">
+                          <motion.div
+                            animate={{ width: `${ratio}%` }}
+                            transition={{ duration: 0.6, ease: 'easeOut' }}
+                            className={`h-full rounded-full ${HIT_BAR_BG[lvl]}`}
+                          />
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+              </div>
+            )
+          }
+        />
       </div>
 
-      {/* ============================ 便当盒三（重构）：图文并茂的击球瞬间关键帧生物力学诊断报告单 ============================
-          扩展为全宽双栏「科研诊断报告单」：左栏展示后端 OpenCV 矢量标注的击球关键帧，右栏展示评分卡 + DeepSeek 打字机文字处方 */}
-      <section
-        className={`relative flex flex-col gap-5 rounded-3xl border p-5 backdrop-blur-xl transition-colors sm:p-6 ${
-          finalReport
-            ? 'border-emerald-400/30 bg-gradient-to-br from-emerald-500/10 via-white/5 to-transparent'
-            : 'border-white/10 bg-white/5'
-        }`}
-      >
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <span className="inline-flex flex-shrink-0">
-              <Sparkles className="h-4 w-4 text-emerald-400" />
-            </span>
-            <h3 className="text-sm font-semibold text-white/80">AI 综合反馈报告 · 双栏科研诊断报告单</h3>
-          </div>
-          <span
-            className={`flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[10px] font-semibold ${
-              isAnalyzing || isGeneratingReport
-                ? 'bg-amber-500/20 text-amber-300'
-                : finalReport
-                  ? 'bg-emerald-500/20 text-emerald-300'
-                  : 'bg-white/10 text-white/40'
-            }`}
-          >
-            <span
-              className={`h-1.5 w-1.5 rounded-full ${
-                isAnalyzing || isGeneratingReport
-                  ? 'animate-pulse bg-amber-400'
-                  : finalReport
-                    ? 'bg-emerald-400'
-                    : 'bg-white/30'
-              }`}
-            />
-            {isGeneratingReport ? 'DeepSeek 生成中' : isAnalyzing ? '分析中' : finalReport ? '报告已生成' : '待机'}
-          </span>
-        </div>
-
-        {!finalReport && !isAnalyzing && !isGeneratingReport && (
-          <p className="text-xs leading-relaxed text-white/40">
-            点击「开始分析 / 训练」后，系统将通过后端真实推理持续采集触球瞬间关节角度与角速度数据，并自动捕捉
-            右膝角速度峰值所在的「击球关键帧」；点击「结束分析」后，后端会真正调用 DeepSeek 大模型 + OpenCV
-            矢量标注引擎，在此处生成左图右文的结构化本次综合练习诊断报告。
-          </p>
-        )}
-
-        {isAnalyzing && !finalReport && (
-          <div className="flex flex-col gap-2">
-            <p className="text-xs text-white/50">实时监测中，当前判定状态：</p>
-            <p className="min-h-[3rem] rounded-2xl bg-black/20 p-3 text-sm text-white/80">
-              {level
-                ? `右膝角度 ${kneeAngle}°，判定为「${LEVEL_LABEL_MAP[level]}」，累计已采集 ${totalAttempts} 次有效数据。`
-                : '正在等待后端检测到完整人体姿态……'}
-            </p>
-          </div>
-        )}
-
-        {finalReport && (
-          <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
-            {/* 左栏：生物力学关键帧诊断图 —— 后端 OpenCV 矢量标注的击球瞬间截图 */}
-            <div className="flex flex-col gap-2">
-              <div className="relative overflow-hidden rounded-2xl border border-white/10 bg-black/40">
-                {finalReport.impactFrameImage ? (
-                  <img
-                    src={finalReport.impactFrameImage}
-                    alt="击球瞬间生物力学诊断关键帧"
-                    className="h-full w-full object-contain"
-                  />
-                ) : (
-                  <div className="flex aspect-video flex-col items-center justify-center gap-2 text-white/30">
-                    <span className="inline-flex flex-shrink-0">
-                      <ScanFace className="h-10 w-10" />
-                    </span>
-                    <p className="max-w-[16rem] text-center text-xs">
-                      本次分析未能捕捉到有效击球关键帧（可能全程未检测到完整人体姿态）。
-                    </p>
-                  </div>
-                )}
-                <span className="absolute left-3 top-3 flex items-center gap-1.5 rounded-full border border-white/10 bg-black/60 px-2.5 py-1 text-[10px] text-emerald-300 backdrop-blur-xl">
-                  <span className="inline-flex flex-shrink-0">
-                    <Crosshair className="h-3 w-3" />
-                  </span>
-                  矢量标注 · 髋-膝-踝动力链
-                </span>
-              </div>
-              <p className="text-center text-xs text-white/40">关键力学特征捕获帧 (Impact Moment)</p>
-            </div>
-
-            {/* 右栏：AIGC 专家处方 —— 评分卡 + 打字机动效呈现的 DeepSeek 文字指导 */}
-            <div className="flex flex-col gap-4">
-              <div className="flex items-center gap-4">
-                <div className="flex h-16 w-16 flex-shrink-0 flex-col items-center justify-center rounded-2xl bg-emerald-500/20">
-                  <span className="text-2xl font-bold text-emerald-300">{finalReport.score}</span>
-                  <span className="text-[9px] text-emerald-300/70">评分</span>
-                </div>
-                <div className="text-xs text-white/40">
-                  <p>共采集 {finalReport.totalAttempts} 次有效触球数据</p>
-                  <p>{finalReport.generatedAt}</p>
-                </div>
-              </div>
-              <p className="flex-1 whitespace-pre-line rounded-2xl bg-black/20 p-4 text-sm leading-relaxed text-white/85">
-                {reportDisplayText}
-                {!isReportDone && <span className="typewriter-caret">|</span>}
-              </p>
-              {/* 醒目的主操作按钮：调用后台接口，在本机硬盘完成建文件夹 + 写 Word 文档 */}
-              <button
-                type="button"
-                onClick={handleSaveWordReport}
-                disabled={wordSaveStatus === 'saving'}
-                className={`flex items-center justify-center gap-2 rounded-2xl py-3 text-sm font-bold shadow-lg transition active:scale-95 disabled:cursor-not-allowed disabled:opacity-70 ${
-                  wordSaveStatus === 'success'
-                    ? 'bg-emerald-500 text-black shadow-emerald-500/30'
-                    : wordSaveStatus === 'error'
-                      ? 'bg-rose-500 text-white shadow-rose-500/30'
-                      : 'bg-gradient-to-r from-emerald-400 to-teal-400 text-black shadow-emerald-500/30 hover:brightness-110'
-                }`}
-              >
-                <span className="inline-flex flex-shrink-0">
-                  {wordSaveStatus === 'saving' ? (
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                  ) : wordSaveStatus === 'success' ? (
-                    <CheckCircle2 className="h-4 w-4" />
-                  ) : wordSaveStatus === 'error' ? (
-                    <XCircle className="h-4 w-4" />
-                  ) : (
-                    <Save className="h-4 w-4" />
-                  )}
-                </span>
-                {wordSaveStatus === 'saving'
-                  ? '正在写入本地 Word 文档…'
-                  : wordSaveStatus === 'success'
-                    ? '已成功归档为 Word 文档'
-                    : wordSaveStatus === 'error'
-                      ? '归档失败，点击重试'
-                      : '💾 自动归档并生成 Word 报告'}
-              </button>
-              <button
-                type="button"
-                onClick={handleExportReport}
-                className="flex items-center justify-center gap-2 rounded-2xl bg-white/10 py-2.5 text-sm font-semibold text-white/80 transition hover:bg-white/20 active:scale-95"
-              >
-                <span className="inline-flex flex-shrink-0">
-                  <Download className="h-4 w-4" />
-                </span>
-                导出本次反馈报告 (JSON)
-              </button>
-            </div>
-          </div>
-        )}
-      </section>
-
-      {/* ============================ 右上角浮动 Toast 提示条：Word 报告归档结果 ============================ */}
       <AnimatePresence>
         {wordSaveToast && (
           <motion.div
@@ -941,40 +915,21 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
             transition={{ type: 'spring', stiffness: 300, damping: 26 }}
             className={`fixed top-6 right-6 z-[60] flex max-w-md items-start gap-3 rounded-2xl border px-5 py-3.5 shadow-2xl backdrop-blur-2xl ${
               wordSaveToast.success
-                ? 'border-emerald-400/30 bg-emerald-950/90 text-emerald-100'
-                : 'border-rose-400/30 bg-rose-950/90 text-rose-100'
+                ? 'border-[color-mix(in_srgb,var(--GREEN_OPTIMAL)_35%,transparent)] bg-slate-950/90 text-[var(--GREEN_OPTIMAL)]'
+                : 'border-[color-mix(in_srgb,var(--RED_DEVIATED)_35%,transparent)] bg-slate-950/90 text-[var(--RED_DEVIATED)]'
             }`}
           >
             <span className="mt-0.5 inline-flex flex-shrink-0">
               {wordSaveToast.success ? (
-                <CheckCircle2 className="h-4 w-4 text-emerald-300" />
+                <CheckCircle2 className="h-4 w-4" />
               ) : (
-                <XCircle className="h-4 w-4 text-rose-300" />
+                <XCircle className="h-4 w-4" />
               )}
             </span>
-            <p className="text-sm leading-relaxed break-all">{wordSaveToast.message}</p>
+            <p className="text-sm leading-relaxed break-all text-slate-100">{wordSaveToast.message}</p>
           </motion.div>
         )}
       </AnimatePresence>
-
-      <div className="flex items-center gap-2 rounded-3xl border border-white/10 bg-white/5 p-4 text-xs text-white/40 backdrop-blur-xl">
-        <span className="inline-flex flex-shrink-0">
-          <Bone className="h-4 w-4" />
-        </span>
-        <p>
-          全边缘计算：所有推理与渲染均在 api_server.py 本地内存中完成，画面通过局域网 WebSocket 直传浏览器，不上传公有云端。
-        </p>
-      </div>
-    </div>
-  )
-}
-
-/** 档案信息小格子 */
-function InfoCell({ label, value, valueClassName }: { label: string; value: string; valueClassName?: string }) {
-  return (
-    <div className="rounded-2xl bg-black/20 px-3.5 py-3">
-      <p className="text-[11px] text-white/40">{label}</p>
-      <p className={`mt-1 truncate text-sm font-semibold ${valueClassName ?? 'text-white/90'}`}>{value}</p>
     </div>
   )
 }
@@ -1024,88 +979,5 @@ function ThresholdRing({ stats }: { stats: ThresholdHitStats }) {
         <span className="text-[10px] text-white/40">次采样 · 达标{greenRatioPercent}%</span>
       </div>
     </div>
-  )
-}
-
-/**
- * 【核心新增】实时动力链角速度 (deg/s) 与动平衡稳定指数监控卡片。
- *
- * 纯 SVG 实现的滚动时序波形图：横轴为最近 5 秒的滚动时间窗口，纵轴为后端
- * 实时计算出的右膝角速度（正负号代表伸展/屈曲方向），发力瞬间角速度会
- * 骤然拉出尖峰，直观呈现"动力链传导是否顺畅、是否存在多余抖动"；
- * 右上角同步展示后端基于滑动窗口角速度离散程度换算出的动平衡稳定指数。
- */
-function KineticChainMonitor({
-  history,
-  stabilityIndex,
-}: {
-  history: VelocitySample[]
-  stabilityIndex: number | null
-}) {
-  const stabilityMeta = getStabilityMeta(stabilityIndex)
-
-  const viewWidth = 600
-  const viewHeight = 140
-  const midY = viewHeight / 2
-  const now = Date.now()
-
-  // 把每个样本的"距今毫秒数"映射到 [0, viewWidth] 的横坐标（越靠右代表越接近当前时刻）。
-  // 【容错防呆】先过滤掉任何非有限数值的样本（NaN/Infinity 等异常数据），
-  // 避免拼出非法的 SVG path 坐标字符串，导致整张波形图静默不渲染。
-  const points = history
-    .filter((sample) => Number.isFinite(sample.t) && Number.isFinite(sample.v))
-    .map((sample) => {
-      const elapsed = now - sample.t
-      const x = viewWidth - (elapsed / VELOCITY_WINDOW_MS) * viewWidth
-      const clampedV = Math.max(-VELOCITY_CLAMP_RANGE, Math.min(VELOCITY_CLAMP_RANGE, sample.v))
-      const y = midY - (clampedV / VELOCITY_CLAMP_RANGE) * (midY - 12)
-      return { x, y }
-    })
-
-  const linePath = points.length > 1 ? `M ${points.map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' L ')}` : ''
-  const areaPath =
-    points.length > 1
-      ? `${linePath} L ${points[points.length - 1].x.toFixed(1)},${midY} L ${points[0].x.toFixed(1)},${midY} Z`
-      : ''
-
-  const latestSample = history.length > 0 ? history[history.length - 1] : null
-
-  return (
-    <section className="mt-6 rounded-3xl border border-white/10 bg-white/5 p-5 backdrop-blur-xl">
-      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-        <div className="flex items-center gap-2">
-          <span className="inline-flex flex-shrink-0">
-            <Gauge className="h-4 w-4 text-emerald-400" />
-          </span>
-          <h3 className="text-sm font-semibold text-white/80">实时动力链角速度监控</h3>
-          <span className="rounded-full bg-black/30 px-2 py-0.5 text-[10px] text-white/40">5s 滚动波形</span>
-        </div>
-        <div className="text-right">
-          <p className="text-[10px] text-white/40">动平衡稳定指数</p>
-          <p className={`text-sm font-bold tabular-nums ${stabilityMeta.className}`}>{stabilityMeta.text}</p>
-        </div>
-      </div>
-
-      <div className="relative overflow-hidden rounded-2xl bg-black/30">
-        <svg viewBox={`0 0 ${viewWidth} ${viewHeight}`} preserveAspectRatio="none" className="h-28 w-full">
-          {/* 零基准线：代表角速度为 0 deg/s，即摆动腿瞬时静止的参考线 */}
-          <line x1="0" y1={midY} x2={viewWidth} y2={midY} stroke="rgba(255,255,255,0.12)" strokeWidth={1} strokeDasharray="4 4" />
-          {areaPath && <path d={areaPath} fill="rgba(52,211,153,0.14)" stroke="none" />}
-          {linePath && <path d={linePath} fill="none" stroke="#34d399" strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" />}
-          {/* 当前帧尖端高亮点：标记波形最新推进到的位置，模拟"实时扫描笔尖" */}
-          {points.length > 0 && (
-            <circle cx={points[points.length - 1].x} cy={points[points.length - 1].y} r={4} fill="#a7f3d0" />
-          )}
-        </svg>
-        <div className="pointer-events-none absolute bottom-2 left-3 text-[10px] text-white/30">
-          实时角速度：{latestSample ? `${latestSample.v.toFixed(0)} deg/s` : '--'}
-        </div>
-      </div>
-
-      <p className="mt-2 text-[11px] leading-relaxed text-white/30">
-        波形来自后端逐帧计算的右膝关节角速度（deg/s），发力瞬间会出现尖峰；动平衡稳定指数基于滑动窗口内角速度的
-        离散程度换算，指数越高代表触球前后身体动力链传导越连贯稳定。
-      </p>
-    </section>
   )
 }

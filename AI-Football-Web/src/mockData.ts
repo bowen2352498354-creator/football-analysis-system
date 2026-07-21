@@ -8,7 +8,9 @@ import type {
   FinalDiagnosisReport,
   GlobalSettings,
   GlobalTrainingRecord,
+  RadarScores,
   School,
+  ScoreDetailPayload,
   ScoreRecord,
   StudentInfo,
   TeachingSuggestion,
@@ -24,25 +26,25 @@ export function getThresholdLevel(angle: number): ThresholdLevel {
   return 'red'
 }
 
-/** 各等级对应的主题色（Tailwind 类名片段） */
+/** 各等级对应的主题色（对齐 V2.5 Traffic-Light System） */
 export const LEVEL_COLOR_MAP: Record<ThresholdLevel, { text: string; bg: string; ring: string; glow: string }> = {
   green: {
-    text: 'text-emerald-400',
-    bg: 'bg-emerald-500/20',
-    ring: 'ring-emerald-400/50',
-    glow: 'shadow-[0_0_40px_rgba(52,211,153,0.35)]',
+    text: 'text-[var(--GREEN_OPTIMAL)]',
+    bg: 'bg-[color-mix(in_srgb,var(--GREEN_OPTIMAL)_18%,transparent)]',
+    ring: 'ring-[color-mix(in_srgb,var(--GREEN_OPTIMAL)_50%,transparent)]',
+    glow: 'traffic-glow-green',
   },
   yellow: {
-    text: 'text-amber-400',
-    bg: 'bg-amber-500/20',
-    ring: 'ring-amber-400/50',
-    glow: 'shadow-[0_0_40px_rgba(251,191,36,0.35)]',
+    text: 'text-[var(--YELLOW_APPROACHING)]',
+    bg: 'bg-[color-mix(in_srgb,var(--YELLOW_APPROACHING)_18%,transparent)]',
+    ring: 'ring-[color-mix(in_srgb,var(--YELLOW_APPROACHING)_50%,transparent)]',
+    glow: 'traffic-glow-yellow',
   },
   red: {
-    text: 'text-rose-400',
-    bg: 'bg-rose-500/20',
-    ring: 'ring-rose-400/50',
-    glow: 'shadow-[0_0_40px_rgba(251,113,133,0.35)]',
+    text: 'text-[var(--RED_DEVIATED)]',
+    bg: 'bg-[color-mix(in_srgb,var(--RED_DEVIATED)_18%,transparent)]',
+    ring: 'ring-[color-mix(in_srgb,var(--RED_DEVIATED)_50%,transparent)]',
+    glow: 'traffic-glow-red',
   },
 }
 
@@ -50,6 +52,99 @@ export const LEVEL_LABEL_MAP: Record<ThresholdLevel, string> = {
   green: '达标',
   yellow: '接近',
   red: '错误',
+}
+
+/**
+ * V3.1 Sprint 1 五维雷达测试数据（对齐后端 DeterministicScorer.radar_scores）。
+ * 模拟一次偏「支撑稳、折叠佳、鞭打偏弱、踝锁中等」的儿童射门。
+ */
+export const MOCK_RADAR_SCORES: RadarScores = {
+  support_stability: 18.2,
+  backswing_folding: 16.5,
+  ankle_rigidity: 15.0,
+  whipping_velocity: 12.4,
+  approach_rhythm: 18.0,
+}
+
+/** 对比 Attempt：鞭打提升、折叠略降 */
+export const MOCK_RADAR_SCORES_COMPARE: RadarScores = {
+  support_stability: 17.5,
+  backswing_folding: 14.0,
+  ankle_rigidity: 20.0,
+  whipping_velocity: 18.7,
+  approach_rhythm: 19.0,
+}
+
+/**
+ * 模拟完整 scoreDetail（含 radar_scores），供 MetricPanel / MetricCardList 联调。
+ */
+export const MOCK_SCORE_DETAIL_V31: ScoreDetailPayload = {
+  TotalScore: 80.1,
+  t_impact: 42,
+  base_score: 100,
+  total_penalty: 19.9,
+  scoring_engine: 'DeterministicScorer_V3.1',
+  llm_participated: false,
+  radar_scores: MOCK_RADAR_SCORES,
+  indicators: {
+    distance_cm: {
+      value: 17.2,
+      unit: 'cm',
+      status: 'GREEN_OPTIMAL',
+      penalty: 0,
+      extreme_frame_index: 39,
+    },
+    toe_angle: {
+      value: 8.0,
+      unit: 'deg',
+      status: 'GREEN_OPTIMAL',
+      penalty: 0,
+      extreme_frame_index: 39,
+    },
+    max_folding_angle: {
+      value: 78.0,
+      unit: 'deg',
+      status: 'GREEN_OPTIMAL',
+      penalty: 0,
+      extreme_frame_index: 34,
+    },
+    whipping_velocity: {
+      value: 279.0,
+      unit: 'deg/s',
+      status: 'YELLOW_APPROACHING',
+      penalty: 4.2,
+      extreme_frame_index: 40,
+    },
+    impact_knee_angle: {
+      value: 148.0,
+      unit: 'deg',
+      status: 'GREEN_OPTIMAL',
+      penalty: 0,
+      extreme_frame_index: 42,
+    },
+    ankle_rigidity: {
+      value: 3.2,
+      variance: 3.2,
+      unit: 'variance',
+      status: 'YELLOW_APPROACHING',
+      penalty: 4.1,
+      extreme_frame_index: 42,
+    },
+    support_knee_angle: {
+      value: 152.0,
+      unit: 'deg',
+      status: 'GREEN_OPTIMAL',
+      penalty: 0,
+      extreme_frame_index: 39,
+    },
+    hip_torsion_angle: {
+      value: 22.0,
+      unit: 'deg',
+      status: 'GREEN_OPTIMAL',
+      penalty: 0,
+      extreme_frame_index: 42,
+    },
+  },
 }
 
 /** DeepSeek 模拟指导语列表（具身隐喻、积极意图原则） */

@@ -10,9 +10,14 @@ node_modules/
 # ignore auto-generated local report/data files, keep only source code tracked
 student feedback report/
 academic_data_export/
+telestration_annotations/
 *.docx
 *.csv
 *.xlsx
+cluster_rct.db
+session_checkpoint.db
+session_checkpoint.json
+session_checkpoint.db-*
 
 # --- whitelist protection for core backend code ---
 !*.py
@@ -29,3 +34,15 @@ academic_data_export/
 # --- absolute enforcement: these must stay ignored no matter what ---
 __pycache__/
 *.pyc
+
+# 忽略临时媒体文件与生成的科研报告，坚守隐私伦理红线
+uploads/
+video/
+student feedback report/
+*.mp4
+*.MOV
+*.mov
+*.docx
+*.csv
+__pycache__/
+.env

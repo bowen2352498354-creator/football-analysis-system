@@ -29,7 +29,7 @@ function App() {
   }
 
   return (
-    <div className="min-h-screen bg-black text-white">
+    <div className="app-shell text-slate-100">
       <Navbar
         activeView={activeView}
         onChangeView={setActiveView}
@@ -42,6 +42,7 @@ function App() {
       <AnimatePresence mode="wait">
         <motion.main
           key={activeView}
+          className="workbench-shell min-h-0 flex-1"
           initial={{ opacity: 0, y: 8 }}
           animate={{ opacity: 1, y: 0 }}
           exit={{ opacity: 0, y: -8 }}

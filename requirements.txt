@@ -1,6 +1,7 @@
 opencv-python
 mediapipe
 numpy
+scipy
 Pillow
 openai
 PyQt5
@@ -11,3 +12,5 @@ uvicorn[standard]
 python-multipart
 pandas
 openpyxl
+sqlalchemy>=2.0,<3
+pytest

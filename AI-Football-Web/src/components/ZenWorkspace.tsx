@@ -36,6 +36,9 @@ import {
   loadZenSessionsFromLocalStorage,
   saveZenSessionsToLocalStorage,
   clearZenSessionsFromLocalStorage,
+  MOCK_RADAR_SCORES,
+  MOCK_RADAR_SCORES_COMPARE,
+  MOCK_SCORE_DETAIL_V31,
 } from '../mockData'
 import type {
   AggregateDiagnosisReport,
@@ -47,6 +50,7 @@ import type {
   ZenSessionRecord,
   ZenViewMode,
 } from '../types'
+import MetricCardList from './MetricCardList'
 
 interface ZenWorkspaceProps {
   /** 来自 Navbar 的全局教学环境设置（学校 + 班级/组别），本工作台只读消费 */
@@ -241,8 +245,19 @@ export default function ZenWorkspace({ globalSettings }: ZenWorkspaceProps) {
           prescription: report?.prescription ?? '',
           generatedAt: report?.generatedAt ?? null,
           impactFrameImage: attempt.impactFrameBase64 ?? report?.impactFrameImage ?? null,
+          heatmapBase64:
+            report?.heatmap_base64 ??
+            report?.heatmapBase64 ??
+            report?.scoreDetail?.heatmap_base64 ??
+            null,
+          heatmap_base64:
+            report?.heatmap_base64 ??
+            report?.heatmapBase64 ??
+            report?.scoreDetail?.heatmap_base64 ??
+            null,
           hitStats: report?.hitStats ?? null,
           kneeFlexionAngle: report?.avgKneeAngle ?? null,
+          scoreDetail: report?.scoreDetail ?? null,
         }),
       })
       const data = (await response.json()) as { success: boolean; message?: string; record?: GlobalTrainingRecord }
@@ -1204,6 +1219,24 @@ export default function ZenWorkspace({ globalSettings }: ZenWorkspaceProps) {
                             ))}
                           </div>
                         )}
+
+                        {/* 实验B组：离线雷达 / 幽灵骨架 + 8 大量纲卡片 */}
+                        <div className="mt-3 rounded-2xl border border-white/10 bg-black/25 p-3">
+                          <MetricCardList
+                            renderMode="GROUP_B"
+                            scoreDetail={bestAttempt?.reportData?.scoreDetail ?? MOCK_SCORE_DETAIL_V31}
+                            tImpact={
+                              bestAttempt?.reportData?.t_impact ??
+                              bestAttempt?.reportData?.tImpact ??
+                              MOCK_SCORE_DETAIL_V31.t_impact ??
+                              null
+                            }
+                            radarScores={
+                              bestAttempt?.reportData?.scoreDetail?.radar_scores ?? MOCK_RADAR_SCORES
+                            }
+                            compareRadarScores={MOCK_RADAR_SCORES_COMPARE}
+                          />
+                        </div>
                       </section>
 
                       {/* 右下长立盒：DeepSeek 跨课时聚合诊断处方 */}

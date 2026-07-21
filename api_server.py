@@ -8,10 +8,12 @@ v1.1 前后端全栈联调阶段：后台服务网关（FastAPI + Uvicorn）
     (pose_tracker.py + llm_agent.py)」之间的唯一桥梁。它彻底废除了前端的假数据
     (mockData.ts) 生成逻辑，让网页真正显示后台实时推理出来的画面与数据。
 
-    本文件【完全复用】pose_tracker.py 里已经写好的核心算法函数（角度计算、
-    三级容错判定、骨骼连线绘制、面部高斯模糊打码），不重复实现任何算法逻辑，
-    只是把原来"画在 PyQt5 QLabel 上"的输出通道，换成了"通过 WebSocket 推给
-    浏览器"的输出通道；也完全复用 llm_agent.py 里封装好的 DeepSeek 调用逻辑。
+    本文件【完全复用】pose_tracker.py / image_processing.py 里已经写好的核心算法
+    （角度计算、三级容错判定、骨骼连线绘制、物理级面部脱敏 apply_facial_anonymization），
+    不重复实现任何算法逻辑；只是把原来"画在 PyQt5 QLabel 上"的输出通道，换成了
+    "通过 WebSocket 推给浏览器"的输出通道；也完全复用 llm_agent.py 里封装好的
+    DeepSeek 调用逻辑。关键点提取后、推流编码与击球关键帧缓存前，强制用脱敏安全帧
+    替换原始画面，确保错题本/对比照也是彻底无脸的。
 
 核心接口一览：
     POST /api/upload_video   ：上传本地 MP4 文件（例如 test_video.mp4），
@@ -41,6 +43,11 @@ v1.1 前后端全栈联调阶段：后台服务网关（FastAPI + Uvicorn）
                                 "一级测试类型 -> 二级学校-班级/组别 -> 三级学生编号"
                                 的规则建好文件夹树，并把规范排版的 Word (.docx) 报告
                                 写入其中，返回成功消息与生成文件的绝对物理路径。
+    GET  /api/fatigue_alert  ：课堂疲劳熔断轮询（ANKLE_FATIGUE / KNEE_STIFFNESS）。
+                                generate_report 写入时序后命中规则即缓存；教练端
+                                「纵向双轴进化图谱」每 2.5s 拉取并渲染熔断闪烁卡。
+    GET  /api/achievements/weekly ：SDT 游戏化周成就印章（钢铁锁踝王 / 最稳底盘奖 /
+                                最快进步奖），拒绝总分排名，返回匿名学员编号与指标。
 
 【科技伦理与隐私保护红线】（与 pose_tracker.py 完全一致）：
     所有视频帧的姿态推理、骨骼绘制、面部高斯模糊打码全部在服务端内存中实时完成，
@@ -82,20 +89,24 @@ v1.1 前后端全栈联调阶段：后台服务网关（FastAPI + Uvicorn）
 ============================================================================
 """
 
+# 【V2.5】必须在任何可能触发 CUDA/PyTorch 的 import 之前锁死 CUBLAS 工作区
+import os
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+
 import asyncio
 import base64
 import collections
 import io
 import json
 import math
-import os
 import queue
 import subprocess
 import sys
 import threading
 import time
 import uuid
-from typing import Optional
+from datetime import datetime, timedelta
+from typing import Any, Optional
 
 # --------------------------------------------------------------------------
 # 【Windows 编码兼容性修复：第一防线】强制把标准输出/标准错误流重新包装成
@@ -154,14 +165,21 @@ import cv2
 import mediapipe as mp
 from fastapi import FastAPI, UploadFile, File, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from pydantic import BaseModel
 
 # 【核心复用】直接把 pose_tracker.py 当作一个模块导入，复用里面已经写好的
 # 骨骼绘制 / 角度计算 / 三级容错判定 / 面部打码函数，绝不重复实现算法逻辑。
 import pose_tracker as pt
 
+# 【V2.5】导入时再次确认确定性锁死（pose_tracker 模块级已执行；此处幂等加固）
+pt.lock_vision_pipeline_determinism()
+
 # 【核心复用】直接复用 llm_agent.py 里封装好的 DeepSeek 调用逻辑。
 import llm_agent
+
+# 【V2.5】确定性评分 + Action ROI + 黄金审计日志
+import error_diagnoser
 
 # 【核心复用】直接复用 word_reporter.py 里封装好的本地归档 + Word 报告生成逻辑。
 import word_reporter
@@ -169,6 +187,21 @@ import word_reporter
 # 【v4.0 核心复用】直接复用 academic_exporter.py 里封装好的「论文专供：学术统计
 # 矩阵一键自动导出」清洗 + 落盘逻辑，完全不在本文件重复实现任何转换算法。
 import academic_exporter
+
+# 【V2.5 Cluster-RCT】教练端科研控制台：干预剂量监控 + 极端个案目的性抽样。
+# 业务逻辑全部封装在 ResearchDashboardService，本文件只挂路由与透传查询参数。
+import research_dashboard_service
+from research_models import STANDARD_SHOT_DOSE
+
+# 【疲劳熔断】复用 session_monitor 判定阈值与静态评估函数（不实例化 QObject）。
+from session_monitor import (
+    FATIGUE_MESSAGES,
+    MIN_ATTEMPTS_FOR_MONITOR,
+    BASELINE_WINDOW,
+    RECENT_WINDOW,
+    FatigueMonitor,
+    flatten_eight_metrics,
+)
 
 # 【重要防呆】当 Python 进程的标准输出没有连接到一个真正的交互式终端时
 # （例如被某些 IDE/工具通过管道重定向捕获），CPython 默认会切换成"整块缓冲"
@@ -207,6 +240,13 @@ WEB_SESSION_LOG_PATH = os.path.join(SCRIPT_DIR, "B_group_web_sessions_log.json")
 GLOBAL_DB_PATH = os.path.join(SCRIPT_DIR, "global_training_db.json")
 _global_db_lock = threading.Lock()
 
+# 【疲劳熔断】课堂时序监控状态（纯 Python，不依赖 PyQt QObject 信号总线）
+# 供教练端 / 延时组看板轮询 GET /api/fatigue_alert；generate_report 成功后写入。
+_fatigue_history_lock = threading.Lock()
+_fatigue_attempts: dict[str, list] = {}  # student_id -> flatten_eight_metrics 行
+_latest_fatigue_alerts: dict[str, dict] = {}  # student_id -> 报警字典
+_global_latest_fatigue: Optional[dict] = None
+
 # 传输给前端时，把画面等比例缩放到这个最大宽度以内，减少 WebSocket 传输的
 # Base64 数据量，避免大分辨率视频/摄像头把浏览器和网络带宽拖垮。
 MAX_TRANSMIT_WIDTH = 800
@@ -242,6 +282,13 @@ FRAME_PROGRESS_LOG_INTERVAL = 60
 # 一个学生在做分析，这里用一个简单的全局字典即可满足需求；如果未来要支持
 # 多教室并发使用，可以在这里升级为按 classroom_id 分片的会话管理。
 SESSIONS: dict[str, "AnalysisSession"] = {}
+
+# 【V2.5 竞态防护】/api/generate_report 若早于分析完成到达，最长挂起等待秒数
+REPORT_WAIT_TIMEOUT_SEC = 600.0
+
+# 任务状态常量（AnalysisSession.task_status）
+TASK_STATUS_PROCESSING = "PROCESSING"
+TASK_STATUS_COMPLETED = "COMPLETED"
 
 
 # --------------------------------------------------------------------------
@@ -366,7 +413,15 @@ class AnalysisSession:
         #   stop_event：协程收到前端"结束分析"指令时 set()，后台线程每一轮
         #               循环都会检查，检测到就自然退出（跟 VideoWorker 的
         #               request_stop() 设计思路完全一致）。
-        self.frame_queue: "queue.Queue[dict]" = queue.Queue(maxsize=2)
+        #
+        # 【V2.5 确定性】录像分析禁用「满则丢最旧帧」语义：
+        #   - file 模式：无界队列，保证推理过的每一帧都送达消费端，frame_count 绝对相等；
+        #   - webcam 模式：仍用 maxsize=2 丢旧帧保实时性（实时流允许丢显示帧）。
+        is_file = source == "file"
+        self.frame_queue: "queue.Queue[dict]" = (
+            queue.Queue() if is_file else queue.Queue(maxsize=2)
+        )
+        self._drop_frames_on_backpressure: bool = not is_file
         self.stop_event = threading.Event()
         self.thread: Optional[threading.Thread] = None
 
@@ -378,6 +433,8 @@ class AnalysisSession:
         # 【新增：实时动力链角速度监控】上一帧角度与时间戳，用于逐帧计算角速度（deg/s）
         self._prev_angle: Optional[float] = None
         self._prev_frame_time: Optional[float] = None
+        # 录像分析：用固定 fps 推导 Δt，杜绝墙钟抖动导致角速度/触球帧跳变
+        self._fixed_frame_dt: Optional[float] = None
         # 最近 STABILITY_WINDOW_SIZE 帧的角速度滑动窗口，用于计算"动平衡稳定指数"
         self._velocity_window: "collections.deque[float]" = collections.deque(maxlen=STABILITY_WINDOW_SIZE)
 
@@ -386,6 +443,19 @@ class AnalysisSession:
         self.impact_frame = None  # numpy 数组：命中的击球关键帧（已完成面部打码，未叠加骨骼线）
         self.impact_metrics: Optional[dict] = None  # 该帧对应的 hip/knee/ankle 像素坐标与角度/状态
         self._best_impact_score: float = -1.0
+        # 【V2.5】逐帧轨迹缓存，分析结束后用 locate_impact_frame 抛物线锁帧覆写
+        self._trajectory_angles: list[float] = []
+        self._trajectory_omega: list[float] = []
+        self._trajectory_ankle_px: list[tuple] = []
+        self._trajectory_frames_blurred: list = []  # 可选：仅保留候选邻域，控制内存
+        # 【Sprint 1】逐帧姿态关键点（支撑踝 / 摆腿踝等），供时空热力图坐标映射
+        self._trajectory_pose_frames: list[dict] = []
+        self.t_impact: Optional[int] = None
+        self.sync_frame_count: int = 0
+
+        # 【V2.5 竞态锁】PROCESSING → COMPLETED；generate_report 必须等 COMPLETED
+        self.task_status: str = TASK_STATUS_PROCESSING
+        self._completed_event = threading.Event()
 
         # 【新增：黑屏问题自动诊断】累计推送帧数（用于终端进度日志）+ 连续疑似全黑帧计数
         # （用于自动检测"摄像头权限被禁用/被占用/被遮挡"这一类无报错但画面全黑的情况）。
@@ -394,28 +464,122 @@ class AnalysisSession:
         self._dark_frame_warning_sent = False
 
     def start(self):
+        self.task_status = TASK_STATUS_PROCESSING
+        self._completed_event.clear()
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
     def request_stop(self):
         self.stop_event.set()
 
+    def wait_until_completed(self, timeout: float = REPORT_WAIT_TIMEOUT_SEC) -> bool:
+        """阻塞直到分析线程将状态标为 COMPLETED（或超时）。返回是否已完成。"""
+        if self.task_status == TASK_STATUS_COMPLETED:
+            return True
+        return bool(self._completed_event.wait(timeout=timeout))
+
+    def mark_completed(self) -> None:
+        """幂等：标记任务完成并唤醒所有等待 generate_report 的调用方。"""
+        self.task_status = TASK_STATUS_COMPLETED
+        self._completed_event.set()
+
     def get_records_snapshot(self) -> list[dict]:
         with self._records_lock:
             return list(self.records)
 
+    def build_scoring_payloads(self) -> tuple[dict, dict]:
+        """从本会话轨迹构造 DeterministicScorer 所需的 impact / trajectory 载荷。"""
+        knee_angles = list(self._trajectory_angles)
+        omega = list(self._trajectory_omega)
+        pose_frames = list(self._trajectory_pose_frames)
+        n = len(knee_angles)
+        t_impact = int(self.t_impact) if self.t_impact is not None else (
+            int(max(range(n), key=lambda i: abs(omega[i]))) if n > 0 else 0
+        )
+        if n > 0:
+            t_impact = int(max(0, min(n - 1, t_impact)))
+
+        # 触球帧球心锚点：优先该帧右足尖（与 lock_absolute_t0 口径一致）
+        ball_center = None
+        if pose_frames and 0 <= t_impact < len(pose_frames):
+            rec = pose_frames[t_impact]
+            world = rec.get("world") if isinstance(rec, dict) else None
+            if isinstance(world, dict) and world.get("right_foot_index") is not None:
+                ball_center = world["right_foot_index"]
+            elif isinstance(rec, dict):
+                ball_center = rec.get("right_foot_index") or rec.get("right_ankle")
+
+        impact_metrics = self.impact_metrics or {}
+        impact_frame_data = {
+            "t_impact": t_impact,
+            "task_id": self.session_id,
+            "session_id": self.session_id,
+            "total_frames": n,
+            "frames": pose_frames,
+            "ball_center": ball_center,
+            "impact_knee_angle": impact_metrics.get("angle"),
+            "distance_cm": impact_metrics.get("distance_cm"),
+            "toe_angle": impact_metrics.get("toe_angle"),
+            "support_knee_angle": impact_metrics.get("support_knee_angle"),
+            "hip_torsion_angle": impact_metrics.get("hip_torsion_angle"),
+        }
+        dt = float(self._fixed_frame_dt) if self._fixed_frame_dt else (1.0 / 30.0)
+        trajectory_data = {
+            "task_id": self.session_id,
+            "session_id": self.session_id,
+            "knee_angles": knee_angles,
+            "angular_velocities": omega,
+            "timestamps_sec": [i * dt for i in range(n)],
+            "total_frames": n,
+            "t_impact": t_impact,
+            "frames": pose_frames,
+            "ball_center": ball_center,
+            "whipping_velocity": float(max((abs(v) for v in omega), default=0.0)),
+        }
+        return impact_frame_data, trajectory_data
+
+    def build_time_series_velocity_window(
+        self, t_impact: Optional[int] = None
+    ) -> tuple[list[float], int, int]:
+        """裁剪 Action ROI 内的摆动腿小腿连续角速度序列（KinematicSignalProcessor 平滑后）。
+
+        窗口为 ``[t_impact-30, t_impact+30)``（最长约 60 帧）。返回：
+            (time_series_velocity, impact_index_in_window, roi_start)
+        边界未截断时 ``impact_index_in_window`` 恒为 30（数组中心）。
+        """
+        omega_raw = list(self._trajectory_omega)
+        n = len(omega_raw)
+        if n <= 0:
+            return [], 0, 0
+
+        omega_smooth = pt.KinematicSignalProcessor.smooth_joint_trajectories(omega_raw)
+        if t_impact is None:
+            t_impact = int(self.t_impact) if self.t_impact is not None else int(
+                max(range(n), key=lambda i: abs(float(omega_smooth[i])))
+            )
+        t = int(max(0, min(n - 1, int(t_impact))))
+        roi_start, roi_end = error_diagnoser.slice_action_roi_bounds(t, n)
+        window = [round(float(v), 2) for v in omega_smooth[roi_start:roi_end]]
+        impact_index_in_window = int(t - roi_start)
+        return window, impact_index_in_window, int(roi_start)
+
     def _compute_angular_velocity(self, angle: float) -> float:
         """根据"当前帧角度 - 上一帧角度"除以帧间时间差，计算右膝角速度（deg/s）。
         第一帧因为没有"上一帧"可比较，约定角速度为 0。
+
+        【V2.5】录像模式优先使用固定 fps 的 Δt，避免 wall-clock 抖动导致分数跳变。
         """
-        now = time.time()
         angular_velocity = 0.0
-        if self._prev_angle is not None and self._prev_frame_time is not None:
-            dt = now - self._prev_frame_time
+        if self._prev_angle is not None:
+            if self._fixed_frame_dt is not None and self._fixed_frame_dt > 0:
+                dt = self._fixed_frame_dt
+            else:
+                now = time.time()
+                dt = (now - self._prev_frame_time) if self._prev_frame_time is not None else 0.0
             if dt > 0:
                 angular_velocity = (angle - self._prev_angle) / dt
         self._prev_angle = angle
-        self._prev_frame_time = now
+        self._prev_frame_time = time.time()
         self._velocity_window.append(angular_velocity)
         return angular_velocity
 
@@ -440,10 +604,10 @@ class AnalysisSession:
         整趟练习结束后，self.impact_frame 会一直保留角速度绝对值最大（即冲击最
         剧烈、最贴近真实触球瞬间）的那一帧，供 /api/generate_report 生成矢量标注图。
 
-        重要：必须在 pt.apply_face_blur() 之后、pt.draw_pose_landmarks() /
-        pt.draw_right_knee_overlay() 之前调用——既要保证脸部已经打码（隐私红线），
-        又要保证存下来的是一张"干净"的画面，方便后续单独叠加矢量标注，不会与
-        实时预览用的白色骨骼线/粗染色线互相干扰。
+        重要：必须在 pt.apply_facial_anonymization()（或兼容别名 apply_face_blur）
+        之后、pt.draw_pose_landmarks() / pt.draw_right_knee_overlay() 之前调用——
+        既要保证脸部已经打码（隐私红线），又要保证存下来的是一张"干净"的画面，
+        方便后续单独叠加矢量标注，不会与实时预览用的白色骨骼线/粗染色线互相干扰。
         """
         height, width = frame.shape[:2]
         left_hip = landmarks[23]
@@ -453,7 +617,9 @@ class AnalysisSession:
             int((left_hip.y + right_hip.y) / 2 * height),
         )
 
-        self.impact_frame = frame.copy()
+        # 【隐私红线】落盘/缓存前再次强制脱敏，杜绝任何旁路漏网的原始带脸帧
+        safe_frame = pt.apply_facial_anonymization(frame, landmarks)
+        self.impact_frame = safe_frame.copy()
         self.impact_metrics = {
             "hip_px": hip_px,
             "knee_px": knee_px,
@@ -464,10 +630,14 @@ class AnalysisSession:
         }
 
     def _push_frame_payload(self, payload: dict):
-        """把一份处理好的帧数据放进队列；如果消费端（WebSocket 协程）来不及
-        取走导致队列满了，就直接丢弃最旧的一帧，保证画面始终贴近"实时"，
-        而不是攒积压帧导致画面越播越"卡"、越滞后。
+        """把一份处理好的帧数据放进队列。
+
+        【V2.5】录像分析（file）严禁丢帧：阻塞式 put，保证 frame_count 绝对相等。
+        仅实时摄像头模式允许在背压时丢弃最旧显示帧。
         """
+        if not self._drop_frames_on_backpressure:
+            self.frame_queue.put(payload)
+            return
         try:
             self.frame_queue.put_nowait(payload)
         except queue.Full:
@@ -480,6 +650,36 @@ class AnalysisSession:
             except queue.Full:
                 pass
 
+    def _finalize_impact_with_parabolic_lock(self) -> None:
+        """分析结束后用 locate_impact_frame（抛物线插值）覆写流式峰值候选，零漂移锁帧。"""
+        n = len(self._trajectory_omega)
+        if n < 3 or len(self._trajectory_ankle_px) < n:
+            if n > 0:
+                self.t_impact = int(max(range(n), key=lambda i: abs(self._trajectory_omega[i])))
+            return
+
+        # 球心代理：若无独立球检测，用整段踝坐标中位数作为静止球近似（操场固定机位）
+        ankles = self._trajectory_ankle_px[:n]
+        xs = [float(a[0]) for a in ankles]
+        ys = [float(a[1]) for a in ankles]
+        # 取踝轨迹 Y 较大的 15% 分位中位数作为触地球区近似球心
+        order = sorted(range(n), key=lambda i: ys[i])
+        tail = order[int(n * 0.85) :] or order[-1:]
+        ball_x = float(sum(xs[i] for i in tail) / len(tail))
+        ball_y = float(sum(ys[i] for i in tail) / len(tail))
+        ball_coords = [(ball_x, ball_y) for _ in range(n)]
+
+        omega_smooth = pt.KinematicSignalProcessor.smooth_joint_trajectories(
+            list(self._trajectory_omega[:n])
+        )
+        t_impact = pt.locate_impact_frame(omega_smooth, ankles, ball_coords)
+        self.t_impact = int(t_impact)
+        safe_print(
+            f"【api_server】[V2.5] 抛物线触球锁帧 t_impact={self.t_impact} "
+            f"（同步总帧数 frame_count={self.sync_frame_count}）",
+            flush=True,
+        )
+
     def _run(self):
         """后台工作线程主体：逐帧读取视频源 -> 姿态检测 -> 力学诊断 ->
         骨骼染色 + 面部打码渲染 -> 编码成 Base64 JPEG -> 推入队列。
@@ -490,6 +690,7 @@ class AnalysisSession:
         cap = None
         landmarker = None
         is_video_file_mode = self.source == "file"
+        video_fps = 30.0
 
         try:
             pt.ensure_model_downloaded()
@@ -502,9 +703,13 @@ class AnalysisSession:
                         "message": f"未找到视频文件：{self.video_path}",
                     })
                     return
-                cap = cv2.VideoCapture(self.video_path)
+                cap, video_fps, _reported = pt.open_video_capture_deterministic(
+                    self.video_path, is_camera=False
+                )
             else:
-                cap = cv2.VideoCapture(self.camera_index)
+                cap, video_fps, _reported = pt.open_video_capture_deterministic(
+                    "", is_camera=True, camera_index=self.camera_index
+                )
 
             if not cap.isOpened():
                 # 【新增】终端同步打印一条明确的错误提示：这是"点击开始分析后一直黑屏，
@@ -518,27 +723,28 @@ class AnalysisSession:
                 return
 
             if is_video_file_mode:
-                video_fps = cap.get(cv2.CAP_PROP_FPS)
-                if not video_fps or video_fps <= 0:
-                    video_fps = 30.0
-                frame_delay_seconds = 1.0 / video_fps
+                # 【V2.5】录像分析：固定 Δt，角速度与 MediaPipe 时间戳完全由 fps 决定
+                self._fixed_frame_dt = 1.0 / float(video_fps)
+                frame_delay_seconds = self._fixed_frame_dt
             else:
+                self._fixed_frame_dt = None
                 frame_delay_seconds = 0.0
 
-            # 与 pose_tracker.py A组逻辑完全一致：VIDEO 运行模式的姿态检测器
-            pose_options = pt.mp_vision.PoseLandmarkerOptions(
-                base_options=pt.mp_tasks_python.BaseOptions(model_asset_path=pt.MODEL_PATH),
-                running_mode=pt.mp_vision.RunningMode.VIDEO,
-                num_poses=1,
-                min_pose_detection_confidence=0.5,
-                min_pose_presence_confidence=0.5,
-                min_tracking_confidence=0.5,
-            )
-            landmarker = pt.mp_vision.PoseLandmarker.create_from_options(pose_options)
+            # 【V2.5】每次分析任务：销毁旧 PoseLandmarker/YOLO 记忆并重建干净实例
+            task_handles = pt.start_analysis_task(reset_yolo=True)
+            landmarker = task_handles["pose_landmarker"]
 
+            frame_interval_ms = int(round(1000.0 / float(video_fps)))
             frame_timestamp_ms = 0
+            self.sync_frame_count = 0
 
-            while not self.stop_event.is_set() and cap.isOpened():
+            # 【V2.5】同步阻断式 while cap.read()：录像路径严禁跳帧/丢帧
+            # 录像文件模式：忽略 stop_event，必须读到 EOF，避免报告竞态截断在 300/414 帧。
+            # 摄像头模式：允许 stop_event 提前结束。
+            while cap.isOpened():
+                if (not is_video_file_mode) and self.stop_event.is_set():
+                    break
+
                 loop_start_time = time.time()
 
                 ret, frame = cap.read()
@@ -572,10 +778,13 @@ class AnalysisSession:
                     else:
                         safe_print(
                             f"【api_server】提示：视频源已读取完毕或已断开"
-                            f"（本次分析累计成功推送 {self._pushed_frame_count} 帧），分析自然结束。",
+                            f"（本次分析同步读入 frame_count={self.sync_frame_count}，"
+                            f"成功推送 {self._pushed_frame_count} 帧），分析自然结束。",
                             flush=True,
                         )
                     break
+
+                self.sync_frame_count += 1
 
                 if not is_video_file_mode:
                     frame = cv2.flip(frame, 1)
@@ -589,7 +798,7 @@ class AnalysisSession:
                     safe_print(
                         f"【api_server】[OK] 已成功读取到第 1 帧原始画面"
                         f"（平均亮度 {mean_brightness:.1f}/255，数值越接近 0 代表画面越黑），"
-                        f"视频推理管线已正常启动。"
+                        f"视频推理管线已正常启动（V2.5 同步顺序帧 / 模型热重置）。"
                     )
                 elif self._pushed_frame_count % FRAME_PROGRESS_LOG_INTERVAL == 0:
                     safe_print(
@@ -623,7 +832,8 @@ class AnalysisSession:
 
                 rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
-                frame_timestamp_ms += 33
+                # MediaPipe VIDEO 时间戳按真实 fps 递增，杜绝写死 33ms 造成的跨次漂移
+                frame_timestamp_ms += frame_interval_ms
                 results = landmarker.detect_for_video(mp_image, frame_timestamp_ms)
 
                 angle_value = None
@@ -651,13 +861,47 @@ class AnalysisSession:
                         angular_velocity = self._compute_angular_velocity(angle)
                         stability_index_value = self._compute_stability_index()
 
-                        # 顺序严格保持与 pose_tracker.py 一致：先打码，再画骨骼线，
-                        # 最后叠加红/黄/绿容错染色骨骼线，避免打码把骨骼线又"擦掉"。
-                        pt.apply_face_blur(frame, landmarks)
+                        # 轨迹缓存（供结束后抛物线锁帧）
+                        self._trajectory_angles.append(float(angle))
+                        self._trajectory_omega.append(float(angular_velocity))
+                        self._trajectory_ankle_px.append(
+                            (float(ankle_px[0]), float(ankle_px[1]))
+                        )
+                        # Sprint 1：支撑脚 / 摆腿时空热力图所需逐帧关键点
+                        try:
+                            world_lms = None
+                            if getattr(results, "pose_world_landmarks", None):
+                                world_lms = results.pose_world_landmarks[0]
+                            ts_sec = (
+                                float(self.sync_frame_count - 1) * float(self._fixed_frame_dt)
+                                if self._fixed_frame_dt
+                                else float(self.sync_frame_count - 1) / 30.0
+                            )
+                            self._trajectory_pose_frames.append(
+                                pt.serialize_pose_frame_record(
+                                    landmarks,
+                                    frame.shape,
+                                    timestamp_sec=ts_sec,
+                                    world_landmarks=world_lms,
+                                )
+                            )
+                        except Exception:  # noqa: BLE001 - 热力图序列化失败不阻断主诊断链路
+                            ts_sec = (
+                                float(self.sync_frame_count - 1) * float(self._fixed_frame_dt)
+                                if self._fixed_frame_dt
+                                else float(self.sync_frame_count - 1) / 30.0
+                            )
+                            self._trajectory_pose_frames.append(pt.empty_pose_frame_record(ts_sec))
 
-                        # 【新增：击球关键帧自动捕捉】在打码之后、骨骼线绘制之前，
+                        # 【绝对拦截器 / Choke Point】关键点提取后立即强制替换为脱敏安全帧，再画骨骼线；
+                        # 这是符合《未成年人保护法》与科研伦理审查的物理级脱敏，任何人不得在此行代码之前进行原图转存。
+                        # 顺序严格保持：先打码，再捕捉击球关键帧，最后叠加染色骨骼线。
+                        frame = pt.apply_facial_anonymization(frame, landmarks)
+
+                        # 【击球关键帧自动捕捉】在打码之后、骨骼线绘制之前，
                         # 用"角速度绝对值是否为整趟练习目前最大值"来判定是否更新击球关键帧候选，
                         # 角速度越大代表这一帧越接近真实的"发力冲击瞬间"。
+                        # 写入 impact_frame 的一定是无脸安全图像（错题本/对比照同理）。
                         impact_score = abs(angular_velocity)
                         if impact_score > self._best_impact_score:
                             self._best_impact_score = impact_score
@@ -677,15 +921,44 @@ class AnalysisSession:
                             "knee_angle": angle_value,
                             "status": status_value,
                             "angular_velocity": angular_velocity_value,
+                            "frame_index": self.sync_frame_count - 1,
                         }
                         with self._records_lock:
                             self.records.append(record)
+                    else:
+                        # 无姿态帧：仍计入同步帧序列长度，用中性值填轨迹以保持索引对齐
+                        self._trajectory_angles.append(
+                            float(self._trajectory_angles[-1]) if self._trajectory_angles else 150.0
+                        )
+                        self._trajectory_omega.append(0.0)
+                        self._trajectory_ankle_px.append(
+                            self._trajectory_ankle_px[-1] if self._trajectory_ankle_px else (0.0, 0.0)
+                        )
+                        ts_sec = (
+                            float(self.sync_frame_count - 1) * float(self._fixed_frame_dt)
+                            if self._fixed_frame_dt
+                            else float(self.sync_frame_count - 1) / 30.0
+                        )
+                        self._trajectory_pose_frames.append(pt.empty_pose_frame_record(ts_sec))
                 except Exception as diagnosis_exc:  # noqa: BLE001 - 单帧诊断异常绝不能打断整条视频流
                     safe_print(f"【api_server】单帧姿态诊断/角速度计算发生异常（已跳过该帧诊断信息，画面仍会继续推送）：{diagnosis_exc}")
                     angle_value = None
                     status_value = None
                     angular_velocity_value = None
                     stability_index_value = None
+                    self._trajectory_angles.append(
+                        float(self._trajectory_angles[-1]) if self._trajectory_angles else 150.0
+                    )
+                    self._trajectory_omega.append(0.0)
+                    self._trajectory_ankle_px.append(
+                        self._trajectory_ankle_px[-1] if self._trajectory_ankle_px else (0.0, 0.0)
+                    )
+                    ts_sec = (
+                        float(self.sync_frame_count - 1) * float(self._fixed_frame_dt)
+                        if self._fixed_frame_dt
+                        else float(self.sync_frame_count - 1) / 30.0
+                    )
+                    self._trajectory_pose_frames.append(pt.empty_pose_frame_record(ts_sec))
 
                 # 传输前按最大宽度等比例缩小，减轻 Base64 + WebSocket 的带宽压力
                 height, width = frame.shape[:2]
@@ -711,6 +984,7 @@ class AnalysisSession:
                     "status": status_value,
                     "angular_velocity": angular_velocity_value,
                     "stability_index": stability_index_value,
+                    "frame_index": self.sync_frame_count - 1,
                     "timestamp": time.time(),
                 })
 
@@ -719,6 +993,10 @@ class AnalysisSession:
                     remaining = frame_delay_seconds - elapsed
                     if remaining > 0:
                         time.sleep(remaining)
+
+            # 录像跑完后：抛物线插值锁定全局唯一 t_impact
+            if is_video_file_mode:
+                self._finalize_impact_with_parabolic_lock()
 
         except Exception as exc:  # noqa: BLE001 - 后台线程内的任何异常都不能让服务崩溃
             # 【新增】同步把异常信息打印到服务端终端：之前这里只把错误通过 WebSocket
@@ -730,11 +1008,16 @@ class AnalysisSession:
             if cap is not None:
                 cap.release()
             if landmarker is not None:
-                landmarker.close()
+                pt.destroy_pose_landmarker(landmarker)
+            # 【V2.5】必须在推送 stopped 之前标记 COMPLETED，唤醒挂起的 generate_report
+            self.mark_completed()
             self._push_frame_payload({
                 "type": "stopped",
                 "session_id": self.session_id,
                 "total_records": len(self.records),
+                "frame_count": self.sync_frame_count,
+                "t_impact": self.t_impact,
+                "task_status": self.task_status,
             })
 
 
@@ -894,14 +1177,39 @@ class GenerateReportRequest(BaseModel):
 def generate_report(payload: GenerateReportRequest):
     """分析结束后，前端带着刚才那次分析的 session_id 调用本接口。
 
+    【V2.5 竞态防护】若 WebSocket 仍在推帧 / MediaPipe 尚未跑完，本接口会挂起
+    等待 AnalysisSession.task_status == COMPLETED，禁止用半截轨迹打分。
+
     后台会：
-        1) 从内存里取出这次分析全过程采集到的真实诊断记录；
-        2) 汇总出 Green / Yellow / Red 三级命中次数统计；
-        3) 真正调用 llm_agent.generate_session_report()，把统计数据交给
-           DeepSeek 大模型，换回结构化的评分 + 痛点 + 处方；
-        4) 拼接成前端 FinalDiagnosisReport 类型所需的完整 JSON 返回。
+        1) 等待分析 COMPLETED；
+        2) 用 DeterministicScorer + Action ROI（t_impact±30）解算确定性总分；
+        3) 打印黄金审计日志；
+        4) 汇总三级命中统计并调用 llm_agent 生成文字痛点/处方；
+        5) 返回结构化报告 JSON（分数以确定性引擎为准）。
     """
     session = SESSIONS.get(payload.session_id)
+
+    # ---------- 竞态锁：未完成则挂起等待 ----------
+    if session is not None and session.task_status != TASK_STATUS_COMPLETED:
+        safe_print(
+            f"【api_server】[竞态防护] generate_report 早到：session={payload.session_id} "
+            f"status={session.task_status}，挂起等待 COMPLETED（超时 {REPORT_WAIT_TIMEOUT_SEC:.0f}s）…",
+            flush=True,
+        )
+        finished = session.wait_until_completed(timeout=REPORT_WAIT_TIMEOUT_SEC)
+        if not finished:
+            safe_print(
+                f"【api_server】[竞态防护] 等待超时：session={payload.session_id} "
+                f"仍为 {session.task_status}，将基于当前已采集轨迹继续报告（可能不完整）。",
+                flush=True,
+            )
+        else:
+            safe_print(
+                f"【api_server】[竞态防护] 分析已 COMPLETED：frame_count={session.sync_frame_count}，"
+                f"t_impact={session.t_impact}，开始确定性打分。",
+                flush=True,
+            )
+
     records = session.get_records_snapshot() if session is not None else []
 
     hit_stats = {"green": 0, "yellow": 0, "red": 0}
@@ -922,14 +1230,62 @@ def generate_report(payload: GenerateReportRequest):
     # 「双轴互动运动学成长期刊图」右侧蓝色虚线轴与学术统计矩阵导出直接消费。
     avg_knee_angle = round(sum(sample_angles) / len(sample_angles), 1) if sample_angles else None
 
+    # ---------- V2.5 确定性打分（Action ROI）+ 黄金审计 ----------
+    deterministic_score = None
+    score_detail = None
+    t_impact_locked = None
+    heatmap_base64 = None
+    spatial_trajectory = None
+    if session is not None and len(session._trajectory_angles) > 0:
+        impact_payload, trajectory_payload = session.build_scoring_payloads()
+        deterministic_score, score_detail = error_diagnoser.calculate_biomechanical_score(
+            impact_payload, trajectory_payload
+        )
+        t_impact_locked = int(score_detail.get("t_impact", session.t_impact or 0))
+        heatmap_base64 = score_detail.get("heatmap_base64")
+        spatial_trajectory = score_detail.get("spatial_trajectory")
+        # 若打分路径未产出热力图（极短序列等），再显式用姿态序列补一次
+        if not heatmap_base64 and session._trajectory_pose_frames:
+            try:
+                heat = error_diagnoser.build_spatial_heatmap_payload(
+                    session._trajectory_pose_frames,
+                    t_impact_locked,
+                    ball_center_t_impact=impact_payload.get("ball_center"),
+                )
+                heat.pop("_canvas_bgr", None)
+                heatmap_base64 = heat.get("heatmap_base64")
+                spatial_trajectory = {
+                    k: v
+                    for k, v in heat.items()
+                    if k not in ("heatmap_base64", "heatmap_data_uri", "_canvas_bgr")
+                }
+                if isinstance(score_detail, dict):
+                    score_detail["heatmap_base64"] = heatmap_base64
+                    score_detail["spatial_trajectory"] = spatial_trajectory
+            except Exception as heat_exc:  # noqa: BLE001
+                safe_print(f"【api_server】时空热力图生成失败（不影响评分）：{heat_exc}")
+        error_diagnoser.print_golden_audit_log(
+            task_id=payload.session_id,
+            knee_angle_count=len(trajectory_payload.get("knee_angles") or []),
+            impact_frame_idx=t_impact_locked,
+            final_score=float(deterministic_score),
+        )
+
     ai_result = llm_agent.generate_session_report(
         hit_stats=hit_stats, student_number=payload.student_number, sample_angles=sample_angles
+    )
+
+    # 分数以确定性引擎为准；无轨迹时回退 LLM 分
+    final_score = (
+        float(deterministic_score)
+        if deterministic_score is not None
+        else float(ai_result["score"])
     )
 
     generated_at = time.strftime("%Y-%m-%d %H:%M:%S")
     full_text = (
         f"学号 {payload.student_number or '未填写'} 本次综合练习诊断报告\n\n"
-        f"发力稳定性评分：{ai_result['score']} 分（共采集 {total_attempts} 次有效触球数据）。\n"
+        f"发力稳定性评分：{final_score:.2f} 分（共采集 {total_attempts} 次有效触球数据）。\n"
         f"{ai_result['painPoint']}\n"
         f"{ai_result['prescription']}"
     )
@@ -944,12 +1300,38 @@ def generate_report(payload: GenerateReportRequest):
         if ok:
             impact_frame_image = f"data:image/jpeg;base64,{base64.b64encode(buffer).decode('ascii')}"
 
+    # V2.5 Kinovea 联动：全程角速度 + Action ROI 鞭打发力窗口（须在 pop 前读完）
+    angular_velocities_out = None
+    frame_count_out = len(sample_angles)
+    time_series_velocity: Optional[list] = None
+    impact_index_in_window: Optional[int] = None
+    if session is not None:
+        angular_velocities_out = [float(v) for v in session._trajectory_omega]
+        frame_count_out = int(
+            getattr(session, "sync_frame_count", None) or len(session._trajectory_omega) or len(sample_angles)
+        )
+        if len(session._trajectory_omega) > 0:
+            time_series_velocity, impact_index_in_window, _roi_start = (
+                session.build_time_series_velocity_window(t_impact=t_impact_locked)
+            )
+
     # 报告已生成完毕，主动清理这份会话（连同内存中持有的击球关键帧画面），
     # 严格遵守"不长期持久化保存任何视频帧"的科技伦理红线，同时避免内存持续累积。
     SESSIONS.pop(payload.session_id, None)
 
+    # 【疲劳熔断】将本趟确定性打分写入课堂时序；命中 ANKLE_FATIGUE 等时缓存供看板轮询
+    fatigue_warning = None
+    if isinstance(score_detail, dict):
+        try:
+            fatigue_warning = _ingest_web_fatigue_attempt(
+                payload.student_number or "",
+                score_detail,
+            )
+        except Exception as fatigue_exc:  # noqa: BLE001
+            safe_print(f"【api_server】疲劳熔断写入失败（不影响报告）：{fatigue_exc}")
+
     return {
-        "score": ai_result["score"],
+        "score": final_score,
         "totalAttempts": total_attempts,
         "painPoint": ai_result["painPoint"],
         "prescription": ai_result["prescription"],
@@ -958,6 +1340,27 @@ def generate_report(payload: GenerateReportRequest):
         "hitStats": hit_stats,
         "impactFrameImage": impact_frame_image,
         "avgKneeAngle": avg_knee_angle,
+        "t_impact": t_impact_locked,
+        "tImpact": t_impact_locked,
+        "frame_count": frame_count_out,
+        "frameCount": frame_count_out,
+        "angular_velocities": angular_velocities_out,
+        "angularVelocities": angular_velocities_out,
+        # Sprint 1：鞭打发力窗口 [t_impact±30] 角速度时序 + 触球点窗口内索引
+        "time_series_velocity": time_series_velocity,
+        "timeSeriesVelocity": time_series_velocity,
+        "impact_index_in_window": impact_index_in_window,
+        "impactIndexInWindow": impact_index_in_window,
+        "task_status": TASK_STATUS_COMPLETED,
+        "scoreDetail": score_detail,
+        "scoringEngine": "DeterministicScorer_V2.5" if deterministic_score is not None else "llm_fallback",
+        # Sprint 1：支撑脚 / 摆腿时空热力图（纯 PNG base64，前端拼 data URI）
+        "heatmap_base64": heatmap_base64,
+        "heatmapBase64": heatmap_base64,
+        "spatial_trajectory": spatial_trajectory,
+        "spatialTrajectory": spatial_trajectory,
+        "fatigue_warning": fatigue_warning,
+        "fatigueWarning": fatigue_warning,
     }
 
 
@@ -1108,6 +1511,9 @@ class SaveWordReportRequest(BaseModel):
     generatedAt: Optional[str] = None
     # 后端 OpenCV 矢量标注过的击球关键帧截图，Base64/data URI 字符串，可为空
     impactFrameImage: Optional[str] = None
+    # Sprint 1：支撑脚 / 摆腿时空热力图 PNG base64（可带或不带 data URI 前缀）
+    heatmapBase64: Optional[str] = None
+    heatmap_base64: Optional[str] = None
     # 【v3.0 新增：集体错误热力图数据源】本次分析的三级容错命中次数统计
     # （Green/Yellow/Red），前端 finalReport.hitStats / attempt.reportData.hitStats
     # 原样转发过来，后端据此推导出本条记录归属的生物力学错误分类标签，
@@ -1118,6 +1524,10 @@ class SaveWordReportRequest(BaseModel):
     # 真实计算出的物理测量值）。缺失时（例如历史联调数据、前端尚未回填）后端
     # 会自动退化为基于评分的启发式估算，确保导出的学术矩阵绝不出现空值。
     kneeFlexionAngle: Optional[float] = None
+    # 【SDT 成就印章】前端原样转发 generate_report 的 scoreDetail，供落盘时
+    # 抽出脚踝刚性方差 / 支撑脚横纵偏差 / 五维雷达，供周成就引擎消费。
+    scoreDetail: Optional[dict] = None
+    score_detail: Optional[dict] = None
 
 
 # 【v3.0 新增：生物力学错误分类体系】
@@ -1248,6 +1658,472 @@ def _append_global_record(record: dict) -> None:
             json.dump(records, f, ensure_ascii=False, indent=2)
 
 
+# --------------------------------------------------------------------------
+# SDT 游戏化成就印章引擎（拒绝总分排名，只发多维度独立王者）
+# --------------------------------------------------------------------------
+
+_SUPPORT_LATERAL_IDEAL_CENTER_CM = 17.5
+_RADAR_DIM_KEYS = (
+    "support_stability",
+    "backswing_folding",
+    "ankle_rigidity",
+    "whipping_velocity",
+    "approach_rhythm",
+)
+
+_ACHIEVEMENT_PRAISE = {
+    "iron_ankle": "踝关节稳如泰山，力量毫无流失！",
+    "stable_chassis": "支撑脚扎根大地，底盘稳如磐石！",
+    "fastest_progress": "本周飞跃成长，高反应者实至名归！",
+}
+
+
+def _parse_record_datetime(record: dict) -> Optional[datetime]:
+    """从 testDate / timestamp 解析记录时间；失败返回 None。"""
+    raw = (record.get("timestamp") or "").strip()
+    if not raw:
+        date_only = (record.get("testDate") or "").strip()
+        if len(date_only) >= 10:
+            raw = date_only[:10] + " 12:00:00"
+    if not raw:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(raw[:19] if len(raw) >= 19 else raw[:10], fmt)
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00").replace(" ", "T")[:19])
+    except ValueError:
+        return None
+
+
+def _week_window(now: Optional[datetime] = None) -> tuple[datetime, datetime, datetime, datetime]:
+    """返回 (本周一起点, 本周结束, 上周一起点, 上周结束)，周一 00:00 为界。"""
+    anchor = now or datetime.now()
+    this_monday = anchor.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(
+        days=anchor.weekday()
+    )
+    next_monday = this_monday + timedelta(days=7)
+    last_monday = this_monday - timedelta(days=7)
+    return this_monday, next_monday, last_monday, this_monday
+
+
+def _safe_float(value: Any) -> Optional[float]:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if math.isnan(float(value)) or math.isinf(float(value)):
+            return None
+        return float(value)
+    return None
+
+
+def _nested_metric_value(container: Any, *keys: str) -> Optional[float]:
+    """从扁平字段 / indicators 嵌套 {value|variance} 中取第一个可用标量。"""
+    if not isinstance(container, dict):
+        return None
+    for key in keys:
+        entry = container.get(key)
+        if isinstance(entry, dict):
+            for sub in ("variance", "value"):
+                num = _safe_float(entry.get(sub))
+                if num is not None:
+                    return num
+        else:
+            num = _safe_float(entry)
+            if num is not None:
+                return num
+    return None
+
+
+def _extract_ankle_rigidity_variance(record: dict) -> Optional[float]:
+    """脚踝刚性方差（越小越锁踝稳固）。优先真实字段，缺失时用综合分启发式。"""
+    direct = _nested_metric_value(
+        record,
+        "ankle_rigidity",
+        "ankle_rigidity_variance",
+        "ankleRigidity",
+        "ankleRigidityVariance",
+    )
+    if direct is not None:
+        return max(0.0, direct)
+
+    metrics = record.get("instepKickMetrics") or record.get("metrics") or {}
+    if isinstance(metrics, dict):
+        from_metrics = _nested_metric_value(
+            metrics,
+            "ankle_rigidity",
+            "ankle_rigidity_variance",
+            "ankle_variance",
+        )
+        if from_metrics is not None:
+            return max(0.0, from_metrics)
+
+    detail = record.get("scoreDetail") or record.get("score_detail") or {}
+    if isinstance(detail, dict):
+        indicators = detail.get("indicators") if isinstance(detail.get("indicators"), dict) else detail
+        from_detail = _nested_metric_value(
+            indicators,
+            "ankle_rigidity",
+            "ankle_rigidity_variance",
+        )
+        if from_detail is not None:
+            return max(0.0, from_detail)
+
+    score = _safe_float(record.get("score"))
+    if score is None:
+        return None
+    # 启发式：高分 → 低方差（与 ANKLE_VARIANCE_* 量级对齐）
+    return round(max(0.0, (100.0 - score) / 12.0), 3)
+
+
+def _support_lateral_deviation(lateral_cm: float) -> float:
+    """相对 [15, 20] cm 理想带的横向偏差（带内为 0）。"""
+    low, high = 15.0, 20.0
+    if low <= lateral_cm <= high:
+        return 0.0
+    if lateral_cm < low:
+        return low - lateral_cm
+    return lateral_cm - high
+
+
+def _extract_support_chassis_deviation(record: dict) -> Optional[float]:
+    """支撑脚横纵向位移偏差综合值 = 横向偏离理想带 + |纵向 AP 偏移|。"""
+    metrics = record.get("instepKickMetrics") or record.get("metrics") or {}
+    detail = record.get("scoreDetail") or record.get("score_detail") or {}
+    indicators: dict = {}
+    if isinstance(detail, dict) and isinstance(detail.get("indicators"), dict):
+        indicators = detail["indicators"]
+
+    lateral = (
+        _nested_metric_value(record, "support_lateral_dist_cm", "supportLateralDistCm", "distance_cm")
+        or _nested_metric_value(
+            metrics if isinstance(metrics, dict) else {},
+            "support_lateral_dist_cm",
+            "distance_cm",
+        )
+        or _nested_metric_value(indicators, "distance_cm", "support_lateral_dist_cm")
+    )
+    ap = (
+        _nested_metric_value(record, "support_ap_offset_cm", "supportApOffsetCm")
+        or _nested_metric_value(
+            metrics if isinstance(metrics, dict) else {},
+            "support_ap_offset_cm",
+        )
+        or _nested_metric_value(indicators, "support_ap_offset_cm")
+    )
+
+    if lateral is None:
+        foot = _safe_float(record.get("supportFootDistance"))
+        if foot is not None:
+            lateral = foot
+    if lateral is None:
+        score = _safe_float(record.get("score"))
+        if score is None:
+            return None
+        lateral = _SUPPORT_LATERAL_IDEAL_CENTER_CM + (100.0 - score) * 0.15
+    if ap is None:
+        score = _safe_float(record.get("score"))
+        # 启发式：低分时略增大前后偏差
+        ap = 0.0 if score is None else max(0.0, (70.0 - score) * 0.2)
+
+    return round(_support_lateral_deviation(float(lateral)) + abs(float(ap)), 3)
+
+
+def _sum_radar_scores(radar: Any) -> Optional[float]:
+    if not isinstance(radar, dict):
+        return None
+    vals: list[float] = []
+    for key in _RADAR_DIM_KEYS:
+        num = _safe_float(radar.get(key))
+        if num is None:
+            # 兼容旧版 *_score 别名
+            num = _safe_float(radar.get(f"{key}_score"))
+        if num is not None:
+            vals.append(num)
+    # 也兼容 quantified5dScores 的简写键
+    if len(vals) < 3:
+        alias_map = {
+            "support_stability": ("support_stability_score", "support"),
+            "backswing_folding": ("backswing_folding_score", "folding"),
+            "ankle_rigidity": ("ankle_rigidity_score",),
+            "whipping_velocity": ("whipping_velocity_score", "whipping"),
+            "approach_rhythm": ("approach_rhythm_score", "approach"),
+        }
+        vals = []
+        for key, aliases in alias_map.items():
+            num = _safe_float(radar.get(key))
+            if num is None:
+                for a in aliases:
+                    num = _safe_float(radar.get(a))
+                    if num is not None:
+                        break
+            if num is not None:
+                vals.append(num)
+    if not vals:
+        return None
+    return round(sum(vals), 2)
+
+
+def _extract_five_dim_total(record: dict) -> Optional[float]:
+    """五维雷达总分（每维满分 20，合计满分 100）；缺失时回退综合分 score。"""
+    for key in ("quantified5dScores", "radar_scores", "radarScores"):
+        total = _sum_radar_scores(record.get(key))
+        if total is not None:
+            return total
+    detail = record.get("scoreDetail") or record.get("score_detail") or {}
+    if isinstance(detail, dict):
+        total = _sum_radar_scores(detail.get("radar_scores"))
+        if total is not None:
+            return total
+    return _safe_float(record.get("score"))
+
+
+def _mean(values: list[float]) -> Optional[float]:
+    if not values:
+        return None
+    return sum(values) / len(values)
+
+
+def _pack_winner(
+    badge_id: str,
+    title: str,
+    emoji: str,
+    student_id: Optional[str],
+    value: Optional[float],
+    value_label: str,
+    unit: str = "",
+    attempt_count: int = 0,
+) -> dict:
+    return {
+        "id": badge_id,
+        "title": title,
+        "emoji": emoji,
+        "anonymousId": student_id,
+        "studentId": student_id,
+        "value": None if value is None else round(float(value), 3),
+        "valueLabel": value_label,
+        "unit": unit,
+        "attemptCount": attempt_count,
+        "praise": _ACHIEVEMENT_PRAISE.get(badge_id, "太棒了，继续探索身体的超级力量！"),
+        "hasWinner": student_id is not None and value is not None,
+    }
+
+
+def calculate_achievements(
+    records: Optional[list] = None,
+    *,
+    school: str = "",
+    class_group: str = "",
+    now: Optional[datetime] = None,
+) -> dict:
+    """基于 SDT 的多维度成就印章计算引擎（无总分排名）。
+
+    三个独立王者：
+      a) 钢铁锁踝王 —— 本周脚踝刚性方差均值最小（趋近 0）
+      b) 最稳底盘奖 —— 本周支撑脚横纵向位移偏差综合最小
+      c) 最快进步奖 —— 本周五维总分均值 − 上周五维总分均值，正向差值最大
+    """
+    source = records if isinstance(records, list) else _load_global_records()
+    school_q = (school or "").strip()
+    class_q = (class_group or "").strip()
+    this_start, this_end, last_start, last_end = _week_window(now)
+
+    # studentId -> {"this": [...], "last": [...]} 指标包
+    buckets: dict[str, dict[str, list]] = {}
+
+    for record in source:
+        if not isinstance(record, dict):
+            continue
+        sid = str(record.get("studentId") or record.get("anonymous_id") or "").strip()
+        if not sid:
+            continue
+        if school_q and school_q not in ("all", "全部") and (record.get("school") or "") != school_q:
+            continue
+        if class_q and class_q not in ("all", "全部") and (record.get("classGroup") or "") != class_q:
+            continue
+
+        ts = _parse_record_datetime(record)
+        if ts is None:
+            continue
+
+        ankle = _extract_ankle_rigidity_variance(record)
+        chassis = _extract_support_chassis_deviation(record)
+        five_dim = _extract_five_dim_total(record)
+        row = {
+            "ankle": ankle,
+            "chassis": chassis,
+            "five_dim": five_dim,
+            "timestamp": ts.isoformat(sep=" ", timespec="seconds"),
+        }
+
+        if this_start <= ts < this_end:
+            buckets.setdefault(sid, {"this": [], "last": []})["this"].append(row)
+        elif last_start <= ts < last_end:
+            buckets.setdefault(sid, {"this": [], "last": []})["last"].append(row)
+
+    iron_best: tuple[Optional[str], Optional[float], int] = (None, None, 0)
+    chassis_best: tuple[Optional[str], Optional[float], int] = (None, None, 0)
+    progress_best: tuple[Optional[str], Optional[float], int] = (None, None, 0)
+
+    for sid, pack in buckets.items():
+        this_rows = pack.get("this") or []
+        last_rows = pack.get("last") or []
+
+        ankle_vals = [r["ankle"] for r in this_rows if isinstance(r.get("ankle"), (int, float))]
+        ankle_mean = _mean(ankle_vals)
+        if ankle_mean is not None:
+            if iron_best[1] is None or ankle_mean < iron_best[1] or (
+                ankle_mean == iron_best[1] and len(ankle_vals) > iron_best[2]
+            ):
+                iron_best = (sid, ankle_mean, len(ankle_vals))
+
+        chassis_vals = [
+            r["chassis"] for r in this_rows if isinstance(r.get("chassis"), (int, float))
+        ]
+        chassis_mean = _mean(chassis_vals)
+        if chassis_mean is not None:
+            if chassis_best[1] is None or chassis_mean < chassis_best[1] or (
+                chassis_mean == chassis_best[1] and len(chassis_vals) > chassis_best[2]
+            ):
+                chassis_best = (sid, chassis_mean, len(chassis_vals))
+
+        this_five = [
+            r["five_dim"] for r in this_rows if isinstance(r.get("five_dim"), (int, float))
+        ]
+        last_five = [
+            r["five_dim"] for r in last_rows if isinstance(r.get("five_dim"), (int, float))
+        ]
+        this_avg = _mean(this_five)
+        last_avg = _mean(last_five)
+        if this_avg is not None and last_avg is not None:
+            delta = this_avg - last_avg
+            if delta > 0 and (
+                progress_best[1] is None
+                or delta > progress_best[1]
+                or (delta == progress_best[1] and len(this_five) > progress_best[2])
+            ):
+                progress_best = (sid, delta, len(this_five))
+
+    badges = [
+        _pack_winner(
+            "iron_ankle",
+            "钢铁锁踝王",
+            "🛡️",
+            iron_best[0],
+            iron_best[1],
+            "脚踝刚性方差",
+            unit="σ²",
+            attempt_count=iron_best[2],
+        ),
+        _pack_winner(
+            "stable_chassis",
+            "最稳底盘奖",
+            "🌳",
+            chassis_best[0],
+            chassis_best[1],
+            "支撑脚横纵偏差",
+            unit="cm",
+            attempt_count=chassis_best[2],
+        ),
+        _pack_winner(
+            "fastest_progress",
+            "最快进步奖",
+            "🚀",
+            progress_best[0],
+            progress_best[1],
+            "五维均分周环比",
+            unit="Δ",
+            attempt_count=progress_best[2],
+        ),
+    ]
+
+    return {
+        "success": True,
+        "weekStart": this_start.strftime("%Y-%m-%d"),
+        "weekEnd": (this_end - timedelta(seconds=1)).strftime("%Y-%m-%d"),
+        "lastWeekStart": last_start.strftime("%Y-%m-%d"),
+        "lastWeekEnd": (last_end - timedelta(seconds=1)).strftime("%Y-%m-%d"),
+        "subjectCount": len(buckets),
+        "badges": badges,
+        "achievements": badges,  # 别名，便于前端消费
+    }
+
+
+def _metrics_snapshot_from_score_detail(score_detail: Optional[dict]) -> dict:
+    """从 scoreDetail 抽出成就引擎与看板可复用的轻量指标快照（无大图）。"""
+    if not isinstance(score_detail, dict):
+        return {}
+    flat = flatten_eight_metrics(score_detail)
+    indicators = score_detail.get("indicators") if isinstance(score_detail.get("indicators"), dict) else {}
+    ankle = flat.get("ankle_rigidity")
+    if ankle is None and isinstance(indicators.get("ankle_rigidity"), dict):
+        ankle = _safe_float(indicators["ankle_rigidity"].get("variance"))
+        if ankle is None:
+            ankle = _safe_float(indicators["ankle_rigidity"].get("value"))
+
+    lateral = _nested_metric_value(indicators, "distance_cm", "support_lateral_dist_cm")
+    if lateral is None:
+        lateral = _nested_metric_value(score_detail, "support_lateral_dist_cm", "distance_cm")
+    ap = _nested_metric_value(score_detail, "support_ap_offset_cm")
+    if ap is None and isinstance(score_detail.get("spatial_trajectory"), dict):
+        # 若有相对坐标点，不在此强解；保持 None
+        pass
+
+    radar = score_detail.get("radar_scores")
+    snapshot: dict[str, Any] = {}
+    if ankle is not None:
+        snapshot["ankle_rigidity"] = round(float(ankle), 3)
+        snapshot["ankle_rigidity_variance"] = round(float(ankle), 3)
+    if lateral is not None:
+        snapshot["support_lateral_dist_cm"] = round(float(lateral), 2)
+        snapshot["supportFootDistance"] = round(float(lateral), 2)
+    if ap is not None:
+        snapshot["support_ap_offset_cm"] = round(float(ap), 2)
+    # V3.1：支撑脚相对坐标写入归档，供 Heatmap_Dispersion_Index 结算
+    spatial = score_detail.get("spatial_trajectory") or score_detail.get("spatialTrajectory")
+    if isinstance(spatial, dict):
+        dx = _safe_float(spatial.get("dx_support"))
+        dy = _safe_float(spatial.get("dy_support"))
+        if dx is None or dy is None:
+            rel = spatial.get("support_rel")
+            if isinstance(rel, (list, tuple)) and len(rel) >= 2:
+                dx = _safe_float(rel[0]) if dx is None else dx
+                dy = _safe_float(rel[1]) if dy is None else dy
+        if dx is not None and dy is not None:
+            snapshot["dx_support"] = round(float(dx), 2)
+            snapshot["dy_support"] = round(float(dy), 2)
+            snapshot["support_rel"] = [round(float(dx), 2), round(float(dy), 2)]
+            snapshot["spatial_trajectory"] = {
+                "dx_support": round(float(dx), 2),
+                "dy_support": round(float(dy), 2),
+                "support_rel": [round(float(dx), 2), round(float(dy), 2)],
+            }
+    # 脚踝锁紧状态数字编码（GREEN=3 / YELLOW=2 / RED=1）供宽表直接读取
+    ankle_entry = indicators.get("ankle_rigidity") if isinstance(indicators, dict) else None
+    if isinstance(ankle_entry, dict) and ankle_entry.get("status") is not None:
+        snapshot["ankle_lock_status"] = ankle_entry.get("status")
+    if isinstance(radar, dict):
+        snapshot["quantified5dScores"] = radar
+        snapshot["radar_scores"] = radar
+    # 保留精简 indicators 数值，避免把 heatmap_base64 等巨字段写入 JSON DB
+    slim_indicators: dict[str, Any] = {}
+    for key, entry in (indicators or {}).items():
+        if isinstance(entry, dict):
+            slim: dict[str, Any] = {}
+            for sub in ("value", "variance", "status", "penalty"):
+                if sub in entry:
+                    slim[sub] = entry[sub]
+            if slim:
+                slim_indicators[key] = slim
+    if slim_indicators or radar:
+        snapshot["scoreDetail"] = {
+            "indicators": slim_indicators,
+            "radar_scores": radar if isinstance(radar, dict) else None,
+            "t_impact": score_detail.get("t_impact"),
+        }
+    return snapshot
+
+
 @app.post("/api/save_word_report")
 def save_word_report(payload: SaveWordReportRequest):
     """接收前端组装好的学生档案 + AI 诊断报告 + 关键帧图片 Base64 + 模式类型，
@@ -1290,6 +2166,7 @@ def save_word_report(payload: SaveWordReportRequest):
             "biomechanicalErrors": biomechanical_errors,
             "aiFeedback": ai_feedback_text,
             "impactFrameBase64": payload.impactFrameImage,
+            "heatmapBase64": payload.heatmapBase64 or payload.heatmap_base64,
             "path": result["path"],
             "directory": result.get("directory"),
             # 【v4.0 新增：科研级数据矩阵字段】详见 project_plan.md 第4节新增需求——
@@ -1305,6 +2182,17 @@ def save_word_report(payload: SaveWordReportRequest):
             "supportFootDistance": _estimate_support_foot_distance(payload.score),
             "primaryErrorCode": _derive_primary_error_code(biomechanical_errors),
         }
+        # 【SDT】合并 scoreDetail 轻量快照（脚踝刚性 / 支撑横纵 / 五维雷达）
+        detail_payload = payload.scoreDetail or payload.score_detail
+        snapshot = _metrics_snapshot_from_score_detail(
+            detail_payload if isinstance(detail_payload, dict) else None
+        )
+        if snapshot.get("supportFootDistance") is not None:
+            record["supportFootDistance"] = snapshot["supportFootDistance"]
+        for key, value in snapshot.items():
+            if key == "supportFootDistance":
+                continue
+            record[key] = value
         try:
             _append_global_record(record)
         except Exception as exc:  # noqa: BLE001 - 数据库追加失败不应影响 Word 本身已经保存成功的结果
@@ -1332,6 +2220,131 @@ def get_all_records():
     return {"success": True, "records": records, "count": len(records)}
 
 
+@app.get("/api/achievements/weekly")
+def get_weekly_achievements(school: str = "", classGroup: str = ""):
+    """SDT 游戏化周成就印章：返回三个维度的独立王者（无总分排名）。
+
+    可选 query：school / classGroup —— 与教练端筛选器对齐；空则全库遍历。
+    """
+    try:
+        return calculate_achievements(school=school, class_group=classGroup)
+    except Exception as exc:  # noqa: BLE001
+        safe_print(f"【api_server】计算周成就失败：{exc}")
+        return {
+            "success": False,
+            "message": f"计算周成就失败：{exc}",
+            "badges": [],
+            "achievements": [],
+        }
+
+
+# --------------------------------------------------------------------------
+# 疲劳熔断报警 —— 供教练端 / 延时组「纵向双轴进化图谱」轮询
+# --------------------------------------------------------------------------
+
+
+def _eval_fatigue_from_history(history: list) -> Optional[dict]:
+    """基线 vs 近期对比；命中 ANKLE_FATIGUE / KNEE_STIFFNESS 时返回报警字典。"""
+    if len(history) < MIN_ATTEMPTS_FOR_MONITOR:
+        return None
+    baseline = history[:BASELINE_WINDOW]
+    recent = history[-RECENT_WINDOW:]
+    warning = FatigueMonitor._eval_ankle_fatigue(baseline, recent)
+    if warning is None:
+        warning = FatigueMonitor._eval_knee_stiffness(baseline, recent)
+    return warning
+
+
+def _ingest_web_fatigue_attempt(
+    student_id: str,
+    score_detail: Optional[dict],
+) -> Optional[dict]:
+    """将一次确定性打分写入疲劳时序，并在命中熔断时缓存最新报警。"""
+    global _global_latest_fatigue
+    sid = (student_id or "").strip() or "_anonymous"
+    if not isinstance(score_detail, dict):
+        return None
+    flat = flatten_eight_metrics(score_detail)
+    with _fatigue_history_lock:
+        rows = _fatigue_attempts.setdefault(sid, [])
+        row = dict(flat)
+        row["attempt_index"] = len(rows) + 1
+        row["student_id"] = sid
+        rows.append(row)
+        warning = _eval_fatigue_from_history(rows)
+        if isinstance(warning, dict) and warning.get("is_fatigue"):
+            payload = {
+                **warning,
+                "student_id": sid,
+                "studentId": sid,
+                "isFatigue": True,
+                "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "updatedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "attempt_count": len(rows),
+                "message": warning.get("message")
+                or FATIGUE_MESSAGES.get(str(warning.get("reason") or ""), "疲劳熔断"),
+            }
+            _latest_fatigue_alerts[sid] = payload
+            _global_latest_fatigue = payload
+            safe_print(
+                f"【api_server】⚠️ 疲劳熔断 [{payload.get('reason')}] student={sid} "
+                f"attempts={len(rows)}",
+                flush=True,
+            )
+            return payload
+    return None
+
+
+@app.get("/api/fatigue_alert")
+def get_fatigue_alert(student_id: str = ""):
+    """轮询最新疲劳熔断信号。
+
+    - 指定 student_id：返回该被试最近一次熔断（无则 is_fatigue=false）
+    - 不传：返回全局最近一次熔断（供教练端总览）
+    """
+    sid = (student_id or "").strip()
+    with _fatigue_history_lock:
+        if sid:
+            alert = _latest_fatigue_alerts.get(sid)
+            history_len = len(_fatigue_attempts.get(sid, []))
+        else:
+            alert = _global_latest_fatigue
+            history_len = sum(len(v) for v in _fatigue_attempts.values())
+
+    if isinstance(alert, dict) and alert.get("is_fatigue"):
+        return {**alert, "success": True, "history_len": history_len}
+    return {
+        "success": True,
+        "is_fatigue": False,
+        "isFatigue": False,
+        "reason": None,
+        "message": None,
+        "student_id": sid or None,
+        "history_len": history_len,
+    }
+
+
+@app.post("/api/fatigue_alert/reset")
+def reset_fatigue_alert(student_id: str = ""):
+    """换人 / 新开轮次时清空疲劳时序（可选）。"""
+    global _global_latest_fatigue
+    sid = (student_id or "").strip()
+    with _fatigue_history_lock:
+        if sid:
+            _fatigue_attempts.pop(sid, None)
+            _latest_fatigue_alerts.pop(sid, None)
+            if _global_latest_fatigue and (
+                _global_latest_fatigue.get("student_id") == sid
+                or _global_latest_fatigue.get("studentId") == sid
+            ):
+                _global_latest_fatigue = None
+        else:
+            _fatigue_attempts.clear()
+            _latest_fatigue_alerts.clear()
+            _global_latest_fatigue = None
+    return {"success": True, "cleared": sid or "all"}
+
+
 # --------------------------------------------------------------------------
 # 第五步再再再再半：核心接口七 —— 「论文专供：学术统计矩阵一键自动导出」
 #
@@ -1344,15 +2357,22 @@ def get_all_records():
 
 @app.post("/api/export_academic_matrix")
 def export_academic_matrix():
-    """一键清洗 global_training_db.json 全量记录，导出规范的 SPSS/Excel 长表格式
-    学术统计矩阵 CSV，落盘存入项目根目录 academic_data_export/ 文件夹。
+    """【V3.1】一键导出全数字化 SPSS 标准宽表（JSON 元信息 + 落盘）。
+
+    优先走 AcademicDataExporter 宽表主路径；同时保留长表旁路落盘供 ANOVA。
+    前端若需浏览器直接下载，请改用 GET ``/api/export/spss_matrix``。
     """
-    records = _load_global_records()
     try:
-        result = academic_exporter.export_academic_matrix(records)
-    except Exception as exc:  # noqa: BLE001 - 导出失败不应让接口直接抛 500，交由前端友好提示
-        safe_print(f"【api_server】导出学术统计矩阵失败：{exc}")
-        return {"success": False, "message": f"导出学术统计矩阵失败：{exc}"}
+        exporter = academic_exporter.AcademicDataExporter.from_db()
+        result = exporter.export_spss_matrix_file()
+    except Exception as exc:  # noqa: BLE001
+        safe_print(f"【api_server】导出 V3.1 科研宽表失败：{exc}")
+        # 回退：旧成长表，避免教练端完全无法导出
+        records = _load_global_records()
+        try:
+            result = academic_exporter.export_academic_matrix(records)
+        except Exception as long_exc:  # noqa: BLE001
+            return {"success": False, "message": f"导出学术统计矩阵失败：{long_exc}"}
 
     if not result.get("success"):
         return result
@@ -1360,14 +2380,56 @@ def export_academic_matrix():
     return {
         "success": True,
         "message": (
-            f"✅ 科研数据矩阵已清洗完毕并数字化编码！文件已存入："
-            f"{result['path']}，可直接导入 SPSS、Excel 或 Mplus 跑方差分析！"
+            f"✅ V3.1 全数字化科研宽表已生成！文件："
+            f"{result.get('filename', academic_exporter.RESEARCH_MATRIX_V3_FILENAME)}，"
+            f"已存入：{result['path']}，可直接导入 SPSS / Mplus 跑 MSEM！"
         ),
         "path": result["path"],
         "filename": result["filename"],
         "rowCount": result["rowCount"],
+        "columnCount": result.get("columnCount"),
         "studentCount": result["studentCount"],
+        "downloadUrl": "/api/export/spss_matrix",
     }
+
+
+@app.get("/api/export/spss_matrix")
+def export_spss_wide_matrix():
+    """【V3.1 Cluster-RCT · MSEM】导出全数字化 SPSS 标准宽表 CSV（浏览器直接下载）。
+
+    数据源优先级：``cluster_rct.db`` → 桥接 ``global_training_db.json``。
+    主键 ``anonymous_id`` 一行一人；T0–T4 前缀展平；组别/疲劳/锁踝全数字编码；
+    含 ``Heatmap_Dispersion_Index`` / ``Ankle_Rigidity_Score`` 衍生中介；
+    表尾 ``Class_Dummy_1``…``Class_Dummy_5`` 群聚固定效应哑变量。
+
+    固定文件名：``AI_Football_Research_Matrix_V3.csv``。
+    """
+    filename = academic_exporter.RESEARCH_MATRIX_V3_FILENAME
+    try:
+        exporter = academic_exporter.AcademicDataExporter.from_db()
+        wide_df = exporter.generate_wide_format_matrix()
+        # 同步落盘一份到 academic_data_export/，便于教练本地归档
+        exporter.export_spss_matrix_file(filename=filename)
+    except Exception as exc:  # noqa: BLE001 - 导出失败返回结构化错误，避免裸 500
+        safe_print(f"【api_server】导出 V3.1 科研宽表失败：{exc}")
+        return {"success": False, "message": f"导出 V3.1 科研宽表失败：{exc}"}
+
+    csv_bytes = exporter.to_csv_bytes(wide_df)
+
+    safe_print(
+        f"【api_server】V3.1 科研宽表已生成：{filename}"
+        f"（{len(wide_df)} 行 × {len(wide_df.columns)} 列）",
+        flush=True,
+    )
+    return Response(
+        content=csv_bytes,
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-Export-Row-Count": str(len(wide_df)),
+            "X-Export-Column-Count": str(len(wide_df.columns)),
+        },
+    )
 
 
 # --------------------------------------------------------------------------
@@ -1458,6 +2520,178 @@ def open_folder(payload: OpenFolderRequest):
     except Exception as exc:  # noqa: BLE001 - 打开文件夹失败不应让接口抛出 500
         safe_print(f"【api_server】打开本地文件夹失败：{exc}")
         return {"success": False, "message": f"打开文件夹失败：{exc}"}
+
+
+# --------------------------------------------------------------------------
+# 第五步再再再再再半：核心接口八 —— 教练端 / 科研控制台
+# 「干预进度与剂量异常监控」+「极端个案目的性抽样」
+#
+#         全部聚合 / 斜率 / 百分位逻辑封装在
+#         research_dashboard_service.ResearchDashboardService，本处只做
+#         查询参数解析与结果透传。数据优先读 research_shot_logs.json，
+#         不存在时自动桥接 global_training_db.json。
+# --------------------------------------------------------------------------
+
+
+@app.get("/api/coach/progress_monitor")
+def coach_progress_monitor(
+    timepoint: Optional[str] = None,
+    cluster_id: Optional[str] = None,
+    standard_dose: int = STANDARD_SHOT_DOSE,
+):
+    """【干预进度与缺失值监控】
+
+    分组聚合当前（或指定 T 节点）所有被试的射门完成次数，计算组内均值，
+    并返回射门次数偏离「标准剂量 ±20%」的剂量异常被试名单，供教练课上
+    及时人工干预。
+
+    Query 参数：
+        timepoint     —— 可选，T0/T1/T2/T3/T4；缺省则汇总全部节点
+        cluster_id    —— 可选，行政班集群过滤（如 Class_1）
+        standard_dose —— 可选，标准射门剂量，默认 15
+    """
+    try:
+        service = research_dashboard_service.get_dashboard_service(reload=True)
+        return service.get_progress_monitor(
+            timepoint=timepoint,
+            cluster_id=cluster_id,
+            standard_dose=standard_dose,
+        )
+    except Exception as exc:  # noqa: BLE001
+        safe_print(f"【api_server】progress_monitor 失败：{exc}")
+        return {"success": False, "message": f"干预进度监控失败：{exc}", "dose_anomalies": []}
+
+
+@app.get("/api/coach/extreme_cases")
+def coach_extreme_cases(
+    cluster_id: Optional[str] = None,
+    baseline: str = "T1",
+    followup: str = "T2",
+    percentile: float = 0.20,
+):
+    """【极端个案捕捉 · Purposive Sampling Extractor】
+
+    对比 baseline（默认 T1）与 followup（默认 T2）阶段被试在 8 大生物力学
+    综合得分上的变化斜率（Slope），自动识别：
+      - 高反应者 (High Responders)：斜率最高的前 20%
+      - 低反应者 (Low Responders)：得分一直处于低位且改善斜率最平缓的后 20%
+
+    返回名单可作为后续现象学深度访谈的客观抽样基础。
+    """
+    try:
+        service = research_dashboard_service.get_dashboard_service(reload=True)
+        return service.extract_extreme_cases(
+            cluster_id=cluster_id,
+            baseline=baseline,
+            followup=followup,
+            percentile=percentile,
+        )
+    except Exception as exc:  # noqa: BLE001
+        safe_print(f"【api_server】extreme_cases 失败：{exc}")
+        return {
+            "success": False,
+            "message": f"极端个案捕捉失败：{exc}",
+            "high_responders": [],
+            "low_responders": [],
+        }
+
+
+# --------------------------------------------------------------------------
+# 【V3.1 Sprint 3】教练端手绘电烙铁批注截图归档
+# --------------------------------------------------------------------------
+
+TELESTRATION_DIR = os.path.join(SCRIPT_DIR, "telestration_annotations")
+os.makedirs(TELESTRATION_DIR, exist_ok=True)
+
+
+class SaveTelestrationImageRequest(BaseModel):
+    """前端合并「视频定格帧 + Canvas 涂鸦」后的 JPEG/PNG Base64。"""
+
+    imageBase64: str
+    attemptId: Optional[str] = None
+    studentNumber: Optional[str] = None
+    studentId: Optional[str] = None
+
+
+def _decode_data_url_bytes(data_url: str) -> bytes:
+    """支持 data:image/...;base64,XXX 或纯 base64。"""
+    raw = (data_url or "").strip()
+    if not raw:
+        raise ValueError("imageBase64 为空")
+    if "," in raw and raw.lower().startswith("data:"):
+        raw = raw.split(",", 1)[1]
+    return base64.b64decode(raw)
+
+
+@app.post("/api/save_telestration_image")
+def save_telestration_image(payload: SaveTelestrationImageRequest):
+    """
+    接收教练手绘批注合成图，写入 telestration_annotations/，
+    若 attemptId 命中 global_training_db.json 则回填 telestrationImagePath 字段，
+    供后续 Word 诊断处方附加。
+    """
+    try:
+        image_bytes = _decode_data_url_bytes(payload.imageBase64)
+    except Exception as exc:  # noqa: BLE001
+        return {"success": False, "message": f"Base64 解码失败：{exc}"}
+
+    if not image_bytes:
+        return {"success": False, "message": "图像数据为空"}
+
+    student_key = (payload.studentNumber or payload.studentId or "unknown").strip() or "unknown"
+    # Windows 非法文件名字符清理
+    for ch in '<>:"/\\|?*':
+        student_key = student_key.replace(ch, "_")
+
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    attempt_part = (payload.attemptId or uuid.uuid4().hex[:8]).strip()
+    for ch in '<>:"/\\|?*':
+        attempt_part = attempt_part.replace(ch, "_")
+
+    # 根据 data URI 头或内容简单判定扩展名
+    lower = (payload.imageBase64 or "")[:64].lower()
+    ext = ".png" if "image/png" in lower else ".jpg"
+    filename = f"telestration_{student_key}_{attempt_part}_{stamp}{ext}"
+    abs_path = os.path.join(TELESTRATION_DIR, filename)
+
+    try:
+        with open(abs_path, "wb") as fh:
+            fh.write(image_bytes)
+    except Exception as exc:  # noqa: BLE001
+        safe_print(f"【api_server】写入手绘批注失败：{exc}")
+        return {"success": False, "message": f"写盘失败：{exc}"}
+
+    # 可选：回填全局训练库记录，便于报告附加
+    linked = False
+    if payload.attemptId:
+        try:
+            if os.path.isfile(GLOBAL_DB_PATH):
+                with open(GLOBAL_DB_PATH, "r", encoding="utf-8") as f:
+                    records = json.load(f)
+                if isinstance(records, list):
+                    for row in records:
+                        if isinstance(row, dict) and str(row.get("id", "")) == str(payload.attemptId):
+                            row["telestrationImagePath"] = abs_path
+                            row["telestrationImageFilename"] = filename
+                            linked = True
+                            break
+                    if linked:
+                        with open(GLOBAL_DB_PATH, "w", encoding="utf-8") as f:
+                            json.dump(records, f, ensure_ascii=False, indent=2)
+        except Exception as exc:  # noqa: BLE001
+            safe_print(f"【api_server】回填手绘批注到全局库失败（文件已保存）：{exc}")
+
+    msg = f"手绘批注已归档：{abs_path}"
+    if linked:
+        msg += "（已关联 Attempt 诊断记录）"
+
+    return {
+        "success": True,
+        "message": msg,
+        "path": abs_path,
+        "filename": filename,
+        "linked": linked,
+    }
 
 
 # --------------------------------------------------------------------------

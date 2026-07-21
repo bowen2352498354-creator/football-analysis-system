@@ -1,16 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import {
-  CartesianGrid,
-  ComposedChart,
-  Line,
-  ReferenceArea,
-  ResponsiveContainer,
-  Tooltip,
-  XAxis,
-  YAxis,
-} from 'recharts'
-import {
   Users,
   Radio,
   Clock3,
@@ -42,6 +32,9 @@ import {
   MessageSquareText,
 } from 'lucide-react'
 import { BIOMECH_ERROR_TAXONOMY, loadGlobalRecordsFromLocalStorage, saveGlobalRecordsToLocalStorage } from '../mockData'
+import LongitudinalProgressChart from './LongitudinalProgressChart'
+import SpatialHeatmap from './SpatialHeatmap'
+import GamifiedLeaderboard from './GamifiedLeaderboard'
 import type {
   AcademicExportResult,
   BiomechFaultStat,
@@ -50,10 +43,6 @@ import type {
   GlobalTrainingRecord,
   IndividualSummaryReport,
 } from '../types'
-
-/** 【v4.0 新增】科研级膝角学术合规发力区间：135°-155°（用于双轴成长期刊图绿色阴影带） */
-const OPTIMAL_KNEE_ANGLE_MIN = 135
-const OPTIMAL_KNEE_ANGLE_MAX = 155
 
 /** 从记录中安全提取 "YYYY-MM-DD" 测试日期：优先使用后端回填的 testDate 字段，
  * 历史旧记录缺失时退化为从 timestamp 字符串前 10 位截取。 */
@@ -250,17 +239,39 @@ export default function CoachDashboard() {
     setClassPrescription(null)
   }, [selectedSchool, selectedClassGroup, selectedTestDate])
 
-  /** 📥 一键导出科研论文数据矩阵：调用后端清洗转换 + 落盘，成功后弹出 Apple 风格提示 */
+  /** 📥 V3.1 一键下载全数字化 SPSS 宽表：AI_Football_Research_Matrix_V3.csv */
   async function handleExportAcademicMatrix() {
     if (isExportingMatrix) return
     setIsExportingMatrix(true)
     try {
-      const response = await fetch(`${API_BASE_URL}/api/export_academic_matrix`, { method: 'POST' })
-      const data = (await response.json()) as AcademicExportResult
-      if (!response.ok || !data.success) throw new Error(data.message || `接口返回状态码 ${response.status}`)
+      const response = await fetch(`${API_BASE_URL}/api/export/spss_matrix`)
+      const contentType = response.headers.get('content-type') || ''
+      if (!response.ok) {
+        let message = `接口返回状态码 ${response.status}`
+        if (contentType.includes('application/json')) {
+          const data = (await response.json()) as AcademicExportResult
+          message = data.message || message
+        }
+        throw new Error(message)
+      }
+      if (contentType.includes('application/json')) {
+        const data = (await response.json()) as AcademicExportResult
+        throw new Error(data.message || '导出失败：后端返回了错误信息而非 CSV')
+      }
+      const blob = await response.blob()
+      const objectUrl = URL.createObjectURL(blob)
+      const anchor = document.createElement('a')
+      anchor.href = objectUrl
+      anchor.download = 'AI_Football_Research_Matrix_V3.csv'
+      document.body.appendChild(anchor)
+      anchor.click()
+      anchor.remove()
+      URL.revokeObjectURL(objectUrl)
+      const rows = response.headers.get('X-Export-Row-Count')
       showToast(
-        data.message ||
-          `✅ 科研数据矩阵已清洗完毕并数字化编码！文件已存入：${data.path ?? 'academic_data_export/'}`,
+        rows
+          ? `✅ V3.1 科研宽表已下载（${rows} 名被试）· AI_Football_Research_Matrix_V3.csv`
+          : '✅ V3.1 全数字化科研宽表已下载：AI_Football_Research_Matrix_V3.csv',
         true,
       )
     } catch (error) {
@@ -638,9 +649,11 @@ export default function CoachDashboard() {
             )}
           </span>
           <span className="text-[11px] font-bold leading-tight text-amber-100">
-            📥 一键导出科研论文数据矩阵
+            {isExportingMatrix ? '正在生成宽表…' : '导出 SPSS 标准宽表 (.csv)'}
           </span>
-          <span className="text-[9px] leading-tight text-amber-200/60">SPSS / Excel 宽表 · 学术数值编码</span>
+          <span className="text-[9px] leading-tight text-amber-200/60">
+            AI_Football_Research_Matrix_V3 · 全数字编码 · MSEM 直入
+          </span>
         </button>
       </div>
 
@@ -768,18 +781,28 @@ export default function CoachDashboard() {
       ) : records.length === 0 ? (
         <EmptyStateCard />
       ) : perspective === 'classOverview' ? (
-        <ClassOverviewSection
-          scopeLabel={filterScopeLabel}
-          faultStats={faultStats}
-          totalRecords={filteredRecords.length}
-          avgScore={classAvgScore}
-          prescription={classPrescription}
-          isPrescriptionLoading={isPrescriptionLoading}
-          onGeneratePrescription={() => void handleGenerateClassPrescription()}
-          onPrintRecord={handlePrintRecord}
-          onOpenFolder={(record) => void handleOpenFolder(record)}
-          recentRecords={filteredRecords.slice(0, 6)}
-        />
+        <>
+          <ClassOverviewSection
+            scopeLabel={filterScopeLabel}
+            faultStats={faultStats}
+            totalRecords={filteredRecords.length}
+            avgScore={classAvgScore}
+            prescription={classPrescription}
+            isPrescriptionLoading={isPrescriptionLoading}
+            onGeneratePrescription={() => void handleGenerateClassPrescription()}
+            onPrintRecord={handlePrintRecord}
+            onOpenFolder={(record) => void handleOpenFolder(record)}
+            recentRecords={filteredRecords.slice(0, 6)}
+          />
+          {/* SDT 成就印章：班级看板下方横向 Bento 卡片组 */}
+          <div className="mt-5">
+            <GamifiedLeaderboard
+              school={selectedSchool}
+              classGroup={selectedClassGroup}
+              scopeLabel={filterScopeLabel}
+            />
+          </div>
+        </>
       ) : (
         <IndividualDrilldownSection
           students={studentAggregates}
@@ -1310,27 +1333,28 @@ function IndividualDrilldownSection({
               </div>
             </section>
 
-            {/* 📈 双轴互动的运动学成长期刊图 (Biomechanical Dual-Axis Curve) */}
+            {/* 📈 纵向双轴进化图谱 (ECharts Dual-Axis + MarkArea 黄金区间) */}
             <section className="rounded-3xl border border-white/10 bg-white/5 p-5 backdrop-blur-xl">
               <h4 className="mb-3 flex items-center gap-2 text-sm font-semibold text-white/80">
                 <span className="inline-flex flex-shrink-0">
-                  <TrendingUp className="h-4 w-4 text-emerald-300" />
+                  <TrendingUp className="h-4 w-4 text-blue-300" />
                 </span>
-                📈 双轴运动学成长期刊图 · 综合评分 (左轴) × 击球瞬间右膝屈曲角度 (右轴)
+                📈 纵向双轴进化图谱 · 五维综合评分 (蓝实线) × 触球瞬间膝关节夹角 (橙虚线)
               </h4>
               {selectedStudent.records.length === 0 ? (
                 <div className="flex h-64 w-full items-center justify-center rounded-2xl bg-black/20 text-xs text-white/25">
-                  暂无任何尝试数据，无法绘制成长期刊图
+                  暂无任何尝试数据，无法绘制进化图谱
                 </div>
               ) : (
-                <BiomechDualAxisChart
+                <LongitudinalProgressChart
                   records={selectedStudent.records}
                   selectedIndex={selectedAttemptIndex}
                   onSelectIndex={onSelectAttemptIndex}
+                  studentId={selectedStudent.studentId}
                 />
               )}
               <p className="mt-2 text-[11px] leading-relaxed text-white/30">
-                🎯 学术合规发力区间 (135°-155°)：图中绿色阴影带即为触球瞬间膝关节屈曲角度的学术合规区间，一眼看清哪一次尝试精准落入标准区间。
+                🎯 学术合规黄金区间 (140°–160°)：淡绿 markArea 横贯全图；橙色虚线跌入/逃出绿带即可定位第几次 Attempt 偏离标准。收到 ANKLE_FATIGUE 等熔断信号时，右上角将闪烁警告卡。
               </p>
             </section>
 
@@ -1388,6 +1412,22 @@ function IndividualDrilldownSection({
                     </p>
                   </div>
                 </div>
+
+                {/* Sprint 1：支撑脚 / 摆腿时空热力图选项卡式展示 */}
+                <SpatialHeatmap
+                  heatmapBase64={
+                    selectedAttempt?.heatmapBase64 ?? selectedAttempt?.heatmap_base64 ?? null
+                  }
+                  landingPositions={
+                    typeof selectedAttempt?.supportFootDistance === 'number'
+                      ? [[selectedAttempt.supportFootDistance, -5]]
+                      : []
+                  }
+                  title="空间热力图"
+                  subtitle="球心原点 (0,0) · 支撑脚热力核 + 摆腿 15 帧光流 · 1 px = 0.5 cm"
+                  height={220}
+                  compact
+                />
 
                 <div className="mt-1 flex items-center gap-2">
                   <button
@@ -1494,156 +1534,6 @@ function IndividualDrilldownSection({
           </>
         )}
       </div>
-    </div>
-  )
-}
-
-/* ============================================================================
- * 📈 双轴互动的运动学成长期刊图 (Biomechanical Dual-Axis Curve)：
- * 左轴（绿色实线）= 综合动作发力评分 Total Score；
- * 右轴（蓝色虚线）= 击球瞬间右膝屈曲角度 Knee Flexion Angle；
- * 绿色半透明阴影带 = 🎯 学术合规发力区间 (135°-155°)。
- * ========================================================================== */
-
-interface BiomechDualAxisChartProps {
-  records: GlobalTrainingRecord[]
-  selectedIndex: number
-  onSelectIndex: (index: number) => void
-}
-
-/** 自定义可点击圆点：点击图表上任意数据点，立即联动下方「时空胶囊」切换到对应尝试 */
-function ClickableDot(
-  props: {
-    cx?: number
-    cy?: number
-    index?: number
-    payload?: { index: number }
-    fill: string
-  } & { onDotClick: (index: number) => void; isActive: boolean },
-) {
-  const { cx, cy, fill, onDotClick, isActive } = props
-  const pointIndex = props.payload?.index ?? props.index ?? 0
-  if (typeof cx !== 'number' || typeof cy !== 'number') return null
-  return (
-    <circle
-      cx={cx}
-      cy={cy}
-      r={isActive ? 6 : 4}
-      fill={fill}
-      stroke={isActive ? '#fff' : 'transparent'}
-      strokeWidth={isActive ? 2 : 0}
-      style={{ cursor: 'pointer' }}
-      onClick={() => onDotClick(pointIndex)}
-    />
-  )
-}
-
-function BiomechDualAxisChart({ records, selectedIndex, onSelectIndex }: BiomechDualAxisChartProps) {
-  const chartData = records.map((record, index) => ({
-    index,
-    attempt: `#${index + 1}`,
-    label: `Attempt #${index + 1} · ${getRecordTimeLabel(record)}`,
-    score: typeof record.score === 'number' ? record.score : null,
-    kneeAngle: typeof record.kneeFlexionAngle === 'number' ? record.kneeFlexionAngle : null,
-  }))
-
-  const hasKneeAngleData = chartData.some((point) => typeof point.kneeAngle === 'number')
-
-  return (
-    <div className="h-72 w-full rounded-2xl bg-black/20 p-2">
-      <ResponsiveContainer width="100%" height="100%">
-        <ComposedChart data={chartData} margin={{ top: 16, right: 18, bottom: 4, left: 4 }}>
-          <CartesianGrid stroke="rgba(255,255,255,0.06)" vertical={false} />
-          <XAxis dataKey="attempt" tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 11 }} axisLine={false} tickLine={false} />
-          <YAxis
-            yAxisId="left"
-            domain={[0, 100]}
-            tick={{ fill: '#6ee7b7', fontSize: 11 }}
-            axisLine={false}
-            tickLine={false}
-            width={32}
-          />
-          <YAxis
-            yAxisId="right"
-            orientation="right"
-            domain={[95, 185]}
-            tick={{ fill: '#7dd3fc', fontSize: 11 }}
-            axisLine={false}
-            tickLine={false}
-            width={38}
-          />
-          {/* 🎯 学术合规发力区间 (135°-155°) 绿色半透明阴影带 */}
-          <ReferenceArea
-            yAxisId="right"
-            y1={OPTIMAL_KNEE_ANGLE_MIN}
-            y2={OPTIMAL_KNEE_ANGLE_MAX}
-            fill="#34d399"
-            fillOpacity={0.14}
-            stroke="#34d399"
-            strokeOpacity={0.3}
-            strokeDasharray="4 4"
-            label={{
-              value: '🎯 学术合规发力区间 (135°-155°)',
-              position: 'insideTopRight',
-              fill: '#6ee7b7',
-              fontSize: 10,
-            }}
-          />
-          <Tooltip
-            contentStyle={{
-              background: 'rgba(10,14,12,0.92)',
-              border: '1px solid rgba(255,255,255,0.12)',
-              borderRadius: 12,
-              fontSize: 12,
-            }}
-            labelFormatter={(_label, payload) => payload?.[0]?.payload?.label ?? _label}
-            formatter={(value, name) => {
-              const isScore = name === 'score'
-              if (value === null || value === undefined) return ['暂无数据', isScore ? '综合评分' : '膝角']
-              return isScore ? [`${value} 分`, '综合评分'] : [`${value}°`, '膝角']
-            }}
-          />
-          <Line
-            yAxisId="left"
-            type="monotone"
-            dataKey="score"
-            name="score"
-            stroke="#34d399"
-            strokeWidth={2.5}
-            connectNulls
-            dot={(dotProps: unknown) => (
-              <ClickableDot
-                {...(dotProps as { cx?: number; cy?: number; payload?: { index: number } })}
-                fill="#34d399"
-                onDotClick={onSelectIndex}
-                isActive={(dotProps as { payload?: { index: number } }).payload?.index === selectedIndex}
-              />
-            )}
-            activeDot={{ r: 6 }}
-          />
-          {hasKneeAngleData && (
-            <Line
-              yAxisId="right"
-              type="monotone"
-              dataKey="kneeAngle"
-              name="kneeAngle"
-              stroke="#38bdf8"
-              strokeWidth={2}
-              strokeDasharray="6 4"
-              connectNulls
-              dot={(dotProps: unknown) => (
-                <ClickableDot
-                  {...(dotProps as { cx?: number; cy?: number; payload?: { index: number } })}
-                  fill="#38bdf8"
-                  onDotClick={onSelectIndex}
-                  isActive={(dotProps as { payload?: { index: number } }).payload?.index === selectedIndex}
-                />
-              )}
-              activeDot={{ r: 6 }}
-            />
-          )}
-        </ComposedChart>
-      </ResponsiveContainer>
     </div>
   )
 }

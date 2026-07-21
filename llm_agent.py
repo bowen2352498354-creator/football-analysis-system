@@ -1,33 +1,23 @@
 # -*- coding: utf-8 -*-
 """
 llm_agent.py
-v0.3 AIGC 积极意图认知转译引擎（大模型代理模块）
+v3.0 科研级生物力学诊断转译引擎（大模型代理模块）——职责严格解耦
+
+【权限铁律】
+    大语言模型完全不接触数值评分计算。评分由 error_diagnoser.DeterministicScorer
+    纯数学独占；本模块只允许接收其输出的 JSON 诊断报告，转译为严谨的
+    三节制科研诊断 Markdown（客观实测 / 致错根因 / 临床纠正）。
 
 功能说明：
-    1. 使用官方 openai 这个 Python 库来发起网络请求（DeepSeek 官方接口
-       完全兼容 OpenAI 的调用格式，只需要把 base_url 换成 DeepSeek 的
-       服务器地址，再把 model 换成 "deepseek-chat" 即可，不需要额外安装
-       DeepSeek 专用的 SDK）；
-    2. 对外只暴露一个核心函数 generate_feedback(angle, status)：
-       输入"当前膝关节角度"与"三级容错状态"，返回一句适合读给小学生听的、
-       充满正能量、且完全不带生硬力学术语的中文指导语；
-    3. System Prompt（系统提示词）严格照抄 project_plan.md 文档中
-       "AIGC 积极意图认知转译引擎规范"一节规定的三大原则：
-           - 积极意图原则：禁止评判性/惩罚性字眼，只能用建议性表述；
-           - 具身隐喻原则：禁止抽象力学术语，必须换成孩子熟悉的身体比喻；
-           - 单一焦点原则：一次反馈只讲一个最重要的点，避免信息过载；
-    4. 调用参数严格设置 temperature=0.3，把大模型的"随机发挥"程度死死
-       压低，保证同样的输入基本会得到风格、尺度都很稳定的输出，
-       这对教学场景的安全性和一致性非常重要。
-
-【重要说明】
-    本模块只负责"和大模型对话，拿到一句话文本"，完全不涉及摄像头、
-    OpenCV 画面绘制、多线程调度这些逻辑——那些是 pose_tracker.py 的职责。
-    这样职责分离，方便后续 v0.4/v1.0 阶段单独替换或复用这个 AIGC 模块。
+    1. 使用官方 openai Python 库调用 DeepSeek（OpenAI 兼容协议）；
+    2. 核心函数 generate_feedback(diagnosis_json)：输入诊断 JSON，返回三节制科研诊断 Markdown；
+    3. System Prompt 强制：高校运动生物力学专家口径；绝对禁止比喻、拟人、情绪化修辞；
+    4. temperature 强制锁定 LLM_TEMPERATURE=0.1，彻底压制发散性自回归输出。
 """
 
 import json
 import os
+import re
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -61,194 +51,467 @@ DEEPSEEK_MODEL_NAME = "deepseek-chat"
 client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
 
 # --------------------------------------------------------------------------
-# 第二步：System Prompt —— 严格照抄规划文档中的三大转译原则
+# 第二步：System Prompt —— V3.0 科研级生物力学诊断（严禁修辞发散）
 # --------------------------------------------------------------------------
 
-# 这段系统提示词就是整个 AIGC 模块的"灵魂"：它规定了大模型必须扮演什么角色、
-# 必须遵守什么规则、绝对不能说什么话。写得越明确、越有具体范例，
-# 大模型输出的内容就越稳定、越符合小学生的认知与情感需求。
-SYSTEM_PROMPT = """你是一名经验丰富、充满爱心的小学足球启蒙教练，正在给10-11岁的小学五年级学生做\
-动作反馈。你的反馈会被系统直接读出来/展示给孩子看，所以你必须严格遵守下面三条铁律，\
-一条都不能违反：
+# 【权限铁律】大模型完全不接触数值评分计算。它只能接收 error_diagnoser.py
+# 输出的 JSON 诊断报告，强制复述实测数值并给出力学致错根因与厘米级纠正指令。
+# temperature 强制锁定 0.1，彻底封杀发散性自回归输出。
+LLM_TEMPERATURE = 0.1
 
-【铁律一：积极意图原则】
-- 绝对禁止出现任何评判性、惩罚性、否定性的字眼，比如"你做错了""动作错误""不对""失败""不好"。
-- 必须使用信息性、建议性的表达方式，比如"下次可以试着……""再多一点点……就更棒了""我们再感受一下……"。
-- 语气要始终温暖、鼓励，让孩子觉得自己是"正在变得更棒"，而不是"被批评"。
+# 三节制科研诊断输出的唯一合法骨架（SYSTEM / REPORT 共用）
+_CLINICAL_MARKDOWN_CONTRACT = """\
+【最高级别身份与禁令——违背即判定为严重错误】
+你是严谨的高校运动生物力学专家，正在撰写科研级诊断意见书。
+绝对禁止使用任何修辞手法、比喻（如木棍、弹簧、弹簧门、滑滑梯、扫把、弓弦、大树、铁板、瓶盖、陀螺、冻住的小木棍等）、拟人或情绪化词汇。
+绝对禁止寒暄、过渡句、鼓励语、口语化表达。
+禁止输出评分、扣分、评级或对评分结果的任何评论。
+禁止编造 JSON 中不存在的数值；JSON 缺测值时写“该指标未提供实测值”，不得虚构。
+必须使用简体中文、专业生物力学术语（矢状面、额状面、动量、转动惯量、重心投影、折叠鞭打等）。
 
-【铁律二：具身隐喻原则】
-- 绝对禁止使用任何抽象的生物力学/物理学专业术语，比如"角动量""屈曲度""关节角度""力矩""向量""夹角""生物力学"。
-- 必须把动作要点转译成孩子熟悉的、生动形象的身体感觉或生活化比喻，比如"像大树的根稳稳扎在地上"\
-"膝盖像被轻轻按了一下、弹一下""腿像拉满的弓弦，蓄满了力量""像小猫轻轻落地一样"。
+【输出格式——必须且只能输出以下纯 Markdown 文本，首行即【一、】，末行结束于第三节正文】
+【一、 客观实测面诊】
+（必须强制提取并复述传入 JSON 中的支撑脚横距、膝关节角度、折叠角、踝关节刚度等具体数值，并给出偏差定性。示例口径：“实测支撑脚距球心横距 28.5cm，严重偏宽。”禁止空泛描述。）
 
-【铁律三：单一焦点原则】
-- 每一次反馈只能聚焦在当前输入里最需要关注的这一个点上，绝对不要同时讲很多个知识点，
-- 避免孩子的注意力和记忆负担过重，一句话讲清楚一件事就好。
+【二、 生物力学致错根因】
+（纯力学原理解释，禁止比喻。示例口径：“支撑脚偏远导致身体重心过度侧倾，摆动腿无法在矢状面完成折叠鞭打，动量流失。”）
 
-【输出格式要求】
-- 只输出一句话（最多可以分成两小句，用逗号或句号连接），不要输出多段文字。
-- 不要输出任何解释、前缀、标签（比如不要写"反馈："这种字样），直接输出这句要说给孩子听的话本身。
-- 语言必须是简体中文，语气亲切自然，像面对面在跟一个10岁孩子说话。
+【三、 临床纠正药方】
+（给出明确的厘米级或空间定位纠正指令。示例口径：“支撑脚落地需卡在球心侧方 15-20 厘米处。”禁止模糊建议。）
+
+【硬性否决条款】
+- 若输出中出现任何比喻/拟人/情绪词/寒暄/过渡句 → 整份报告作废级错误。
+- 若缺少上述三个标题中的任何一个 → 整份报告作废级错误。
+- 若第一节未复述至少一项具体数值（含单位 cm 或 °）→ 整份报告作废级错误。
+- 除上述三节 Markdown 外，不得输出任何其他字符（含前言、后记、代码围栏）。
 """
+
+SYSTEM_PROMPT = (
+    "你是严谨的高校运动生物力学专家。绝对禁止使用任何修辞手法、比喻"
+    "（如木棍、弹簧、弹簧门、滑滑梯、扫把、弓弦、大树、铁板等）、拟人或情绪化词汇。"
+    "违背此规则将被判定为严重错误！\n\n"
+    "你只能依据传入的诊断 JSON 撰写报告；优先级聚焦："
+    "脚踝锁紧 > 支撑脚 > 摆动腿折叠 > 膝夹角。\n\n"
+    + _CLINICAL_MARKDOWN_CONTRACT
+)
+
+# 红色缺陷优先级（与 SYSTEM_PROMPT 一致，供兜底规则使用）
+_RED_DEFECT_PRIORITY = (
+    "ankle_rigidity",
+    "distance_cm",
+    "toe_angle",
+    "max_folding_angle",
+    "impact_knee_angle",
+    "support_knee_angle",
+    "hip_torsion_angle",
+    "whipping_velocity",
+)
+
+_INDICATOR_LABEL_ZH = {
+    "ankle_rigidity": "踝关节跖屈刚度方差",
+    "distance_cm": "支撑脚距球心横距",
+    "toe_angle": "支撑脚尖朝向角",
+    "max_folding_angle": "摆动腿最大折叠角",
+    "impact_knee_angle": "触球瞬间膝关节角",
+    "support_knee_angle": "支撑腿膝关节角",
+    "hip_torsion_angle": "髋部相对扭转角",
+    "whipping_velocity": "鞭打峰值角速度",
+}
+
+_INDICATOR_UNIT = {
+    "ankle_rigidity": "",
+    "distance_cm": "cm",
+    "toe_angle": "°",
+    "max_folding_angle": "°",
+    "impact_knee_angle": "°",
+    "support_knee_angle": "°",
+    "hip_torsion_angle": "°",
+    "whipping_velocity": "°/s",
+}
+
+_RED_DEFECT_FALLBACK_LINES = {
+    "ankle_rigidity": (
+        "【一、 客观实测面诊】\n"
+        "触球窗口踝关节角度方差偏大，跖屈锁定不足。\n\n"
+        "【二、 生物力学致错根因】\n"
+        "踝关节刚性不足导致触球瞬间足段形变吸收动能，动量向球体传递效率下降。\n\n"
+        "【三、 临床纠正药方】\n"
+        "触球前主动跖屈并维持踝关节锁定至随摆结束；触球面保持足背中段稳定接触。"
+    ),
+    "distance_cm": (
+        "【一、 客观实测面诊】\n"
+        "支撑脚距球心横距偏离目标区间（目标约 15-20cm）。\n\n"
+        "【二、 生物力学致错根因】\n"
+        "支撑脚横距过大导致躯干额状面侧倾，摆动腿难以在矢状面完成折叠鞭打，动量横向流失。\n\n"
+        "【三、 临床纠正药方】\n"
+        "支撑脚落地需卡在球心侧方 15-20 厘米处，脚尖指向踢球方向。"
+    ),
+    "toe_angle": (
+        "【一、 客观实测面诊】\n"
+        "支撑脚尖朝向角偏离踢球前进方向。\n\n"
+        "【二、 生物力学致错根因】\n"
+        "支撑脚外展/内收改变骨盆定向，髋-膝运动链偏离矢状面，击球矢量偏移。\n\n"
+        "【三、 临床纠正药方】\n"
+        "支撑脚尖指向目标方向，允许偏差不超过约 10°。"
+    ),
+    "max_folding_angle": (
+        "【一、 客观实测面诊】\n"
+        "摆动腿后摆最大折叠角不足。\n\n"
+        "【二、 生物力学致错根因】\n"
+        "膝屈曲不足使小腿转动惯量偏大，角速度峰值受限，鞭打链条中断。\n\n"
+        "【三、 临床纠正药方】\n"
+        "后摆极端位将摆动腿膝屈曲增大至充分折叠，再在矢状面加速伸展击球。"
+    ),
+    "impact_knee_angle": (
+        "【一、 客观实测面诊】\n"
+        "触球瞬间摆动腿膝关节角偏离最优区间。\n\n"
+        "【二、 生物力学致错根因】\n"
+        "触球膝角异常改变末端环节有效质量与接触几何，冲量方向失控。\n\n"
+        "【三、 临床纠正药方】\n"
+        "触球瞬间保持摆动腿膝关节适度屈曲，避免过伸直腿鞭打或过度蹲踞。"
+    ),
+    "support_knee_angle": (
+        "【一、 客观实测面诊】\n"
+        "支撑腿膝关节角偏离稳定支撑所需区间。\n\n"
+        "【二、 生物力学致错根因】\n"
+        "支撑膝过伸或过屈削弱下肢刚度，重心垂直投影不稳，影响摆动腿平面约束。\n\n"
+        "【三、 临床纠正药方】\n"
+        "支撑腿落地后保持微屈缓冲，膝关节角稳定在可控屈曲区间至击球完成。"
+    ),
+    "hip_torsion_angle": (
+        "【一、 客观实测面诊】\n"
+        "髋部相对扭转角不足或过度。\n\n"
+        "【二、 生物力学致错根因】\n"
+        "骨盆-髋扭转不足使躯干角动量无法有效向摆动腿传递。\n\n"
+        "【三、 临床纠正药方】\n"
+        "击球过程完成骨盆向击球侧有控制的旋转，幅度与助跑方向一致。"
+    ),
+    "whipping_velocity": (
+        "【一、 客观实测面诊】\n"
+        "摆动腿鞭打峰值角速度偏低。\n\n"
+        "【二、 生物力学致错根因】\n"
+        "近端环节制动与远端加速时序失调，角速度峰值无法在触球前形成。\n\n"
+        "【三、 临床纠正药方】\n"
+        "后摆折叠后，髋先行加速、膝继发伸展，确保触球前达到角速度峰值。"
+    ),
+}
+
+
+def _normalize_diagnosis_json(diagnosis_json) -> dict:
+    """把 error_diagnoser 输出（dict / JSON 字符串）规范为 dict。"""
+    if diagnosis_json is None:
+        return {}
+    if isinstance(diagnosis_json, dict):
+        return diagnosis_json
+    if isinstance(diagnosis_json, str):
+        try:
+            parsed = json.loads(diagnosis_json)
+            return parsed if isinstance(parsed, dict) else {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {"raw_text": diagnosis_json}
+    return {}
+
+
+def _pick_primary_red_defect(diagnosis: dict) -> str | None:
+    """按固定优先级从 JSON 中挑选唯一一个红色缺陷键名。"""
+    detail = diagnosis.get("score_detail") or {}
+    indicators = detail.get("indicators") or diagnosis.get("indicators") or {}
+    if isinstance(indicators, dict):
+        for key in _RED_DEFECT_PRIORITY:
+            item = indicators.get(key) or {}
+            if isinstance(item, dict) and item.get("status") == "RED_DEVIATED":
+                return key
+    # 兼容旧错误码
+    code = diagnosis.get("primary_error_code") or ""
+    code_map = {
+        "ERR_C1_LOOSE_ANKLE": "ankle_rigidity",
+        "ERR_ANKLE_LOOSE": "ankle_rigidity",
+        "ERR_A2_SUPPORT_WIDE": "distance_cm",
+        "ERR_SUPPORT_TOO_CLOSE": "distance_cm",
+        "ERR_WARMUP_CLOSE": "distance_cm",
+        "ERR_A1_SUPPORT_BACK": "toe_angle",
+        "ERR_B1_STRAIGHT_LEG": "max_folding_angle",
+        "ERR_B2_SHANK_ONLY": "max_folding_angle",
+        "ERR_KNEE_STIFF": "support_knee_angle",
+    }
+    return code_map.get(code)
+
+
+def _extract_indicator_payload(diagnosis: dict) -> dict:
+    """提取指标 status + 实测 value（供模型复述），剥离评分/扣分字段。"""
+    detail = diagnosis.get("score_detail") or {}
+    indicators = detail.get("indicators") or diagnosis.get("indicators") or {}
+    metrics = diagnosis.get("metrics") or {}
+    out: dict = {}
+    if not isinstance(indicators, dict):
+        return out
+    for key, item in indicators.items():
+        if not isinstance(item, dict):
+            continue
+        value = item.get("value")
+        if value is None and key == "ankle_rigidity":
+            value = item.get("variance")
+        if value is None and key in metrics:
+            value = metrics.get(key)
+        if value is None and key == "distance_cm":
+            value = metrics.get("support_lateral_dist_cm")
+        entry = {
+            "label_zh": _INDICATOR_LABEL_ZH.get(key, key),
+            "status": item.get("status"),
+            "unit": _INDICATOR_UNIT.get(key, ""),
+        }
+        if value is not None:
+            try:
+                entry["value"] = round(float(value), 2)
+            except (TypeError, ValueError):
+                entry["value"] = value
+        out[key] = entry
+    return out
+
+
+def _strip_code_fences(text: str) -> str:
+    """剔除模型偶发包裹的 Markdown 代码围栏。"""
+    cleaned = (text or "").strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:markdown|md)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    return cleaned.strip()
+
+
+def _split_clinical_markdown(text: str) -> tuple[str, str]:
+    """将三节制 Markdown 拆成 (一+二 → painPoint, 三 → prescription)。"""
+    cleaned = _strip_code_fences(text)
+    match = re.search(r"【三[、．.\s]*临床纠正药方】", cleaned)
+    if match:
+        pain_point = cleaned[: match.start()].strip()
+        prescription = cleaned[match.start() :].strip()
+        return pain_point, prescription
+    return cleaned, cleaned
+
+
+def _build_clinical_fallback_markdown(diagnosis: dict) -> str:
+    """无模型可用时，用规则拼出合规的三节制科研诊断 Markdown。"""
+    defect = _pick_primary_red_defect(diagnosis) or "max_folding_angle"
+    template = _RED_DEFECT_FALLBACK_LINES.get(
+        defect, _RED_DEFECT_FALLBACK_LINES["max_folding_angle"]
+    )
+    indicators = _extract_indicator_payload(diagnosis)
+    measured_lines = []
+    for key, entry in indicators.items():
+        if entry.get("value") is None:
+            continue
+        unit = entry.get("unit") or ""
+        status = entry.get("status") or ""
+        measured_lines.append(
+            f"实测{entry.get('label_zh', key)} {entry['value']}{unit}（状态 {status}）"
+        )
+    if measured_lines:
+        section_one = "；".join(measured_lines[:4]) + "。"
+        template = re.sub(
+            r"【一、 客观实测面诊】\n.*?\n\n【二、",
+            f"【一、 客观实测面诊】\n{section_one}\n\n【二、",
+            template,
+            count=1,
+            flags=re.DOTALL,
+        )
+    return template
+
 
 # --------------------------------------------------------------------------
 # 第三步：核心对外函数 generate_feedback
 # --------------------------------------------------------------------------
 
 
-def generate_feedback(angle, status):
-    """调用 DeepSeek 大模型，把"膝关节角度 + 三级状态"转译成一句温暖的中文指导语。
+def generate_feedback(diagnosis_json, status=None):
+    """调用 DeepSeek：把 error_diagnoser 的 JSON 转译为三节制科研诊断 Markdown。
 
-    参数：
-        angle：float 类型，当前检测到的右膝关节屈曲角度（单位：度），
-               例如 118.3、175.6 等。
-        status：str 类型，三级容错状态之一："Green" / "Yellow" / "Red"，
-                本函数主要在 status 为 "Red"（显著偏离）时被上层代码触发调用，
-                但函数本身对三种状态都可以正常处理。
+    【V3.0 权限解耦】
+        - 本函数绝不计算、修改或返回任何数值评分。
+        - 唯一合法输入是 error_diagnoser 输出的诊断 JSON（dict 或 JSON 字符串）。
+        - 兼容旧调用 generate_feedback(angle: float, status: str)：会包装成最小 JSON，
+          但不允许模型据此打分。
 
     返回：
-        str 类型，一句适合直接展示/朗读给小学生听的中文正向反馈语句。
-        如果调用大模型接口失败（例如网络异常、Key 无效等），
-        会返回一句兜底的默认鼓励语，保证上层调用方不会因为网络问题而崩溃。
+        str，纯 Markdown 三节制科研诊断文本（客观实测 / 致错根因 / 临床纠正）。
     """
-    # 把冷冰冰的数字和英文状态，包装成一句自然语言描述，作为"用户输入"喂给大模型，
-    # 方便大模型理解当前具体发生了什么，但注意：这里描述里依然会出现"角度"这样的词，
-    # 那是喂给大模型参考的原始数据，大模型自己回复时绝对不能照抄这些术语。
+    # 旧签名兼容：generate_feedback(angle, status)
+    if isinstance(diagnosis_json, (int, float)) and status is not None:
+        diagnosis = {
+            "legacy_angle": float(diagnosis_json),
+            "legacy_status": str(status),
+            "score_detail": {
+                "indicators": {
+                    "impact_knee_angle": {
+                        "value": float(diagnosis_json),
+                        "status": (
+                            "RED_DEVIATED"
+                            if str(status).lower() == "red"
+                            else "YELLOW_APPROACHING"
+                            if str(status).lower() == "yellow"
+                            else "GREEN_OPTIMAL"
+                        ),
+                    }
+                }
+            },
+            "llm_participated": False,
+        }
+    else:
+        diagnosis = _normalize_diagnosis_json(diagnosis_json)
+
+    # 传入实测值供第一节复述；剥离 TotalScore / penalty，防止模型接触评分计算
+    safe_payload = {
+        "primary_error_code": diagnosis.get("primary_error_code"),
+        "t_impact": diagnosis.get("t_impact", diagnosis.get("t0_index")),
+        "red_defect_priority_hint": _pick_primary_red_defect(diagnosis),
+        "indicators": _extract_indicator_payload(diagnosis),
+    }
+
     user_message = (
-        f"这位小学生刚刚完成了一次踢球动作，系统检测到他摆动腿触球瞬间的膝关节屈曲角度是 "
-        f"{angle:.1f} 度，当前的三级容错诊断状态是「{status}」（Green 表示达标、"
-        f"Yellow 表示接近达标、Red 表示明显偏离达标区间）。"
-        f"请你根据这个情况，给这位孩子说一句符合三条铁律的正向引导语。"
+        "下面是确定性诊断引擎输出的 JSON。你必须复述其中的实测数值，"
+        "用纯力学语言解释致错根因，并给出厘米级/角度级纠正指令。"
+        "禁止打分、禁止比喻、禁止寒暄。只输出规定的三节 Markdown：\n"
+        f"{json.dumps(safe_payload, ensure_ascii=False)}"
     )
 
     try:
-        # 发起一次标准的 Chat Completions 调用：
-        #   model：使用 DeepSeek 的对话模型
-        #   messages：分别传入 system（规则设定）与 user（本次具体情况）两条消息
-        #   temperature=0.3：严格限制随机性，确保同样的输入基本会得到风格稳定、
-        #                     教学法安全可靠的输出，避免大模型"天马行空"或"幻觉"
         response = client.chat.completions.create(
             model=DEEPSEEK_MODEL_NAME,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_message},
             ],
-            temperature=0.3,
+            temperature=LLM_TEMPERATURE,
         )
-
-        # 从返回结果中取出大模型生成的文本内容，并去除首尾多余的空白字符
-        feedback_text = response.choices[0].message.content.strip()
-        return feedback_text
+        return _strip_code_fences(response.choices[0].message.content or "")
 
     except Exception as exc:  # noqa: BLE001 - 网络/接口异常时需要兜底，不能让程序崩溃
         print(f"【llm_agent】调用 DeepSeek 接口失败，使用兜底提示语。错误信息：{exc}")
-        # 兜底默认语句：即使大模型暂时调用失败，也依然保持"积极意图 + 具身隐喻"的风格，
-        # 让孩子在网络异常时也不会看到任何生硬的报错信息
-        return "再试一次吧，感觉一下腿像拉满的弓弦，稳稳地把力量送出去！"
+        return _build_clinical_fallback_markdown(diagnosis)
 
 
 # --------------------------------------------------------------------------
 # 【v1.1 新增：前后端全栈联调】第三步半：整堂课/整次训练的综合诊断报告生成
 # --------------------------------------------------------------------------
 
-# 综合报告场景下的系统提示词：与 generate_feedback() 用的单帧提示词共享
-# 同样的三大铁律，但视角从"某一帧的即时口头反馈"升级为"整次训练结束后，
-# 面向教师/学生的结构化科研诊断报告"，因此额外要求大模型必须只输出
-# 严格的 JSON（而不是一句话），方便后端直接解析后传给前端渲染。
-REPORT_SYSTEM_PROMPT = """你是一名同时具备儿童运动心理学与运动生物力学背景的小学足球科研教练，\
-现在需要根据系统后台真实采集到的「一整次训练/分析」中，摆动腿触球瞬间膝关节屈曲角度的\
-红(Red)/黄(Yellow)/绿(Green)三级容错判定统计结果，生成一份面向该小学生（10-11岁）\
-本人与授课教师共同查看的「本次综合练习诊断报告」。
-
-你必须严格遵守以下三条铁律，一条都不能违反（这是本报告唯一合法的表达框架）：
-
-【铁律一：积极意图原则】
-- 绝对禁止出现任何评判性、惩罚性、否定性的字眼，比如"你做错了""动作错误""不对""失败""不好"。
-- 必须使用信息性、建议性的表达方式，例如"下次可以试着……""再多一点点……就更棒了"。
-
-【铁律二：具身隐喻原则】
-- 绝对禁止使用任何抽象的生物力学/物理学专业术语，比如"角动量""屈曲度""关节角度""力矩""向量""夹角"。
-- 必须把动作要点转译成孩子熟悉的、生动形象的身体感觉或生活化比喻。
-
-【铁律三：单一焦点原则】
-- painPoint 字段只聚焦当前统计数据中最值得关注的这一个点，不要同时罗列很多个知识点。
-
-【输出格式要求（极其重要，必须严格遵守）】
-- 只允许返回一个合法的 JSON 对象，绝对不能包含任何 Markdown 代码块标记（```）、\
-解释性文字、前后缀说明。
-- JSON 对象必须且只能包含以下三个字段：
-    1. "score"：整数，0-100，代表本次训练的发力稳定性综合评分；
-    2. "painPoint"：字符串，本次训练最主要的具身隐喻化痛点描述（遵守单一焦点原则）；
-    3. "prescription"：字符串，给孩子/教练的下一步具身隐喻化训练处方建议。
-- 两个字符串字段均为简体中文，语气温暖亲切，长度控制在 40-90 字之间。
-"""
+# 综合报告：与 SYSTEM_PROMPT 同一套科研禁令 + 三节制 Markdown（兼容层再拆 painPoint/prescription）
+REPORT_SYSTEM_PROMPT = (
+    "你是严谨的高校运动生物力学专家。绝对禁止使用任何修辞手法、比喻"
+    "（如木棍、弹簧、弹簧门、滑滑梯、扫把、弓弦、大树、铁板、冻住的小木棍等）、"
+    "拟人或情绪化词汇。违背此规则将被判定为严重错误！\n\n"
+    "你只能依据传入的诊断 JSON 撰写整次训练的科研诊断意见书；"
+    "优先级聚焦：脚踝锁紧 > 支撑脚 > 摆动腿折叠 > 膝夹角。\n\n"
+    + _CLINICAL_MARKDOWN_CONTRACT
+)
 
 
-def _build_fallback_report(hit_stats, total_attempts):
-    """当 DeepSeek 接口调用失败或返回内容解析失败时的规则化兜底报告，
-    保证前端接口任何情况下都能拿到一份结构完整、语气安全的报告，不会因为
-    网络异常而让联调流程中断。
+def _deterministic_session_score_from_hits(hit_stats: dict) -> float:
+    """会话级纯数学评分兜底（无逐帧数据时）：由红黄绿命中次数线性推导，LLM 零参与。"""
+    green = int(hit_stats.get("green", 0) or 0)
+    yellow = int(hit_stats.get("yellow", 0) or 0)
+    red = int(hit_stats.get("red", 0) or 0)
+    total = max(1, green + yellow + red)
+    # 100 起：黄各扣 4，红各扣 12，再按绿色占比微调，保留两位小数
+    score = 100.00 - yellow * 4.0 - red * 12.0
+    score = score * (0.55 + 0.45 * (green / total))
+    return round(max(0.0, min(100.0, float(score))), 2)
+
+
+def _build_fallback_report(hit_stats, total_attempts, deterministic_score=None, diagnosis=None):
+    """当 DeepSeek 接口调用失败或返回内容解析失败时的规则化兜底报告。
+
+    【V3.0】score 永远来自确定性数学；文案为无比喻的三节制科研 Markdown。
     """
-    safe_total = max(1, total_attempts)
-    green = hit_stats.get("green", 0)
-    yellow = hit_stats.get("yellow", 0)
-    red = hit_stats.get("red", 0)
-
-    score = max(35, min(98, round((green / safe_total) * 100 - red * 3)))
-
-    if red >= yellow and red > 0:
-        pain_point = f"本次练习中，有 {red} 次触球时腿部像还没完全拉满的弓弦，力量释放得有点着急。"
-        prescription = "下次触球前，试着先感受一下摆动腿像弓弦一样慢慢蓄力，再稳稳地把力量送出去。"
-    elif yellow > 0:
-        pain_point = f"本次练习整体比较稳，只是有 {yellow} 次腿部蓄力的感觉差了那么一点点。"
-        prescription = "可以在踢球前多给自己一点点准备时间，感受一下腿像小猫落地一样轻巧又扎实。"
+    if deterministic_score is not None:
+        score = round(float(deterministic_score), 2)
     else:
-        pain_point = "本次练习动作整体非常稳定，几乎每一次都保持住了很好的发力感觉。"
-        prescription = "继续保持这种感觉，下次可以试着让摆动腿再多一点点加速冲力，会更棒！"
+        score = _deterministic_session_score_from_hits(hit_stats)
 
+    markdown = _build_clinical_fallback_markdown(diagnosis or {})
+    # 若无指标数据，在第一节补充会话红黄命中的客观陈述（仍禁止比喻）
+    if not (diagnosis or {}).get("score_detail") and not (diagnosis or {}).get("indicators"):
+        red = int(hit_stats.get("red", 0) or 0)
+        yellow = int(hit_stats.get("yellow", 0) or 0)
+        session_note = (
+            f"本次有效触球 {total_attempts} 次，其中 RED_DEVIATED {red} 次，"
+            f"YELLOW_APPROACHING {yellow} 次。"
+        )
+        markdown = re.sub(
+            r"【一、 客观实测面诊】\n",
+            f"【一、 客观实测面诊】\n{session_note}",
+            markdown,
+            count=1,
+        )
+    pain_point, prescription = _split_clinical_markdown(markdown)
     return {"score": score, "painPoint": pain_point, "prescription": prescription}
 
 
-def generate_session_report(hit_stats, student_number, sample_angles=None):
-    """调用 DeepSeek 大模型，把「一整次训练」的红/黄/绿统计数据转译成结构化的
-    综合诊断报告（score / painPoint / prescription 三个字段）。
+def generate_session_report(
+    hit_stats,
+    student_number,
+    sample_angles=None,
+    deterministic_score=None,
+    diagnosis_json=None,
+):
+    """把「一整次训练」的诊断 JSON / 红黄绿统计转译为科研诊断；评分绝不经 LLM。
 
     参数：
-        hit_stats：dict，形如 {"green": 12, "yellow": 3, "red": 2}，
-                   三级容错状态各自的命中次数统计（由 api_server.py 汇总后传入）。
-        student_number：str，学生学号，仅用于让大模型的表达更有针对性（不会被
-                         写进禁止事项，纯粹是上下文信息）。
-        sample_angles：可选，list[float]，本次训练部分/全部有效采样角度，
-                        用于让大模型对波动情况有更具体的感知（非必需字段）。
+        hit_stats：dict，形如 {"green": 12, "yellow": 3, "red": 2}
+        student_number：str
+        sample_angles：可选 list[float]（仅作内部波动参考，禁止模型输出评分）
+        deterministic_score：可选 float，来自 DeterministicScorer / error_diagnoser；
+            若提供则原样写入返回的 score 字段。
+        diagnosis_json：可选，error_diagnoser 输出的 JSON 诊断报告。
 
     返回：
-        dict，包含 "score"（int）、"painPoint"（str）、"prescription"（str）
-        三个字段。任何异常情况下都会返回结构完整的兜底数据，绝不抛出异常。
+        dict，含 "score"（确定性数学）、"painPoint"（【一】+【二】）、
+        "prescription"（【三】）。LLM 原文为三节 Markdown，此处拆分以兼容既有 API。
     """
     hit_stats = hit_stats or {}
     total_attempts = sum(hit_stats.get(k, 0) for k in ("green", "yellow", "red"))
 
-    if total_attempts == 0:
-        # 没有任何有效采样数据（例如分析刚开始就立刻结束），直接返回中性兜底报告
+    if deterministic_score is not None:
+        score = round(float(deterministic_score), 2)
+    else:
+        score = _deterministic_session_score_from_hits(hit_stats)
+
+    if total_attempts == 0 and not diagnosis_json:
         return {
-            "score": 0,
-            "painPoint": "本次训练还没有采集到足够的有效触球数据，暂时无法给出具体的身体感觉建议。",
-            "prescription": "别担心，下次多试几次触球动作，系统会帮你记录得更完整哦！",
+            "score": 0.0,
+            "painPoint": (
+                "【一、 客观实测面诊】\n"
+                "本次训练未采集到有效触球数据，关键生物力学指标均未提供实测值。\n\n"
+                "【二、 生物力学致错根因】\n"
+                "数据不足，无法建立运动链致错因果推断。"
+            ),
+            "prescription": (
+                "【三、 临床纠正药方】\n"
+                "需重新完成至少一次完整踢球采样后再出具厘米级纠正指令。"
+            ),
         }
 
-    angle_hint = ""
+    diagnosis = _normalize_diagnosis_json(diagnosis_json)
+    safe_payload = {
+        "student_number": student_number or "未填写",
+        "hit_stats_labels": {
+            "green": hit_stats.get("green", 0),
+            "yellow": hit_stats.get("yellow", 0),
+            "red": hit_stats.get("red", 0),
+        },
+        "red_defect_priority_hint": _pick_primary_red_defect(diagnosis),
+        "indicators": _extract_indicator_payload(diagnosis),
+    }
     if sample_angles:
-        rounded = [round(float(a), 1) for a in sample_angles[:20]]
-        angle_hint = f"部分采样到的原始角度数值（仅供你内部参考波动趋势，禁止在输出中提及）：{rounded}。"
+        try:
+            safe_payload["sample_knee_angle_mean_deg"] = round(
+                sum(float(a) for a in sample_angles) / len(sample_angles), 1
+            )
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
 
     user_message = (
-        f"学生学号：{student_number or '未填写'}。"
-        f"本次训练系统一共采集到 {total_attempts} 次有效触球瞬间判定数据，"
-        f"其中 Green（达标）{hit_stats.get('green', 0)} 次、"
-        f"Yellow（接近达标）{hit_stats.get('yellow', 0)} 次、"
-        f"Red（明显偏离）{hit_stats.get('red', 0)} 次。"
-        f"{angle_hint}"
-        f"请严格按照系统提示词规定的 JSON 格式，生成这次训练的综合诊断报告。"
+        "下面是确定性诊断引擎输出的 JSON。必须复述 indicators 中的实测数值，"
+        "禁止打分，禁止比喻，禁止寒暄。只输出规定的三节 Markdown：\n"
+        f"{json.dumps(safe_payload, ensure_ascii=False)}"
     )
 
     try:
@@ -258,24 +521,24 @@ def generate_session_report(hit_stats, student_number, sample_angles=None):
                 {"role": "system", "content": REPORT_SYSTEM_PROMPT},
                 {"role": "user", "content": user_message},
             ],
-            temperature=0.3,
-            response_format={"type": "json_object"},
+            temperature=LLM_TEMPERATURE,
         )
-        raw_text = response.choices[0].message.content.strip()
-        parsed = json.loads(raw_text)
+        raw_text = _strip_code_fences(response.choices[0].message.content or "")
+        if "【一、" not in raw_text or "【三、" not in raw_text:
+            raise ValueError("DeepSeek 返回内容未包含强制三节标题")
 
-        score = int(parsed["score"])
-        pain_point = str(parsed["painPoint"]).strip()
-        prescription = str(parsed["prescription"]).strip()
-
+        pain_point, prescription = _split_clinical_markdown(raw_text)
         if not pain_point or not prescription:
             raise ValueError("DeepSeek 返回的报告字段为空")
 
-        return {"score": max(0, min(100, score)), "painPoint": pain_point, "prescription": prescription}
+        # 【铁律】即便模型幻觉输出了 score，也一律丢弃，强制使用确定性分数
+        return {"score": score, "painPoint": pain_point, "prescription": prescription}
 
-    except Exception as exc:  # noqa: BLE001 - 网络异常/JSON 解析失败等都需要兜底
+    except Exception as exc:  # noqa: BLE001 - 网络异常/解析失败等都需要兜底
         print(f"【llm_agent】调用 DeepSeek 生成综合报告失败，使用规则化兜底报告。错误信息：{exc}")
-        return _build_fallback_report(hit_stats, total_attempts)
+        return _build_fallback_report(
+            hit_stats, total_attempts, deterministic_score=score, diagnosis=diagnosis
+        )
 
 
 # --------------------------------------------------------------------------
@@ -283,59 +546,49 @@ def generate_session_report(hit_stats, student_number, sample_angles=None):
 # 同一位学生连续 2~3 次尝试之间的「跨次趋势诊断」生成
 # --------------------------------------------------------------------------
 
-# 聚合诊断场景的系统提示词：视角从"单次训练的整体统计"升级为"同一位学生
-# 连续 2~3 次尝试之间，评分/表现是如何变化的"，专门服务于「下节课前 5 分钟
-# 结构化反思」环节，帮助教师快速判断该生是"越练越稳"还是"体力下降变形"。
-AGGREGATE_SYSTEM_PROMPT = """你是一名同时具备儿童运动心理学与运动生物力学背景的小学足球科研教练，\
-现在需要基于同一位小学生（10-11岁）在本节课内连续完成的 2~3 次踢球测试之间的评分变化趋势，\
-撰写一份「跨次尝试聚合诊断建议」，帮助授课教师在下节课前 5 分钟内快速了解这位学生的进步/退步趋势，\
-并给出针对下节课的具身隐喻化教学处方。
+# 聚合诊断：同一学生连续 2~3 次尝试的跨次趋势（科研口径，禁止比喻）
+AGGREGATE_SYSTEM_PROMPT = """你是严谨的高校运动生物力学专家。绝对禁止使用任何修辞手法、比喻\
+（如木棍、弹簧、弹簧门、滑滑梯、扫把、弓弦、大树、铁板等）、拟人或情绪化词汇。\
+违背此规则将被判定为严重错误！
 
-你必须严格遵守以下三条铁律，一条都不能违反：
+基于同一受试者本节课连续 2~3 次踢球测试的评分/命中统计变化，撰写跨次趋势诊断，\
+供教师课前快速判读运动表现稳定性。
 
-【铁律一：积极意图原则】
-- 绝对禁止出现任何评判性、惩罚性、否定性的字眼，比如"退步了""变差了""失败"。
-- 必须使用信息性、建议性的表达方式，例如"后面几次能感觉到……""下次可以试着……"。
+【铁律】
+- 禁止寒暄、过渡句、鼓励语；只陈述趋势机制与可执行纠正。
+- 可用生物力学术语（矢状面、动量、折叠鞭打、重心侧倾等）。
+- trendDescription 只聚焦一个最显著的跨次变化机制。
+- 禁止输出任何比喻或拟人。
 
-【铁律二：具身隐喻原则】
-- 绝对禁止使用任何抽象的生物力学/物理学专业术语（角度、角速度、力矩、评分等数字本身）。
-- 必须把变化趋势转译成孩子熟悉的身体感觉或生活化比喻。
-
-【铁律三：单一焦点原则】
-- trendDescription 只聚焦本次多趟测试中最值得关注的一个变化趋势（例如"后段体力下降造成的动作变形"\
-或"越踢越稳、迅速自我纠错"），不要同时罗列多个知识点。
-
-【输出格式要求（极其重要）】
-- 只允许返回一个合法的 JSON 对象，绝对不能包含任何 Markdown 代码块标记（```）、解释性文字。
-- JSON 对象必须且只能包含以下两个字段：
-    1. "trendDescription"：字符串，40-100字，本次多趟测试之间的趋势总结（具身隐喻化）；
-    2. "prescription"：字符串，40-100字，给教师下节课前的针对性处方建议。
-- 两个字段均为简体中文，语气温暖亲切。
+【输出格式】
+- 只返回合法 JSON 对象，禁止 Markdown 代码围栏与多余文字。
+- 字段仅允许：
+    1. "trendDescription"：字符串，40-100字，跨次趋势的力学机制陈述；
+    2. "prescription"：字符串，40-100字，下节课厘米级/角度级纠正指令。
+- 必须使用简体中文。
 """
 
 
 def _build_fallback_aggregate_report(attempts_summary):
-    """DeepSeek 接口调用失败或解析失败时的规则化兜底聚合诊断，保证接口
-    任何情况下都能返回结构完整、语气安全的结果，不会因网络异常中断复盘流程。
-    """
+    """DeepSeek 接口调用失败或解析失败时的规则化兜底聚合诊断。"""
     scores = [a.get("score") for a in attempts_summary if isinstance(a.get("score"), (int, float))]
 
     if not scores:
         return {
-            "trendDescription": "本节课暂未采集到足够的有效测试评分，无法总结多趟之间的变化趋势。",
-            "prescription": "建议下节课至少完整完成 2 次踢球测试，方便系统生成聚合诊断建议。",
+            "trendDescription": "本节课有效测试评分样本不足，无法建立跨次生物力学趋势推断。",
+            "prescription": "下节课至少完整完成 2 次踢球测试，以支撑跨次趋势诊断。",
         }
 
     first_score, last_score = scores[0], scores[-1]
     if last_score > first_score + 3:
-        trend = "从第一次到最后一次尝试，孩子的发力感觉越来越稳，就像慢慢找到了那种熟悉的节奏。"
-        prescription = "下节课可以继续保持这个节奏，试着让摆动腿再多一点点自信的加速冲力。"
+        trend = "从首次到末次尝试，发力稳定性评分上升，提示运动链控制在重复练习中趋于收敛。"
+        prescription = "下节课维持当前助跑-支撑-鞭打时序，并将支撑脚横距约束在球心侧方 15-20 厘米。"
     elif last_score < first_score - 3:
-        trend = "多次尝试到后段，稳定的感觉有一点点下降，可能是身体累积了一些疲惫，像弓弦稍微松了一点。"
-        prescription = "下节课建议把练习拆成几个小组，中间穿插一点休息，帮孩子把每一次的蓄力感觉都找回来。"
+        trend = "多次尝试后段发力稳定性评分下降，符合疲劳累积导致远端环节控制精度下降的表现。"
+        prescription = "下节课将练习分段并插入被动恢复，每段开始前复核支撑脚横距与后摆折叠角。"
     else:
-        trend = "几次尝试的发力感觉整体保持得比较一致，没有出现明显的忽好忽坏。"
-        prescription = "继续保持当前节奏即可，可以尝试给孩子加一点点新的挑战，比如稍微加快助跑速度。"
+        trend = "各次尝试发力稳定性评分波动较小，运动表现整体处于可重复区间。"
+        prescription = "维持现有技术结构，可在支撑稳定的前提下小幅提高助跑速度以检验鞭打峰值。"
 
     return {"trendDescription": trend, "prescription": prescription}
 
@@ -359,8 +612,8 @@ def generate_aggregate_diagnosis(student_number, attempts_summary):
 
     if not attempts_summary:
         return {
-            "trendDescription": "本节课暂未采集到该生的任何尝试数据，无法总结跨次变化趋势。",
-            "prescription": "请先完成至少一次踢球测试，再来查看聚合诊断报告。",
+            "trendDescription": "本节课未采集到该生尝试数据，无法建立跨次生物力学趋势推断。",
+            "prescription": "先完成至少一次踢球测试后再出具聚合诊断。",
         }
 
     lines = []
@@ -376,10 +629,9 @@ def generate_aggregate_diagnosis(student_number, attempts_summary):
 
     user_message = (
         f"学生学号：{student_number or '未填写'}。"
-        f"该学生本节课一共完成了 {len(attempts_summary)} 次踢球测试，"
-        f"具体每次测试的统计如下（内部参考数据，禁止在输出中提及任何具体数字）：\n"
+        f"该学生本节课一共完成了 {len(attempts_summary)} 次踢球测试，统计如下：\n"
         f"{attempts_text}\n"
-        f"请严格按照系统提示词规定的 JSON 格式，生成这几次测试之间的跨次趋势诊断建议。"
+        f"禁止比喻与寒暄。严格按系统提示词返回 JSON（trendDescription / prescription）。"
     )
 
     try:
@@ -389,7 +641,7 @@ def generate_aggregate_diagnosis(student_number, attempts_summary):
                 {"role": "system", "content": AGGREGATE_SYSTEM_PROMPT},
                 {"role": "user", "content": user_message},
             ],
-            temperature=0.3,
+            temperature=LLM_TEMPERATURE,
             response_format={"type": "json_object"},
         )
         raw_text = response.choices[0].message.content.strip()
@@ -413,26 +665,20 @@ def generate_aggregate_diagnosis(student_number, attempts_summary):
 # 全班集体宏观诊断 —— 基于全班高频生物力学错误分布生成教学处方
 # --------------------------------------------------------------------------
 
-# 集体诊断场景的系统提示词：这次面向的读者是「授课教师/教练」而不是孩子本人，
-# 因此不再需要"具身隐喻+积极意图"这两条面向学生的铁律（教师需要看懂真实的
-# 生物力学术语才能制定教学计划），但依然要求语气专业、建议具体可执行，
-# 输出严格的结构化 JSON，并且严禁生编造未提供的数据。
-CLASS_PRESCRIPTION_SYSTEM_PROMPT = """你是一名拥有运动生物力学与青少年体育教学法双重背景的资深足球教研顾问，\
-正在为一线体育教师撰写「班级集体教学诊断简报」。你会收到该班级全部历史测试记录中，各项\
-生物力学错误分类的出现频率统计（百分比），请据此完成两件事：
+# 集体诊断：面向授课教师，科研口径（已禁止儿童化比喻）
+CLASS_PRESCRIPTION_SYSTEM_PROMPT = """你是严谨的高校运动生物力学专家与青少年足球教研顾问。\
+绝对禁止使用任何修辞手法、比喻（如木棍、弹簧、滑滑梯、扫把、弓弦、大树、铁板等）、\
+拟人或情绪化词汇。违背此规则将被判定为严重错误！
 
-1. "diagnosis"：用专业但易懂的语言，指出该班级当前最突出的1-2个集体性技术短板\
-（可以直接使用生物力学术语，如"核心力量不足""支撑腿动态稳定性欠佳"等），并推测可能的\
-成因（例如儿童此阶段核心稳定肌群发育尚不完全）。
-2. "prescription"：给出3条左右具体、可在常规体育课45分钟内直接执行的下一步教学重点\
-（例如具体的专项练习名称、每组次数/组数建议、动作要领提示）。
+基于班级历史测试中各项生物力学错误出现率，撰写集体教学诊断简报：
 
-【输出格式要求（极其重要，必须严格遵守）】
-- 只允许返回一个合法的 JSON 对象，绝对不能包含任何 Markdown 代码块标记（```）、解释性文字。
-- JSON 对象必须且只能包含以下两个字段："diagnosis"（字符串，80-150字）、"prescription"\
-（字符串，100-200字，可用"①②③"分点罗列）。
-- 只能基于用户提供的统计数据进行专业推断，不允许编造用户未提及的具体数值。
-- 必须使用简体中文。
+1. "diagnosis"：指出最突出的 1-2 个集体性技术短板及其力学成因（可用专业术语）。
+2. "prescription"：给出 3 条可在 45 分钟体育课内执行的纠正重点（含距离/角度/组次数）。
+
+【输出格式】
+- 只返回合法 JSON，禁止 Markdown 代码围栏与寒暄。
+- 字段仅允许："diagnosis"（80-150字）、"prescription"（100-200字，可用①②③分点）。
+- 不得编造用户未提供的数值；必须使用简体中文。
 """
 
 
@@ -492,7 +738,7 @@ def generate_class_prescription(school, class_group, error_stats, total_records,
                 {"role": "system", "content": CLASS_PRESCRIPTION_SYSTEM_PROMPT},
                 {"role": "user", "content": user_message},
             ],
-            temperature=0.3,
+            temperature=LLM_TEMPERATURE,
             response_format={"type": "json_object"},
         )
         raw_text = response.choices[0].message.content.strip()
@@ -515,21 +761,21 @@ def generate_class_prescription(school, class_group, error_stats, total_records,
 # 个体纵向进化画像 —— 基于某学生全周期历史记录生成优缺点总结
 # --------------------------------------------------------------------------
 
-INDIVIDUAL_SUMMARY_SYSTEM_PROMPT = """你是一名同时具备儿童运动心理学与运动生物力学背景的小学足球科研教练，\
-现在需要基于某一位小学生（10-11岁）全周期（从第一次测试到最近一次测试）的历史评分与\
-生物力学错误分类统计，为他/她撰写一份「个体纵向进化画像」，供教师与学生本人共同查看。
+INDIVIDUAL_SUMMARY_SYSTEM_PROMPT = """你是严谨的高校运动生物力学专家。绝对禁止使用任何修辞手法、比喻\
+（如木棍、弹簧、弹簧门、滑滑梯、扫把、弓弦、大树、铁板等）、拟人或情绪化词汇。\
+违背此规则将被判定为严重错误！
 
-你必须严格遵守以下三条铁律（面向学生本人，语气必须温暖正向）：
-【铁律一：积极意图原则】绝对禁止评判性/惩罚性字眼，只能用建议性表述。
-【铁律二：具身隐喻原则】绝对禁止抽象力学术语，必须转译为孩子熟悉的身体隐喻。
-【铁律三：单一焦点原则】每个字段只聚焦最突出的一点，不要罗列多个知识点。
+基于某受试者全周期历史评分与错误分类统计，撰写个体纵向运动表现摘要。
 
-【输出格式要求（极其重要）】
-- 只允许返回一个合法的 JSON 对象，不能包含任何 Markdown 代码块标记、解释性文字。
-- JSON 对象必须且只能包含以下两个字段：
-    1. "strengths"：字符串，40-80字，该生最稳定的发力优势（具身隐喻化）；
-    2. "weaknesses"：字符串，40-80字，该生最需要克服的习惯性盲区（具身隐喻化，且必须\
-用积极建议性语气表达，不能出现否定性字眼）。
+【铁律】
+- 禁止寒暄、鼓励语、儿童化口吻；只用客观力学陈述。
+- 每个字段只聚焦最突出的一点。
+
+【输出格式】
+- 只返回合法 JSON，禁止 Markdown 代码围栏。
+- 字段仅允许：
+    1. "strengths"：40-80字，最稳定的生物力学优势（无比喻）；
+    2. "weaknesses"：40-80字，最需纠正的习惯性偏差及厘米级/角度级方向（无比喻、无情绪词）。
 - 必须使用简体中文。
 """
 
@@ -538,28 +784,30 @@ def _build_fallback_individual_summary(scores, error_counter):
     """DeepSeek 接口调用失败或解析失败时的规则化兜底个体总结。"""
     if not scores:
         return {
-            "strengths": "这位同学暂时还没有足够的历史测试数据，无法总结稳定的发力优势，多来试几次吧！",
-            "weaknesses": "暂无足够数据总结需要关注的地方，继续加油完成更多测试即可。",
+            "strengths": "历史测试样本不足，尚无法判定稳定的生物力学优势指标。",
+            "weaknesses": "数据不足，暂不能给出针对性纠正区间；需补充完整踢球采样。",
         }
 
     avg_score = sum(scores) / len(scores)
     strengths = (
-        "整体发力节奏保持得很稳，像小马达一样持续输出稳定的力量。"
+        "全周期发力稳定性评分维持在较高区间，运动链时序重复性较好。"
         if avg_score >= 70
-        else "已经能感觉到腿部像弓弦一样开始蓄力，基础发力意识正在逐步建立。"
+        else "已形成基本的后摆-伸展击球时序，近端到远端的动量传递仍有提升空间。"
     )
 
     if error_counter:
         top_label = max(error_counter.items(), key=lambda item: item[1])[0]
         weakness_map = {
-            "支撑脚位置偏离": "下次可以多注意一下支撑脚，试着像大树的根一样稳稳扎在地上再出脚。",
-            "膝关节过度屈曲": "触球那一下可以再多给自己一点点缓冲时间，想象膝盖是被轻轻按了一下再弹出去。",
-            "随摆转髋不足": "可以再多感受一下身体像陀螺一样转动的感觉，让摆动腿跟着身体一起转起来。",
-            "身体重心偏移": "踢球前试着先找一下自己站得最稳的那个感觉，像小树苗一样把重心稳稳落住。",
+            "支撑脚位置偏离": "高频偏差为支撑脚横距失控；落地应约束在球心侧方 15-20 厘米。",
+            "膝关节过度屈曲": "触球膝角偏屈；触球瞬间将摆动腿膝角回调至可控伸展区间。",
+            "随摆转髋不足": "髋扭转不足导致角动量传递受限；击球过程完成与助跑方向一致的骨盆旋转。",
+            "身体重心偏移": "重心投影偏离支撑基面；击球前先稳定支撑腿刚度再启动摆动腿。",
         }
-        weaknesses = weakness_map.get(top_label, "继续保持练习节奏，下次可以再多感受一下整体发力的连贯性。")
+        weaknesses = weakness_map.get(
+            top_label, f"高频问题集中于「{top_label}」，需在分解练习中做厘米级/角度级定点纠正。"
+        )
     else:
-        weaknesses = "目前还没有发现特别明显的习惯性盲区，继续保持当前的练习节奏就很好！"
+        weaknesses = "未形成显著集中的错误分类；维持现有技术结构并定期复查关键角与支撑横距。"
 
     return {"strengths": strengths, "weaknesses": weaknesses}
 
@@ -593,8 +841,8 @@ def generate_individual_summary(student_id, score_history, error_counter):
     user_message = (
         f"学生编号：{student_id or '未填写'}。"
         f"该生全周期历史评分序列（从第一次到最近一次）：{scores_text}。"
-        f"该生历史记录中各项生物力学错误分类出现次数统计（内部参考数据，禁止在输出中提及具体数字）：{error_text}。"
-        f"请严格按照系统提示词规定的 JSON 格式，生成这位学生的个体纵向进化画像总结。"
+        f"该生历史错误分类出现次数：{error_text}。"
+        f"禁止比喻与寒暄。严格按系统提示词返回 JSON（strengths / weaknesses）。"
     )
 
     try:
@@ -604,7 +852,7 @@ def generate_individual_summary(student_id, score_history, error_counter):
                 {"role": "system", "content": INDIVIDUAL_SUMMARY_SYSTEM_PROMPT},
                 {"role": "user", "content": user_message},
             ],
-            temperature=0.3,
+            temperature=LLM_TEMPERATURE,
             response_format={"type": "json_object"},
         )
         raw_text = response.choices[0].message.content.strip()
@@ -627,11 +875,21 @@ def generate_individual_summary(student_id, score_history, error_counter):
 # --------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # 直接运行本文件时，用一组示例数据快速测试大模型是否能正常返回结果
-    test_angle = 118.6
-    test_status = "Red"
-    print(f"测试输入：angle={test_angle}, status={test_status}")
+    # 直接运行本文件时，用一组模拟诊断 JSON 测试科研级三节制转译（不含评分）
+    test_diagnosis = {
+        "primary_error_code": "ERR_A2_SUPPORT_WIDE",
+        "t_impact": 60,
+        "score_detail": {
+            "indicators": {
+                "ankle_rigidity": {"value": 0.12, "status": "GREEN_OPTIMAL"},
+                "distance_cm": {"value": 28.5, "status": "RED_DEVIATED"},
+                "max_folding_angle": {"value": 42.0, "status": "YELLOW_APPROACHING"},
+                "impact_knee_angle": {"value": 151.0, "status": "YELLOW_APPROACHING"},
+            }
+        },
+    }
+    print(f"测试输入诊断 JSON（含实测值、无评分数值）：{json.dumps(test_diagnosis, ensure_ascii=False)}")
     print("正在调用 DeepSeek 大模型，请稍候……")
-    result = generate_feedback(test_angle, test_status)
-    print("大模型返回的中文指导语：")
+    result = generate_feedback(test_diagnosis)
+    print("大模型返回的三节制科研诊断 Markdown：")
     print(result)

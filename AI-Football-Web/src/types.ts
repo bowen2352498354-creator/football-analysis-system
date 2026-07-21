@@ -143,6 +143,60 @@ export interface FinalDiagnosisReport {
    * 全程未采集到任何有效姿态数据）。
    */
   avgKneeAngle?: number | null
+  /** DeterministicScorer 完整评分明细（含 8 大量纲 status / extreme_frame_index） */
+  scoreDetail?: ScoreDetailPayload | null
+  /** 触球绝对零点帧索引 */
+  t_impact?: number | null
+  /** 驼峰别名，与 t_impact 等价 */
+  tImpact?: number | null
+  /** 本次分析采样总帧数 */
+  frame_count?: number | null
+  frameCount?: number | null
+  /**
+   * 【V2.5 Kinovea 联动】摆动腿小腿角速度全程时序（deg/s），
+   * 下标即 frame_index，供 SynchronizedVideoWorkspace 波形图与视频 scrub 同步。
+   */
+  angularVelocities?: number[] | null
+  angular_velocities?: number[] | null
+  /**
+   * 【Sprint 1】Action ROI `[t_impact±30]` 内的摆动腿小腿角速度序列（deg/s），
+   * 约 60 帧；由 KinematicSignalProcessor 平滑后裁剪，供鞭打发力波形图。
+   */
+  time_series_velocity?: number[] | null
+  timeSeriesVelocity?: number[] | null
+  /**
+   * 触球点在 `time_series_velocity` 窗口内的索引（边界未截断时为 30）。
+   */
+  impact_index_in_window?: number | null
+  impactIndexInWindow?: number | null
+  /**
+   * 【Sprint 1】支撑脚与摆腿时空运动轨迹热力图（纯 PNG base64，无 data URI 前缀）。
+   * 前端渲染：`<img src={\`data:image/png;base64,${heatmap_base64}\`} />`
+   */
+  heatmap_base64?: string | null
+  heatmapBase64?: string | null
+  /** 相对球心的支撑点 / 摆腿轨迹数值载荷 */
+  spatial_trajectory?: SpatialTrajectoryRelative | null
+  spatialTrajectory?: SpatialTrajectoryRelative | null
+}
+
+/** Sprint 1：相对球心的支撑脚 / 摆腿轨迹（单位 cm） */
+export interface SpatialTrajectoryRelative {
+  dx_support?: number
+  dy_support?: number
+  support_rel?: TrajectoryPoint2D
+  swing_trajectory?: TrajectoryPoint2D[]
+  ball_origin_cm?: TrajectoryPoint2D
+  t_impact?: number
+  window?: [number, number]
+  coord_space?: string
+  cm_per_pixel?: number | null
+  scale?: {
+    cm_per_px?: number
+    px_per_cm?: number
+    canvas_size?: number
+    origin_px?: [number, number]
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -248,6 +302,9 @@ export interface GlobalTrainingRecord {
   biomechanicalErrors?: string[]
   /** 后端 OpenCV 矢量标注过的击球关键帧截图（Base64 data URI），可能为空 */
   impactFrameBase64?: string | null
+  /** Sprint 1：支撑脚 / 摆腿时空热力图 PNG base64（可无 data URI 前缀） */
+  heatmapBase64?: string | null
+  heatmap_base64?: string | null
   /** 生成的 Word 报告文件绝对物理路径 */
   path?: string | null
   /** Word 报告所在的文件夹绝对物理路径（供"打开电脑文件夹"按钮使用） */
@@ -264,10 +321,45 @@ export interface GlobalTrainingRecord {
   kneeFlexionAngle?: number | null
   /** 支撑脚离球距离（cm），当前版本为启发式估算值（尚未接入真实多点位测量） */
   supportFootDistance?: number | null
+  /** 支撑脚横向距离 / 前后偏移（SDT 成就引擎） */
+  support_lateral_dist_cm?: number | null
+  support_ap_offset_cm?: number | null
+  /** 脚踝刚性方差（越小越锁踝） */
+  ankle_rigidity?: number | null
+  ankle_rigidity_variance?: number | null
   /** 实验对照组别编码：1 = 实时反馈 A 组，2 = 延时反馈 B 组 */
   groupTypeCode?: 1 | 2
   /** 主要错误分类编码：0=合规，1=支撑脚偏离，2=膝角不足，3=重心后坐 */
   primaryErrorCode?: 0 | 1 | 2 | 3
+  /** 8 大黄金指标实测矩阵（历史记录可能缺失） */
+  instepKickMetrics?: InstepKickMetrics | null
+  /** 五维量化评分矩阵 */
+  quantified5dScores?: Quantified5dScores | null
+  /** 踝角解析值（新旧字段双写兼容） */
+  ankle_angle_resolved?: number | null
+  ankleAngleResolved?: number | null
+  /** 支撑膝角解析值 */
+  support_knee_angle_resolved?: number | null
+  supportKneeAngleResolved?: number | null
+  /** 动平衡 / 运动稳定性指数 */
+  motor_stability_index?: number | null
+  motorStabilityIndex?: number | null
+  /** 运动稳定阶段文案 */
+  motor_stability_phase?: string | null
+  motorStabilityPhase?: string | null
+  /** 动作自动化状态 */
+  automation_status?: string | null
+  automationStatus?: string | null
+  /** 疲劳预警 */
+  fatigue_alert_flag?: boolean | null
+  fatigueAlertFlag?: boolean | null
+  fatigue_alert_message?: string | null
+  fatigueAlertMessage?: string | null
+  /** 纵向趋势置信带上下界 */
+  band_upper?: number | null
+  bandUpper?: number | null
+  band_lower?: number | null
+  bandLower?: number | null
 }
 
 /* ------------------------------------------------------------------ */
@@ -299,16 +391,250 @@ export interface IndividualSummaryReport {
 /** 教练端看板视角切换：全班集体宏观诊断 / 个体纵向进化追踪 */
 export type CoachDashboardPerspective = 'classOverview' | 'individual'
 
+/**
+ * 课堂疲劳熔断报警（与 session_monitor.FatigueMonitor / GET /api/fatigue_alert 对齐）
+ * 典型 reason：ANKLE_FATIGUE | KNEE_STIFFNESS
+ */
+export interface FatigueAlertPayload {
+  is_fatigue?: boolean
+  isFatigue?: boolean
+  reason?: string | null
+  message?: string | null
+  student_id?: string | null
+  studentId?: string | null
+  baseline_mean?: number | null
+  recent_mean?: number | null
+  delta?: number | null
+  metric?: string | null
+  updated_at?: string | null
+  updatedAt?: string | null
+}
+
 /* ------------------------------------------------------------------ */
 /* 以下为「v4.0 科研级数据矩阵大升级」新增类型定义                        */
 /* ------------------------------------------------------------------ */
 
-/** POST /api/export_academic_matrix 的响应结构 */
+/** GET /api/export/spss_matrix 与 POST /api/export_academic_matrix 的响应结构 */
 export interface AcademicExportResult {
   success: boolean
   message?: string
   path?: string
   filename?: string
   rowCount?: number
+  columnCount?: number
   studentCount?: number
+  downloadUrl?: string
+}
+
+/* ------------------------------------------------------------------ */
+/* V2.5 / Pro-Studio：生物力学量化与播控相关类型                         */
+/* ------------------------------------------------------------------ */
+
+/** 五维生物力学量化评分（V3.1 radar_scores，每维满分 20） */
+export interface RadarScores {
+  /** 支撑与稳固 */
+  support_stability: number
+  /** 蓄力与折叠 */
+  backswing_folding: number
+  /** 锁踝与刚性 */
+  ankle_rigidity: number
+  /** 鞭打与随摆 */
+  whipping_velocity: number
+  /** 助跑与进袭（占位） */
+  approach_rhythm: number
+}
+
+/**
+ * 五维量化评分（兼容层）。
+ * 优先使用 V3.1 `radar_scores` 键名；旧版 `*_score` 别名仍可被雷达组件归一化。
+ */
+export interface Quantified5dScores extends Partial<RadarScores> {
+  approach_score?: number
+  support_score?: number
+  backswing_score?: number
+  ankle_rigidity_score?: number
+  whipping_score?: number
+  total_score?: number
+}
+
+/** 脚背内侧射门 8 大黄金指标实测值（字段与后端确定性算分引擎对齐） */
+export type InstepKickMetrics = Record<string, number | boolean | null>
+
+/* ------------------------------------------------------------------ */
+/* MetricCardList：8 大量纲卡片 + 三实验组差异化渲染                       */
+/* ------------------------------------------------------------------ */
+
+/** 左侧指标卡片 / 教练科研控制台的实验组渲染模式 */
+export type MetricRenderMode = 'GROUP_A' | 'GROUP_B' | 'COACH_CONSOLE'
+
+/** DeterministicScorer 8 大生物力学量纲键（与 error_diagnoser.py indicators 对齐） */
+export type BiomechIndicatorKey =
+  | 'distance_cm'
+  | 'toe_angle'
+  | 'max_folding_angle'
+  | 'whipping_velocity'
+  | 'impact_knee_angle'
+  | 'ankle_rigidity'
+  | 'support_knee_angle'
+  | 'hip_torsion_angle'
+
+/** 后端三级状态编码 */
+export type BiomechStatusCode = 'GREEN_OPTIMAL' | 'YELLOW_APPROACHING' | 'RED_DEVIATED'
+
+/** 单条量纲实测条目 */
+export interface BiomechIndicatorValue {
+  value: number
+  unit?: string
+  status: BiomechStatusCode | string
+  penalty?: number
+  green_band?: Array<number | null>
+  extreme_frame_index?: number | null
+  variance?: number
+  ankle_angles_window?: number[]
+}
+
+/** POST /api/generate_report 返回的 scoreDetail 结构 */
+export interface ScoreDetailPayload {
+  TotalScore?: number
+  t_impact?: number
+  base_score?: number
+  total_penalty?: number
+  indicators?: Partial<Record<BiomechIndicatorKey, BiomechIndicatorValue>>
+  metric_extreme_frames?: Partial<Record<BiomechIndicatorKey, number>>
+  /** V3.1 五维独立量化雷达（每维满分 20） */
+  radar_scores?: RadarScores
+  scoring_engine?: string
+  llm_participated?: boolean
+  action_roi?: {
+    start?: number
+    end?: number
+    half_window?: number
+    length?: number
+    roi_frame_count?: number
+  }
+  /** Sprint 1：单趟次时空热力图 PNG base64 */
+  heatmap_base64?: string | null
+  spatial_trajectory?: SpatialTrajectoryRelative | null
+}
+
+/** 点击指标卡片时，通知 VideoWorkspace Seek 到物理极值帧的事件载荷 */
+export interface MetricSeekEvent {
+  metricKey: BiomechIndicatorKey
+  frameIndex: number
+  label: string
+}
+
+/** 动力链角速度时序单点（相对触球零点的毫秒） */
+export interface AngularVelocityPoint {
+  frame: number
+  time_ms: number
+  hip_vel: number
+  knee_vel: number
+  ankle_vel: number
+}
+
+/** 动力链诊断印章 */
+export interface KineticChainDiagnosis {
+  status?: string
+  summary?: string
+  hip_peak_time_ms?: number | null
+  knee_peak_time_ms?: number | null
+  ankle_peak_time_ms?: number | null
+}
+
+/** 高精度播控倍率 */
+export type PlaybackRate = 0.25 | 0.5 | 1
+
+/** 二维轨迹点 [x, y]（归一化或像素坐标，由消费端自行缩放） */
+export type TrajectoryPoint2D = [number, number]
+
+/** 空间轨迹数据包（双屏对齐 / 光流轨迹用） */
+export interface SpatialTrajectoryData {
+  contact_frame_index?: number
+  sample_frame_count?: number
+  master_path?: TrajectoryPoint2D[]
+  student_path?: TrajectoryPoint2D[]
+  swing_leg_path?: TrajectoryPoint2D[]
+  ball_flight_path?: TrajectoryPoint2D[]
+}
+
+/** 零感自动捕获 FSM 三态 */
+export type AutoCaptureFsmState = 'IDLE' | 'RECORDING' | 'PROCESSING'
+
+/** Attempt Chain Dock 单条趟次卡片 */
+export interface AutoCaptureAttempt {
+  id: string
+  attemptNumber: number
+  score: number | null
+  thumbnail?: string | null
+  status?: 'ready' | 'capturing' | 'processing'
+}
+
+/** 游戏化成就徽章 ID（含 SDT 周成就印章） */
+export type AchievementBadgeId =
+  | 'iron_ankle_master'
+  | 'footwork_sniper'
+  | 'iron_ankle'
+  | 'stable_chassis'
+  | 'fastest_progress'
+  | string
+
+/** GET /api/achievements/weekly 单枚成就印章 */
+export interface WeeklyAchievementBadge {
+  id: AchievementBadgeId
+  title: string
+  emoji: string
+  anonymousId?: string | null
+  studentId?: string | null
+  value: number | null
+  valueLabel: string
+  unit?: string
+  attemptCount?: number
+  praise: string
+  hasWinner: boolean
+}
+
+/** GET /api/achievements/weekly 响应 */
+export interface WeeklyAchievementsResponse {
+  success: boolean
+  message?: string
+  weekStart?: string
+  weekEnd?: string
+  lastWeekStart?: string
+  lastWeekEnd?: string
+  subjectCount?: number
+  badges?: WeeklyAchievementBadge[]
+  achievements?: WeeklyAchievementBadge[]
+}
+
+/** 每周进步飞跃榜条目（历史兼容；SDT 周成就已取代总分皇冠榜） */
+export interface ProgressLeapEntry {
+  studentId: string
+  school?: string
+  classGroup?: string
+  deltaScore: number
+  latestScore: number
+  firstScore: number
+  stabilityDrop: number
+  stubbornFault?: string | null
+  attemptCount: number
+  rank?: number
+}
+
+/** 同伴互评标签 ID */
+export type PeerReviewTagId =
+  | 'knee_spring'
+  | 'knee_straight'
+  | 'stand_far'
+  | 'ankle_iron'
+  | 'ankle_soft'
+  | 'whip_fast'
+
+/** 同伴互评提交载荷 */
+export interface PeerReviewData {
+  tags: PeerReviewTagId[]
+  peerScore: number
+  reviewerId?: string
+  submittedAt?: string
+  comment?: string
 }

@@ -81,8 +81,8 @@ export default function Navbar({
   const summaryText = `${getSchoolDisplayName(globalSettings)} · ${getClassGroupDisplayName(globalSettings)}`
 
   return (
-    <header className="sticky top-0 z-50 w-full border-b border-white/10 bg-white/10 backdrop-blur-md">
-      <div className="mx-auto flex h-16 max-w-7xl items-center justify-between gap-4 px-4 sm:px-6 lg:px-8">
+    <header className="sticky top-0 z-50 w-full flex-shrink-0 border-b border-slate-700/80 bg-slate-900/90 backdrop-blur-md">
+      <div className="flex h-14 w-full items-center justify-between gap-4 px-3 sm:px-4 lg:px-5">
         {/* 左侧品牌标识 */}
         <div className="flex items-center gap-2">
           <div className="flex h-8 w-8 items-center justify-center rounded-xl bg-gradient-to-br from-emerald-400 to-sky-500 text-sm font-bold text-black">
