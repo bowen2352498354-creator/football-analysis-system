@@ -245,17 +245,36 @@ export default function MetricCardList({
     heatmapBase64 ?? scoreDetail?.heatmap_base64 ?? null
 
   const cards = useMemo(() => {
+    const focusKeys = new Set<BiomechIndicatorKey>([
+      'distance_cm',
+      'max_folding_angle',
+      'ankle_rigidity',
+    ])
+    const isMeasuredProvenance = (prov: string | undefined) => {
+      const p = (prov || '').trim().toLowerCase()
+      return p === 'measured' || p === 'calibrated'
+    }
+
     return BIOMECH_CARD_DEFS.map((def) => {
       const entry = indicators?.[def.key]
+      const focusBlocked =
+        focusKeys.has(def.key) &&
+        entry != null &&
+        entry.provenance != null &&
+        !isMeasuredProvenance(entry.provenance)
+
       let value: number | null =
         typeof entry?.value === 'number'
           ? entry.value
-          : typeof metrics?.[def.key] === 'number'
-            ? (metrics[def.key] as number)
-            : null
+          : null
 
-      // 兼容旧黄金指标字段名
-      if (value === null && metrics) {
+      // 焦点三指标：已声明 provenance 且非实测时，禁止用 metrics 别名回填假数
+      if (!focusBlocked && value === null && typeof metrics?.[def.key] === 'number') {
+        value = metrics[def.key] as number
+      }
+
+      // 兼容旧黄金指标字段名（仅非焦点封锁时）
+      if (!focusBlocked && value === null && metrics) {
         const aliases: Partial<Record<BiomechIndicatorKey, string[]>> = {
           distance_cm: ['support_lateral_dist_cm', 'distance_cm'],
           toe_angle: ['support_toe_angle', 'toe_angle'],

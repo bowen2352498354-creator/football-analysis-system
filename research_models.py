@@ -107,6 +107,9 @@ class ShotAttemptLog(BaseModel):
     # 综合得分（DeterministicScorer TotalScore，0–100）
     composite_score: Optional[float] = Field(default=None, ge=0.0, le=100.0)
 
+    # Sprint 5：软删除；True 表示误测脏数据，默认不参与科研统计
+    is_deleted: bool = False
+
     @field_validator("session_date", mode="before")
     @classmethod
     def _parse_session_date(cls, value):

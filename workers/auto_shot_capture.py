@@ -30,11 +30,13 @@ import numpy as np
 # 时间机器 / FSM 常量（与 pose_tracker 对齐，可被外部覆盖）
 # ---------------------------------------------------------------------------
 
-ROLLING_BUFFER_MAXLEN: int = 150  # ~5s @30fps
+ROLLING_BUFFER_SECONDS: float = 5.0  # 时间机器时长（秒）→ 帧数按 fps 推导
+ROLLING_BUFFER_MAXLEN: int = 150  # ~5s @30fps（保留：默认帧率下的等价帧数）
 PRE_IMPACT_FRAMES: int = 60
 POST_IMPACT_FRAMES: int = 30  # 与前窗合计 90 帧核心切片
 COOLDOWN_SEC: float = 3.5  # 强制冷却 3–5s 中位值，防抖
 DEFAULT_CLIP_FPS: float = 30.0
+BUFFER_HEADROOM_FRAMES: int = 10  # 缓冲下界余量：前窗+后窗+余量
 
 _SCRIPT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_AUTO_CLIP_DIR = os.path.join(_SCRIPT_DIR, "auto_capture_clips")
@@ -115,6 +117,23 @@ class RollingBuffer:
             item.release()
         self._buf.clear()
 
+    def resize(self, maxlen: int) -> None:
+        """就地改变容量（帧率变更时调用），保留最近的帧。
+
+        ``deque.maxlen`` 不可变，故重建环；缩容时被截掉的最旧帧显式
+        ``release()``，避免 ndarray 悬挂导致 OOM。
+        """
+        cap = max(1, int(maxlen))
+        if cap == self._maxlen:
+            return
+        items = list(self._buf)
+        if len(items) > cap:
+            for stale in items[: len(items) - cap]:
+                stale.release()
+            items = items[len(items) - cap :]
+        self._buf = deque(items, maxlen=cap)
+        self._maxlen = cap
+
 
 class AutoShotCaptureEngine:
     """无感自动切片引擎：滚动缓冲 + FSM + 异步落盘。
@@ -122,6 +141,14 @@ class AutoShotCaptureEngine:
     线程模型：
       - ``push_frame`` / ``notify_*`` 由推理线程调用（同步、轻量）；
       - ``cv2.VideoWriter`` 写盘在 daemon 线程执行，完成后回调 ``on_clip_saved``。
+
+    帧率适应（24 / 30 / 60 fps 通用）：
+      - ``rolling_maxlen`` 默认由 ``fps`` 推导为 ≈``ROLLING_BUFFER_SECONDS`` 秒的帧数；
+        仅当调用方显式传入非 None 值时才固定为该值（不再随 fps 变化）。
+      - ``cooldown_sec`` 对外按「请求秒数」传入，内部对齐到最近帧边界
+        （``round(sec * fps) / fps``），消除亚帧漂移。
+      - ``fps`` 是可写属性：视频源真实帧率在打开后才知道，赋值会即时
+        重算缓冲容量（就地 resize，保留最近帧）与冷却帧数。
     """
 
     def __init__(
@@ -130,7 +157,7 @@ class AutoShotCaptureEngine:
         output_dir: Optional[str] = None,
         fps: float = DEFAULT_CLIP_FPS,
         session_date: Optional[date] = None,
-        rolling_maxlen: int = ROLLING_BUFFER_MAXLEN,
+        rolling_maxlen: Optional[int] = None,
         pre_frames: int = PRE_IMPACT_FRAMES,
         post_frames: int = POST_IMPACT_FRAMES,
         cooldown_sec: float = COOLDOWN_SEC,
@@ -139,13 +166,24 @@ class AutoShotCaptureEngine:
         on_clip_saved: Optional[ClipSavedFn] = None,
     ) -> None:
         self.output_dir = output_dir or DEFAULT_AUTO_CLIP_DIR
-        self.fps = float(fps) if fps and fps > 1.0 else DEFAULT_CLIP_FPS
         self.session_date = session_date or date.today()
         self.pre_frames = int(pre_frames)
         self.post_frames = int(post_frames)
-        self.cooldown_sec = float(cooldown_sec)
 
-        self._buffer = RollingBuffer(maxlen=int(rolling_maxlen))
+        # 帧率适应的两个「意图」原始值：显式 maxlen 覆盖（None = 随 fps 推导）、
+        # 请求的冷却秒数（内部再按 fps 对齐到帧边界）。fps 变更时据此重算。
+        self._explicit_maxlen: Optional[int] = (
+            max(1, int(rolling_maxlen)) if rolling_maxlen is not None else None
+        )
+        self._requested_cooldown_sec: float = max(0.0, float(cooldown_sec))
+
+        # 先建空缓冲（容量随后由 _apply_fps 按真实 fps 定稿），再套用帧率
+        self._fps: float = DEFAULT_CLIP_FPS
+        self._cooldown_frames: int = 0
+        self.cooldown_sec: float = self._requested_cooldown_sec
+        self._buffer = RollingBuffer(maxlen=self._resolve_maxlen(DEFAULT_CLIP_FPS))
+        self._apply_fps(fps, force=True)
+
         self._state = ShotFsmState.IDLE
         self._state_lock = threading.Lock()
 
@@ -176,6 +214,55 @@ class AutoShotCaptureEngine:
     @property
     def buffer_len(self) -> int:
         return len(self._buffer)
+
+    @property
+    def buffer_capacity(self) -> int:
+        """当前帧率下的滚动缓冲容量（帧）。``buffer_len`` 是已攒帧数，二者不同。"""
+        return int(self._buffer.maxlen)
+
+    # ------------------------------------------------------------------
+    # 帧率（可写）— 视频源打开后才知道真实 fps
+    # ------------------------------------------------------------------
+
+    @property
+    def fps(self) -> float:
+        return self._fps
+
+    @fps.setter
+    def fps(self, value: float) -> None:
+        """设置帧率并即时重算缓冲容量与冷却帧数。"""
+        self._apply_fps(value, force=False)
+
+    def _apply_fps(self, value: float, *, force: bool = False) -> None:
+        """帧率重算核心；``force=True`` 跳过等值短路（构造时首次写入使用）。
+
+        在 IDLE 状态以外调用是安全的（仅修改内部状态，不打断正在执行的切片），
+        但应尽量在首帧入队之前完成赋值。
+        """
+        new_fps = float(value) if value and float(value) > 1.0 else DEFAULT_CLIP_FPS
+        if not force and new_fps == self._fps:
+            return
+        self._fps = new_fps
+        # ── 缓冲容量重算 ─────────────────────────────────────────────────────
+        new_maxlen = self._resolve_maxlen(new_fps)
+        self._buffer.resize(new_maxlen)
+        # ── cooldown 对齐到新帧边界 ──────────────────────────────────────────
+        # round(sec * fps) / fps 确保冷却窗口落在整帧上，消除亚帧漂移
+        self._cooldown_frames = round(self._requested_cooldown_sec * new_fps)
+        self.cooldown_sec = self._cooldown_frames / new_fps
+
+    def _resolve_maxlen(self, fps: float) -> int:
+        """根据 fps 计算实际缓冲容量。
+
+        若调用方在构造时显式指定了 ``rolling_maxlen``，则直接返回该固定值；
+        否则推导 ≈ ``ROLLING_BUFFER_SECONDS`` 秒的帧数，并保证下界
+        （pre_frames + post_frames + ``BUFFER_HEADROOM_FRAMES``）。
+        """
+        if self._explicit_maxlen is not None:
+            return self._explicit_maxlen
+        derived = round(ROLLING_BUFFER_SECONDS * fps)
+        min_needed = self.pre_frames + self.post_frames + BUFFER_HEADROOM_FRAMES
+        return max(derived, min_needed)
 
     def accepts_impact_triggers(self) -> bool:
         """COOLDOWN / IMPACT_LOCKED 期间忽略新的触球触发，防止连踢误判。"""

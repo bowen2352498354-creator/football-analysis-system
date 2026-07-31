@@ -178,3 +178,50 @@ body,
 .typewriter-caret {
   animation: blink-caret 0.9s step-end infinite;
 }
+
+/* ---- Coach Dashboard：三栏局部滚动 + 现代细滚动条 ---- */
+.coach-dashboard-shell {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.coach-panel-scroll {
+  height: calc(100vh - 80px);
+  overflow-y: auto;
+  overflow-x: hidden;
+  min-height: 0;
+}
+
+/* Tailwind-style scrollbar utilities（无需额外插件） */
+.scrollbar-thin {
+  scrollbar-width: thin;
+}
+
+.scrollbar-thumb-slate-700 {
+  scrollbar-color: #334155 transparent;
+}
+
+.scrollbar-thin::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.scrollbar-thin::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.scrollbar-thumb-slate-700::-webkit-scrollbar-thumb {
+  background: #334155;
+  border-radius: 999px;
+}
+
+.scrollbar-thumb-slate-700::-webkit-scrollbar-thumb:hover {
+  background: #475569;
+}
+
+.scrollbar-track-transparent::-webkit-scrollbar-track {
+  background: transparent;
+}

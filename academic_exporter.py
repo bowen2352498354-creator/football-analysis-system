@@ -90,6 +90,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 EXPORT_DIR = os.path.join(SCRIPT_DIR, "academic_data_export")
 
 # 长表最终导出的标准列顺序（严格对应课题组变量命名规范）
+# 【Phase 3】增加 provenance 列，便于 SPSS 过滤启发式估算值
 LONG_FORMAT_COLUMNS = [
     "student_id",
     "school_name",
@@ -99,10 +100,21 @@ LONG_FORMAT_COLUMNS = [
     "attempt_sequence",
     "total_score",
     "knee_flexion_angle",
+    "knee_flexion_angle_provenance",
     "support_foot_distance",
+    "support_foot_distance_provenance",
     "fatigue_drop_flag",
     "primary_error_code",
 ]
+
+PROVENANCE_MEASURED = "measured"
+PROVENANCE_ESTIMATED = "estimated"
+PROVENANCE_MISSING = "missing"
+PROVENANCE_UNKNOWN = "unknown"
+PROVENANCE_CALIBRATED = "calibrated"
+MEASURED_PROVENANCE_SET = frozenset(
+    {PROVENANCE_MEASURED, PROVENANCE_CALIBRATED}
+)
 
 # 综合评分缺失时的中性兜底值（保证 total_score 列绝不出现空值/NaN，
 # 又不会因为极端的 0 分/100 分而扭曲后续的方差分析结果）
@@ -159,18 +171,58 @@ def _clean_score(raw_score) -> float:
     return _NEUTRAL_SCORE_FALLBACK
 
 
-def build_long_format_dataframe(records: list[dict]) -> pd.DataFrame:
-    """把 global_training_db.json 的原始记录列表，清洗转换成标准长表格式
-    的 pandas DataFrame（不做任何文件落盘，方便单独单元测试/复用）。
+def _normalize_metric_provenance(raw) -> str:
+    """归一化指标 provenance；空/未知 → unknown。"""
+    text = str(raw or "").strip().lower()
+    if text in MEASURED_PROVENANCE_SET:
+        return text
+    if text == "default":
+        return PROVENANCE_ESTIMATED
+    if text in (PROVENANCE_ESTIMATED, PROVENANCE_MISSING, PROVENANCE_UNKNOWN):
+        return text
+    if not text:
+        return PROVENANCE_UNKNOWN
+    return PROVENANCE_UNKNOWN
 
-    清洗步骤：
-        1) 逐条记录补全 test_date / total_score / knee_flexion_angle /
-           support_foot_distance / primary_error_code / group_type_code
-           （历史旧记录缺失的字段一律走启发式规则兜底补全，绝不留空）；
-        2) 按 (school, classGroup, studentId) 分组，组内按时间戳升序排列，
-           计算 attempt_sequence（从 1 开始）与 fatigue_drop_flag（对比
-           组内上一条记录的评分）；
-        3) 按标准列顺序整理输出，绝不包含任何多余的内部字段。
+
+def _resolve_record_metric_with_provenance(
+    record: Mapping[str, Any],
+    *,
+    value_keys: Sequence[str],
+    provenance_keys: Sequence[str],
+    estimate_fn,
+    score: Optional[float],
+) -> tuple[float, str]:
+    """读取记录中的量纲；缺值时用启发式并打标 estimated（防科研幻觉）。"""
+    value = None
+    for key in value_keys:
+        raw = record.get(key)
+        if isinstance(raw, (int, float)):
+            value = float(raw)
+            break
+    prov_raw = None
+    for key in provenance_keys:
+        if record.get(key) is not None:
+            prov_raw = record.get(key)
+            break
+    if value is not None:
+        if prov_raw is not None:
+            return round(float(value), 1), _normalize_metric_provenance(prov_raw)
+        # 历史记录有数值但无 provenance：保守标 unknown（非 measured）
+        return round(float(value), 1), PROVENANCE_UNKNOWN
+    estimated = float(estimate_fn(score))
+    return round(estimated, 1), PROVENANCE_ESTIMATED
+
+
+def build_long_format_dataframe(
+    records: list[dict],
+    *,
+    measured_only: bool = False,
+) -> pd.DataFrame:
+    """把 global_training_db.json 的原始记录列表，清洗转换成标准长表格式。
+
+    【Phase 3】启发式补全一律标 ``estimated``；``measured_only=True`` 时仅保留
+    支撑脚横距 provenance∈{measured,calibrated} 的行。
     """
     if not records:
         return pd.DataFrame(columns=LONG_FORMAT_COLUMNS)
@@ -194,13 +246,36 @@ def build_long_format_dataframe(records: list[dict]) -> pd.DataFrame:
 
         test_date = record.get("testDate") or _extract_test_date(timestamp)
 
-        knee_flexion_angle = record.get("kneeFlexionAngle")
-        if not isinstance(knee_flexion_angle, (int, float)):
-            knee_flexion_angle = _estimate_knee_flexion_angle(record.get("score"))
+        knee_flexion_angle, knee_prov = _resolve_record_metric_with_provenance(
+            record,
+            value_keys=("kneeFlexionAngle", "knee_flexion_angle", "impact_knee_angle"),
+            provenance_keys=(
+                "kneeFlexionAngleProvenance",
+                "knee_flexion_angle_provenance",
+                "impact_knee_angle_provenance",
+            ),
+            estimate_fn=_estimate_knee_flexion_angle,
+            score=record.get("score"),
+        )
+        support_foot_distance, support_prov = _resolve_record_metric_with_provenance(
+            record,
+            value_keys=(
+                "supportFootDistance",
+                "support_foot_distance",
+                "distance_cm",
+                "support_lateral_dist_cm",
+            ),
+            provenance_keys=(
+                "supportFootDistanceProvenance",
+                "support_foot_distance_provenance",
+                "distance_cm_provenance",
+            ),
+            estimate_fn=_estimate_support_foot_distance,
+            score=record.get("score"),
+        )
 
-        support_foot_distance = record.get("supportFootDistance")
-        if not isinstance(support_foot_distance, (int, float)):
-            support_foot_distance = _estimate_support_foot_distance(record.get("score"))
+        if measured_only and support_prov not in MEASURED_PROVENANCE_SET:
+            continue
 
         primary_error_code = record.get("primaryErrorCode")
         if primary_error_code not in (0, 1, 2, 3):
@@ -215,7 +290,9 @@ def build_long_format_dataframe(records: list[dict]) -> pd.DataFrame:
                 "test_date": test_date,
                 "total_score": round(float(score), 1),
                 "knee_flexion_angle": round(float(knee_flexion_angle), 1),
+                "knee_flexion_angle_provenance": knee_prov,
                 "support_foot_distance": round(float(support_foot_distance), 1),
+                "support_foot_distance_provenance": support_prov,
                 "primary_error_code": int(primary_error_code),
                 "_timestamp_sort_key": timestamp,
                 "_group_key": f"{school}__{class_group}__{student_id}",
@@ -227,8 +304,6 @@ def build_long_format_dataframe(records: list[dict]) -> pd.DataFrame:
 
     df = pd.DataFrame(rows)
 
-    # 组内按时间先后排序，推导 attempt_sequence（第几次尝试）与
-    # fatigue_drop_flag（本次评分比上一次尝试下降 >= 5 分则为 1）。
     df.sort_values(by=["_group_key", "_timestamp_sort_key"], inplace=True, kind="stable")
     df["attempt_sequence"] = df.groupby("_group_key").cumcount() + 1
     df["_prev_score"] = df.groupby("_group_key")["total_score"].shift(1)
@@ -236,39 +311,41 @@ def build_long_format_dataframe(records: list[dict]) -> pd.DataFrame:
         (df["_prev_score"].notna()) & ((df["_prev_score"] - df["total_score"]) >= FATIGUE_DROP_THRESHOLD)
     ).astype(int)
 
-    # 恢复成"每位学生内部按尝试先后顺序、跨学生按学号排列"的直观阅读顺序
     df.sort_values(by=["_group_key", "attempt_sequence"], inplace=True, kind="stable")
 
     df = df[LONG_FORMAT_COLUMNS].reset_index(drop=True)
     return df
 
 
-def export_academic_matrix(records: list[dict]) -> dict:
-    """核心入口：清洗全量记录 -> 生成长表 DataFrame -> 落盘写入 CSV，
-    返回结构化的导出结果字典，供 api_server.py 直接转发给前端。
+def export_academic_matrix(
+    records: list[dict],
+    *,
+    measured_only: bool = False,
+) -> dict:
+    """核心入口：清洗全量记录 -> 生成长表 DataFrame -> 落盘写入 CSV。
 
-    返回：
-        成功：{"success": True, "path": 绝对路径, "filename": 文件名,
-               "rowCount": 行数, "studentCount": 涉及的受试者人数}
-        失败：{"success": False, "message": 错误说明}
+    【Phase 3】``measured_only=True`` 时仅导出支撑脚横距为实测/标定的行。
     """
     try:
         os.makedirs(EXPORT_DIR, exist_ok=True)
 
-        df = build_long_format_dataframe(records)
+        df = build_long_format_dataframe(records, measured_only=measured_only)
 
         if df.empty:
             return {
                 "success": False,
-                "message": "全局训练数据库当前为空，暂无任何历史归档记录可供导出，请先完成至少一次测试。",
+                "message": (
+                    "全局训练数据库当前为空，暂无任何历史归档记录可供导出，请先完成至少一次测试。"
+                    if not measured_only
+                    else "按 measured_only 过滤后无可用行：请确认归档记录已写入实测 provenance。"
+                ),
             }
 
         timestamp_label = time.strftime("%Y%m%d")
-        filename = f"Academic_SPSS_Matrix_{timestamp_label}.csv"
+        suffix = "_measured" if measured_only else ""
+        filename = f"Academic_SPSS_Matrix_{timestamp_label}{suffix}.csv"
         full_path = os.path.join(EXPORT_DIR, filename)
 
-        # utf-8-sig：带 BOM 的 UTF-8，确保 Windows 上直接双击用 Excel 打开时，
-        # 中文列取值（学校名/班级名）不会被误判成 GBK 编码而显示成乱码问号。
         df.to_csv(full_path, index=False, encoding="utf-8-sig")
 
         student_count = df["student_id"].nunique() if "student_id" in df.columns else 0
@@ -281,8 +358,9 @@ def export_academic_matrix(records: list[dict]) -> dict:
             "filename": filename,
             "rowCount": int(len(df)),
             "studentCount": int(student_count),
+            "measuredOnly": bool(measured_only),
         }
-    except Exception as exc:  # noqa: BLE001 - 导出失败必须结构化返回，绝不抛出让接口 500
+    except Exception as exc:  # noqa: BLE001
         _safe_print(f"[academic_exporter] 导出学术统计矩阵失败：{exc}")
         return {"success": False, "message": f"导出学术统计矩阵失败：{exc}"}
 
@@ -382,6 +460,7 @@ def _as_mapping(obj: Any) -> dict[str, Any]:
             "session_date",
             "impact_frame_index",
             "total_score",
+            "is_deleted",
             "dx_support",
             "dy_support",
             "fatigue_alert_flag",
@@ -395,6 +474,22 @@ def _as_mapping(obj: Any) -> dict[str, Any]:
                     pass
         return raw
     return {}
+
+
+def _is_soft_deleted(record: Mapping[str, Any] | Any) -> bool:
+    """Sprint 5：判断记录是否已被教练端软删除（废记录不参与科研汇总）。"""
+    if record is None:
+        return False
+    if isinstance(record, Mapping):
+        raw = record.get("is_deleted", record.get("isDeleted", False))
+    else:
+        raw = getattr(record, "is_deleted", getattr(record, "isDeleted", False))
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, (int, float)):
+        return bool(raw)
+    text = str(raw or "").strip().lower()
+    return text in {"1", "true", "yes", "y"}
 
 
 def _coerce_timepoint_label(value: Any) -> Optional[str]:
@@ -693,7 +788,9 @@ class AcademicDataExporter:
         timepoint_sessions: Optional[Iterable[Any]] = None,
     ) -> None:
         self.shot_logs: list[dict[str, Any]] = [
-            _as_mapping(item) for item in (shot_logs or [])
+            mapped
+            for mapped in (_as_mapping(item) for item in (shot_logs or []))
+            if mapped and not _is_soft_deleted(mapped)
         ]
         self.student_profiles: list[dict[str, Any]] = [
             _as_mapping(item) for item in (student_profiles or [])
@@ -715,7 +812,12 @@ class AcademicDataExporter:
         from models.student_profile import StudentProfile
         from models.timepoint_session import TimepointSession
 
-        shots = list(session.scalars(select(ShotAttemptLog)).all())
+        # 软删除废记录绝对不进入宽表汇聚
+        shots = list(
+            session.scalars(
+                select(ShotAttemptLog).where(ShotAttemptLog.is_deleted.is_(False))
+            ).all()
+        )
         profiles = list(session.scalars(select(StudentProfile)).all())
         sessions = list(session.scalars(select(TimepointSession)).all())
         return cls(
@@ -762,10 +864,19 @@ class AcademicDataExporter:
 
     @classmethod
     def from_global_records(cls, records: Sequence[Mapping[str, Any]]) -> "AcademicDataExporter":
-        """把教练端归档记录碾平为 shot_logs + student_profiles。"""
+        """把教练端归档记录碾平为 shot_logs + student_profiles。
+
+        【Sprint 5 红线】``is_deleted == True`` 的废记录在此阶段即被剔除，
+        既不参与时点推断，也不进入 ``generate_wide_format_matrix`` 汇总。
+        """
+        active_records = [
+            record
+            for record in records
+            if isinstance(record, Mapping) and not _is_soft_deleted(record)
+        ]
         # 按学生收集测试日，推断 T0–T4
         date_buckets: dict[str, list[str]] = {}
-        for record in records:
+        for record in active_records:
             anon = str(
                 record.get("anonymous_id")
                 or record.get("studentId")
@@ -793,7 +904,7 @@ class AcademicDataExporter:
         class_labels = sorted(
             {
                 str(r.get("classGroup") or r.get("cluster_id") or "").strip()
-                for r in records
+                for r in active_records
                 if str(r.get("classGroup") or r.get("cluster_id") or "").strip()
             }
         )
@@ -804,7 +915,7 @@ class AcademicDataExporter:
         profiles: dict[str, dict[str, Any]] = {}
         shots: list[dict[str, Any]] = []
 
-        for record in records:
+        for record in active_records:
             anon = str(
                 record.get("anonymous_id")
                 or record.get("studentId")
@@ -919,7 +1030,14 @@ class AcademicDataExporter:
             3) 按 (anonymous_id, timepoint) 聚合均值 + SEM 衍生中介；
             4) 展平为 ``T{{k}}_{{Metric}}`` / ``T{{k}}_Heatmap_Dispersion_Index`` 等；
             5) 表尾 ``Class_Dummy_1``…``Class_Dummy_5``（Class_6 全 0）。
+
+        【Sprint 5 红线】构造器已剔除 ``is_deleted`` 废记录；此处再次防御性过滤，
+        确保误测数据绝对不会进入导师论文宽表。
         """
+        # 防御性再过滤：防止外部直接篡改 shot_logs 注入废记录
+        self.shot_logs = [
+            shot for shot in self.shot_logs if not _is_soft_deleted(shot)
+        ]
         profile_index = self._build_profile_index()
         tp_session_index = self._build_timepoint_session_index()
         long_rows = self._shots_to_long_metric_rows(profile_index, tp_session_index)
@@ -1173,6 +1291,8 @@ class AcademicDataExporter:
     ) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         for shot in self.shot_logs:
+            if _is_soft_deleted(shot):
+                continue
             anon = str(shot.get("anonymous_id") or "").strip()
             if not anon:
                 continue

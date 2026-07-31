@@ -74,8 +74,9 @@ export interface SynchronizedVideoWorkspaceProps {
    */
   impactIndexInWindow?: number | null
   /**
-   * velocitySeries[0] 对应的绝对视频帧号。
-   * 窗口模式（0..60）下用于 scrub：videoFrame = offset + localIndex。
+   * velocitySeries[0] 对应的绝对视频帧号 = action_roi.start。
+   * 窗口模式（0..60）下：absolute_frame = seriesFrameOffset + localIndex；
+   * currentTime = absolute_frame / 30.0。切勿用局部 x_index 直接跳视频。
    */
   seriesFrameOffset?: number
   /** 自定义阶段切片；缺省时按 t_impact 自动切分五段 */
@@ -236,6 +237,9 @@ export default function SynchronizedVideoWorkspace({
 
   const [isPlaying, setIsPlaying] = useState(false)
   const [playheadFrame, setPlayheadFrame] = useState(0)
+  /** 游标仅在 Action ROI 窗口内（0~60）显示；越界隐藏 */
+  const [playheadVisible, setPlayheadVisible] = useState(true)
+  const playheadVisibleRef = useRef(true)
   const [seekBadge, setSeekBadge] = useState<string | null>(null)
   const [penActive, setPenActive] = useState(false)
   const [isSavingAnnotation, setIsSavingAnnotation] = useState(false)
@@ -263,22 +267,28 @@ export default function SynchronizedVideoWorkspace({
     return buildDefaultPhases(frameCount, impactFrame)
   }, [phases, frameCount, impactFrame])
 
-  /** localIndex：波形 X 轴帧；映射到绝对视频帧后再 seek */
+  /** localIndex：波形 X 轴 0~60；映射绝对帧后再 seek，绝不用局部索引直接当视频帧 */
   const seekToLocalFrame = (localIndex: number) => {
     const video = videoRef.current
     const rate = fpsRef.current
     if (!Number.isFinite(localIndex)) return
     const clampedLocal = Math.max(0, Math.round(localIndex))
+    // absolute_frame = action_roi.start + x_index
     const absoluteFrame = clampedLocal + offsetRef.current
     if (video) {
       video.pause()
+      // 假定 30fps：currentTime = absolute_frame / 30.0
       const nextTime = absoluteFrame / rate
-      if (Math.abs(video.currentTime - nextTime) > 1 / (rate * 2)) {
-        video.currentTime = nextTime
+      if (Number.isFinite(video.duration) && video.duration > 0) {
+        video.currentTime = Math.max(0, Math.min(video.duration, nextTime))
+      } else {
+        video.currentTime = Math.max(0, nextTime)
       }
     }
     playheadFrameRef.current = clampedLocal
     setPlayheadFrame(clampedLocal)
+    playheadVisibleRef.current = true
+    setPlayheadVisible(true)
     setIsPlaying(false)
   }
 
@@ -287,7 +297,7 @@ export default function SynchronizedVideoWorkspace({
     seekToLocalFrame(Math.round(absoluteFrame) - offsetRef.current)
   }
 
-  // MetricCardList → 物理极值帧 Seek
+  // MetricCardList → 物理极值帧 Seek；报告完成后定格触球瞬间
   useEffect(() => {
     if (!externalSeek) return
     seekToAbsoluteFrame(externalSeek.frameIndex)
@@ -295,6 +305,60 @@ export default function SynchronizedVideoWorkspace({
       setSeekBadge(`${externalSeek.label} · F#${externalSeek.frameIndex}`)
     }
   }, [externalSeek])
+
+  // 报告带回触球索引后，自动把波形游标对齐到射门瞬间（仅在索引就绪时触发）
+  useEffect(() => {
+    if (series.length < 2) return
+    if (typeof impactIndexInWindow === 'number' && Number.isFinite(impactIndexInWindow)) {
+      seekToLocalFrame(impactIndexInWindow)
+      setSeekBadge(`射门瞬间 · 窗内 #${Math.round(impactIndexInWindow)}`)
+      return
+    }
+    if (typeof tImpact === 'number' && Number.isFinite(tImpact)) {
+      seekToAbsoluteFrame(tImpact)
+      setSeekBadge(`射门瞬间 · F#${Math.round(tImpact)}`)
+    }
+  }, [tImpact, impactIndexInWindow, series.length])
+
+  // 视频 loadeddata：强制 seek 到真正的触球帧（红色虚线），避免停在第 0 帧助跑
+  useEffect(() => {
+    const video = videoRef.current
+    if (!video || !videoSrc) return
+
+    const seekImpactOnReady = () => {
+      const rate = fpsRef.current
+      let absolute: number | null = null
+      if (typeof tImpact === 'number' && Number.isFinite(tImpact)) {
+        absolute = Math.round(tImpact)
+      } else if (
+        typeof impactIndexInWindow === 'number' &&
+        Number.isFinite(impactIndexInWindow)
+      ) {
+        absolute = Math.round(impactIndexInWindow) + offsetRef.current
+      }
+      if (absolute == null) return
+      video.pause()
+      const nextTime = absolute / rate
+      if (Number.isFinite(video.duration) && video.duration > 0) {
+        video.currentTime = Math.max(0, Math.min(video.duration, nextTime))
+      } else {
+        video.currentTime = Math.max(0, nextTime)
+      }
+      const local = absolute - offsetRef.current
+      playheadFrameRef.current = local
+      setPlayheadFrame(local)
+      setIsPlaying(false)
+      setSeekBadge(`射门瞬间 · F#${absolute}`)
+    }
+
+    if (video.readyState >= 2) {
+      seekImpactOnReady()
+    }
+    video.addEventListener('loadeddata', seekImpactOnReady)
+    return () => {
+      video.removeEventListener('loadeddata', seekImpactOnReady)
+    }
+  }, [videoSrc, tImpact, impactIndexInWindow, safeOffset, safeFps])
 
   const frameFromChartEvent = (params: unknown): number | null => {
     const current = seriesRef.current
@@ -554,45 +618,63 @@ export default function SynchronizedVideoWorkspace({
     )
   }, [series, resolvedPhases, impactFrame, safeFps, safeOffset])
 
-  // 播放游标：仅更新 markLine，避免整表重绘
+  // 播放游标：仅更新 markLine，避免整表重绘；越界时只保留触球锚线
   useEffect(() => {
     const chart = chartRef.current
     if (!chart || series.length < 2) return
+    const markData = playheadVisible
+      ? [
+          impactMarkLine,
+          {
+            xAxis: playheadFrame,
+            label: { show: false },
+            lineStyle: {
+              color: 'rgba(125,211,252,0.95)',
+              width: 1.5,
+              type: 'dashed',
+            },
+          },
+        ]
+      : [impactMarkLine]
     chart.setOption({
       series: [
         {
           id: 'shank-omega',
           markLine: {
-            data: [
-              impactMarkLine,
-              {
-                xAxis: playheadFrame,
-                label: { show: false },
-                lineStyle: {
-                  color: 'rgba(125,211,252,0.95)',
-                  width: 1.5,
-                  type: 'dashed',
-                },
-              },
-            ],
+            data: markData,
           },
         },
       ],
     })
-  }, [playheadFrame, impactFrame, series.length])
+  }, [playheadFrame, playheadVisible, impactFrame, series.length])
 
-  // 视频 → 图表：timeupdate 驱动游标（绝对帧 → 窗口 localIndex）
+  // 视频 → 图表：timeupdate 驱动游标
+  // x_index = floor(currentTime * 30) - action_roi.start；越出 0~60 则隐藏高亮游标
   useEffect(() => {
     const video = videoRef.current
     if (!video) return
 
     const onTimeUpdate = () => {
       if (scrubbingRef.current) return
-      const absoluteFrame = Math.max(0, Math.round(video.currentTime * safeFps))
-      const localFrame = absoluteFrame - safeOffset
-      if (localFrame !== playheadFrameRef.current) {
-        playheadFrameRef.current = localFrame
-        setPlayheadFrame(localFrame)
+      const xIndex = Math.floor(video.currentTime * safeFps) - safeOffset
+      const maxLocal =
+        seriesRef.current.length > 0
+          ? seriesRef.current[seriesRef.current.length - 1].frame_index
+          : 60
+      if (xIndex < 0 || xIndex > maxLocal) {
+        if (playheadVisibleRef.current) {
+          playheadVisibleRef.current = false
+          setPlayheadVisible(false)
+        }
+        return
+      }
+      if (!playheadVisibleRef.current) {
+        playheadVisibleRef.current = true
+        setPlayheadVisible(true)
+      }
+      if (xIndex !== playheadFrameRef.current) {
+        playheadFrameRef.current = xIndex
+        setPlayheadFrame(xIndex)
       }
     }
     const onPlay = () => setIsPlaying(true)

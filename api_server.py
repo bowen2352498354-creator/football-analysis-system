@@ -48,6 +48,9 @@ v1.1 前后端全栈联调阶段：后台服务网关（FastAPI + Uvicorn）
                                 「纵向双轴进化图谱」每 2.5s 拉取并渲染熔断闪烁卡。
     GET  /api/achievements/weekly ：SDT 游戏化周成就印章（钢铁锁踝王 / 最稳底盘奖 /
                                 最快进步奖），拒绝总分排名，返回匿名学员编号与指标。
+    GET  /api/progress/history ：个人纵向进步图谱（按测试日聚合：date / phase /
+                                score / 正负向诊断高亮），供教练端 Catapult 风格
+                                ECharts 趋势图消费。
 
 【科技伦理与隐私保护红线】（与 pose_tracker.py 完全一致）：
     所有视频帧的姿态推理、骨骼绘制、面部高斯模糊打码全部在服务端内存中实时完成，
@@ -163,10 +166,11 @@ def safe_print(*args, **kwargs) -> None:
 
 import cv2
 import mediapipe as mp
+import numpy as np
 from fastapi import FastAPI, UploadFile, File, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 # 【核心复用】直接把 pose_tracker.py 当作一个模块导入，复用里面已经写好的
 # 骨骼绘制 / 角度计算 / 三级容错判定 / 面部打码函数，绝不重复实现算法逻辑。
@@ -201,6 +205,17 @@ from session_monitor import (
     RECENT_WINDOW,
     FatigueMonitor,
     flatten_eight_metrics,
+)
+
+# 【第 6 点重构】射门分析的全部计算逻辑已迁移到 shot_analysis_service.ShotAnalysisPipeline。
+# 本文件的 AnalysisSession 退化为「传输层 / 生命周期适配器」：只负责队列、WebSocket 边界、
+# 线程管理与 task_status 状态机，不再持有任何逐帧计算状态。
+# safe_print / _is_empty_or_failed_frame 在下方重新导出，保证既有 `from api_server import ...`
+# 的调用方零改动继续可用。
+from shot_analysis_service import (
+    ShotAnalysisPipeline,
+    safe_print,
+    _is_empty_or_failed_frame,
 )
 
 # 【重要防呆】当 Python 进程的标准输出没有连接到一个真正的交互式终端时
@@ -277,6 +292,25 @@ BLACK_FRAME_CONSECUTIVE_LIMIT = 15
 # "画面到底有没有在真实产生、真实推送"，而不是盲猜。
 FRAME_PROGRESS_LOG_INTERVAL = 60
 
+# 【Sprint 5】摄像头连续空帧 / cap.read() 失败阈值：达到后推送 camera_lost 并自愈重开
+CAMERA_READ_FAIL_LIMIT = 50
+CAMERA_REOPEN_SLEEP_SEC = 0.45
+
+
+def _is_empty_or_failed_frame(ret: bool, frame: Any) -> bool:
+    """判定 cap.read() 是否得到可用画面（空帧 / None / 零尺寸均视为失败）。"""
+    if not ret or frame is None:
+        return True
+    try:
+        import numpy as _np
+
+        if not isinstance(frame, _np.ndarray) or frame.size == 0:
+            return True
+    except Exception:  # noqa: BLE001
+        return True
+    return False
+
+
 # 全局会话表：session_id -> AnalysisSession。
 # 【设计说明】本项目是面向单个课堂/单台设备的教学工具，同一时刻通常只有
 # 一个学生在做分析，这里用一个简单的全局字典即可满足需求；如果未来要支持
@@ -301,92 +335,17 @@ TASK_STATUS_COMPLETED = "COMPLETED"
 
 
 def draw_biomechanics_annotation(frame, metrics: dict):
-    """在"击球关键帧"静态截图上叠加专业运动生物力学矢量标注，用于图文并茂的
-    诊断报告左栏展示。
+    """兼容转发：大小腿夹角矢量标注实现位于 pose_tracker。"""
+    return pt.draw_biomechanics_annotation(frame, metrics)
 
-    标注内容（严格对应生物力学诊断报告的可视化需求）：
-        ① 髋->膝、膝->踝 两段带方向箭头的矢量连线，清晰呈现"髋-膝-踝"这条
-           动力链的发力传导路径；颜色随三级容错状态变化——Green/Yellow（达标/
-           接近）用醒目的亮绿色，Red（明显偏离）用醒目的亮红色，一眼可辨；
-        ② 在膝关节顶点画一段角度弧线，并用清晰的白底黑边数字标注出实际测量
-           得到的膝关节屈曲夹角，让"角度数字"与"画面上的真实夹角"直接对应；
-        ③ 从髋部中心点向下画一条身体重心参考垂直虚线，辅助教练/学生判断
-           触球瞬间身体是否存在明显的前倾或后仰，是评估动作稳定性的重要
-           辅助参考线。
 
-    参数：
-        frame：击球关键帧的 BGR 画面（已完成面部高斯模糊打码，函数内部会先
-               .copy() 一份，不会修改传入的原始帧）。
-        metrics：dict，包含 hip_px / knee_px / ankle_px / mid_hip_px / angle /
-                 status 六个字段（由 AnalysisSession._capture_impact_candidate
-                 采集时一并记录下来）。
-
-    返回：
-        画好全部矢量标注之后的新 BGR 画面（numpy 数组）。
-    """
-    annotated = frame.copy()
-
-    hip_px = metrics["hip_px"]
-    knee_px = metrics["knee_px"]
-    ankle_px = metrics["ankle_px"]
-    mid_hip_px = metrics["mid_hip_px"]
-    angle = metrics["angle"]
-    status = metrics["status"]
-
-    # 颜色策略：达标(Green)/接近(Yellow)用醒目亮绿色，明显偏离(Red)用醒目亮红色，
-    # 让教练/学生一眼就能从颜色上判断出这次触球瞬间的发力质量。
-    vector_color = (60, 235, 60) if status in ("Green", "Yellow") else (40, 40, 245)
-    line_thickness = 4
-
-    # ① 髋->膝、膝->踝 方向箭头矢量线：tipLength 取一个比较优雅、不过分夸张的比例，
-    # 线宽 4px 在 800px 宽度的传输画面上清晰又不会显得笨重。
-    cv2.arrowedLine(annotated, hip_px, knee_px, vector_color, line_thickness, cv2.LINE_AA, tipLength=0.14)
-    cv2.arrowedLine(annotated, knee_px, ankle_px, vector_color, line_thickness, cv2.LINE_AA, tipLength=0.14)
-
-    # 髋/膝/踝三个诊断关键点画成"白底描边 + 彩色描边"的双层圆点，在任何背景色下都清晰可见
-    for point in (hip_px, knee_px, ankle_px):
-        cv2.circle(annotated, point, 7, (255, 255, 255), -1, cv2.LINE_AA)
-        cv2.circle(annotated, point, 7, vector_color, 2, cv2.LINE_AA)
-
-    # ② 在膝关节顶点画一段角度弧线：以膝关节为圆心，利用 hip/ankle 两个方向向量
-    # 相对膝关节的极角（atan2），让 cv2.ellipse 自动画出这两条矢量夹出的那一段弧线
-    vector_knee_to_hip = (hip_px[0] - knee_px[0], hip_px[1] - knee_px[1])
-    vector_knee_to_ankle = (ankle_px[0] - knee_px[0], ankle_px[1] - knee_px[1])
-    angle_towards_hip_deg = math.degrees(math.atan2(vector_knee_to_hip[1], vector_knee_to_hip[0]))
-    angle_towards_ankle_deg = math.degrees(math.atan2(vector_knee_to_ankle[1], vector_knee_to_ankle[0]))
-
-    arc_radius = 46
-    cv2.ellipse(
-        annotated,
-        knee_px,
-        (arc_radius, arc_radius),
-        0,
-        angle_towards_hip_deg,
-        angle_towards_ankle_deg,
-        (255, 255, 255),
-        2,
-        cv2.LINE_AA,
-    )
-
-    # 角度数字标注：先画一层加粗的深色描边，再叠一层白色正文，保证在任何画面背景
-    # （亮/暗、复杂纹理）下都清晰可读，字体选用 cv2 内置的 FONT_HERSHEY_SIMPLEX，
-    # 字号 0.85 在 800px 宽度的画面上清晰不拥挤。
-    angle_label = f"{angle:.1f} deg"
-    label_pos = (knee_px[0] + arc_radius + 10, knee_px[1] + 6)
-    cv2.putText(annotated, angle_label, label_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.85, (15, 15, 15), 5, cv2.LINE_AA)
-    cv2.putText(annotated, angle_label, label_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 255), 2, cv2.LINE_AA)
-
-    # ③ 身体重心参考垂直虚线：从髋部中心点开始，向下用"短线段+间隔"的方式手绘一条
-    # 虚线直到画面底部，颜色选用醒目的琥珀色，与绿/红矢量线形成鲜明区分。
-    frame_height = annotated.shape[0]
-    dash_length, gap_length = 10, 8
-    y_cursor = mid_hip_px[1]
-    while y_cursor < frame_height:
-        y_end = min(frame_height, y_cursor + dash_length)
-        cv2.line(annotated, (mid_hip_px[0], y_cursor), (mid_hip_px[0], y_end), (0, 200, 255), 2, cv2.LINE_AA)
-        y_cursor += dash_length + gap_length
-
-    return annotated
+def resolve_leg_annotation_target(
+    score_detail: Optional[dict],
+    *,
+    t_impact: Optional[int] = None,
+) -> tuple[int, str, str]:
+    """兼容转发：标注目标帧选择实现位于 pose_tracker。"""
+    return pt.resolve_leg_annotation_target(score_detail, t_impact=t_impact)
 
 
 # --------------------------------------------------------------------------
@@ -430,43 +389,36 @@ class AnalysisSession:
         self.records: list[dict] = []
         self._records_lock = threading.Lock()
 
-        # 【新增：实时动力链角速度监控】上一帧角度与时间戳，用于逐帧计算角速度（deg/s）
-        self._prev_angle: Optional[float] = None
-        self._prev_frame_time: Optional[float] = None
-        # 录像分析：用固定 fps 推导 Δt，杜绝墙钟抖动导致角速度/触球帧跳变
-        self._fixed_frame_dt: Optional[float] = None
-        # 最近 STABILITY_WINDOW_SIZE 帧的角速度滑动窗口，用于计算"动平衡稳定指数"
-        self._velocity_window: "collections.deque[float]" = collections.deque(maxlen=STABILITY_WINDOW_SIZE)
-
-        # 【新增：击球关键帧自动捕捉】记录整趟练习中"右膝角速度绝对值最大"的那一帧
-        # （即冲击最剧烈、最接近真实触球瞬间的画面），供生成报告时叠加矢量标注。
-        self.impact_frame = None  # numpy 数组：命中的击球关键帧（已完成面部打码，未叠加骨骼线）
-        self.impact_metrics: Optional[dict] = None  # 该帧对应的 hip/knee/ankle 像素坐标与角度/状态
-        self._best_impact_score: float = -1.0
-        # 【V2.5】逐帧轨迹缓存，分析结束后用 locate_impact_frame 抛物线锁帧覆写
-        self._trajectory_angles: list[float] = []
-        self._trajectory_omega: list[float] = []
-        self._trajectory_ankle_px: list[tuple] = []
-        self._trajectory_frames_blurred: list = []  # 可选：仅保留候选邻域，控制内存
-        # 【Sprint 1】逐帧姿态关键点（支撑踝 / 摆腿踝等），供时空热力图坐标映射
-        self._trajectory_pose_frames: list[dict] = []
-        self.t_impact: Optional[int] = None
-        self.sync_frame_count: int = 0
-
         # 【V2.5 竞态锁】PROCESSING → COMPLETED；generate_report 必须等 COMPLETED
         self.task_status: str = TASK_STATUS_PROCESSING
         self._completed_event = threading.Event()
 
-        # 【新增：黑屏问题自动诊断】累计推送帧数（用于终端进度日志）+ 连续疑似全黑帧计数
-        # （用于自动检测"摄像头权限被禁用/被占用/被遮挡"这一类无报错但画面全黑的情况）。
-        self._pushed_frame_count = 0
-        self._consecutive_dark_frames = 0
-        self._dark_frame_warning_sent = False
+        # 【重构】全部计算逻辑（姿态推理 / 脱敏 / 角速度 / 锁帧 / 打分载荷）已迁移到
+        # shot_analysis_service.ShotAnalysisPipeline。本类只负责传输与生命周期：
+        # 队列背压、WebSocket 边界、线程管理、任务状态机。
+        # 管线实例在 start() 时构造（run 前所有轨迹属性访问都走下方转发代理）。
+        self.pipeline: Optional[ShotAnalysisPipeline] = None
 
     def start(self):
         self.task_status = TASK_STATUS_PROCESSING
         self._completed_event.clear()
-        self.thread = threading.Thread(target=self._run, daemon=True)
+        # 管线与宿主共享 records / 锁 / stop_event，并通过回调回写传输层与状态机：
+        #   push_fn        -> 本类的队列背压策略（file 不丢帧 / webcam 丢最旧显示帧）
+        #   on_completed   -> mark_completed()，保证 stopped 之前状态已是 COMPLETED
+        #   status_provider -> 让 stopped 载荷读到宿主真实 task_status
+        self.pipeline = ShotAnalysisPipeline(
+            session_id=self.session_id,
+            source=self.source,
+            video_path=self.video_path,
+            camera_index=self.camera_index,
+            push_fn=self._push_frame_payload,
+            on_completed=self.mark_completed,
+            records=self.records,
+            records_lock=self._records_lock,
+            stop_event=self.stop_event,
+            status_provider=lambda: self.task_status,
+        )
+        self.thread = threading.Thread(target=self.pipeline.run, daemon=True)
         self.thread.start()
 
     def request_stop(self):
@@ -487,155 +439,20 @@ class AnalysisSession:
         with self._records_lock:
             return list(self.records)
 
-    def build_scoring_payloads(self) -> tuple[dict, dict]:
-        """从本会话轨迹构造 DeterministicScorer 所需的 impact / trajectory 载荷。"""
-        knee_angles = list(self._trajectory_angles)
-        omega = list(self._trajectory_omega)
-        pose_frames = list(self._trajectory_pose_frames)
-        n = len(knee_angles)
-        t_impact = int(self.t_impact) if self.t_impact is not None else (
-            int(max(range(n), key=lambda i: abs(omega[i]))) if n > 0 else 0
-        )
-        if n > 0:
-            t_impact = int(max(0, min(n - 1, t_impact)))
-
-        # 触球帧球心锚点：优先该帧右足尖（与 lock_absolute_t0 口径一致）
-        ball_center = None
-        if pose_frames and 0 <= t_impact < len(pose_frames):
-            rec = pose_frames[t_impact]
-            world = rec.get("world") if isinstance(rec, dict) else None
-            if isinstance(world, dict) and world.get("right_foot_index") is not None:
-                ball_center = world["right_foot_index"]
-            elif isinstance(rec, dict):
-                ball_center = rec.get("right_foot_index") or rec.get("right_ankle")
-
-        impact_metrics = self.impact_metrics or {}
-        impact_frame_data = {
-            "t_impact": t_impact,
-            "task_id": self.session_id,
-            "session_id": self.session_id,
-            "total_frames": n,
-            "frames": pose_frames,
-            "ball_center": ball_center,
-            "impact_knee_angle": impact_metrics.get("angle"),
-            "distance_cm": impact_metrics.get("distance_cm"),
-            "toe_angle": impact_metrics.get("toe_angle"),
-            "support_knee_angle": impact_metrics.get("support_knee_angle"),
-            "hip_torsion_angle": impact_metrics.get("hip_torsion_angle"),
-        }
-        dt = float(self._fixed_frame_dt) if self._fixed_frame_dt else (1.0 / 30.0)
-        trajectory_data = {
-            "task_id": self.session_id,
-            "session_id": self.session_id,
-            "knee_angles": knee_angles,
-            "angular_velocities": omega,
-            "timestamps_sec": [i * dt for i in range(n)],
-            "total_frames": n,
-            "t_impact": t_impact,
-            "frames": pose_frames,
-            "ball_center": ball_center,
-            "whipping_velocity": float(max((abs(v) for v in omega), default=0.0)),
-        }
-        return impact_frame_data, trajectory_data
-
-    def build_time_series_velocity_window(
-        self, t_impact: Optional[int] = None
-    ) -> tuple[list[float], int, int]:
-        """裁剪 Action ROI 内的摆动腿小腿连续角速度序列（KinematicSignalProcessor 平滑后）。
-
-        窗口为 ``[t_impact-30, t_impact+30)``（最长约 60 帧）。返回：
-            (time_series_velocity, impact_index_in_window, roi_start)
-        边界未截断时 ``impact_index_in_window`` 恒为 30（数组中心）。
-        """
-        omega_raw = list(self._trajectory_omega)
-        n = len(omega_raw)
-        if n <= 0:
-            return [], 0, 0
-
-        omega_smooth = pt.KinematicSignalProcessor.smooth_joint_trajectories(omega_raw)
-        if t_impact is None:
-            t_impact = int(self.t_impact) if self.t_impact is not None else int(
-                max(range(n), key=lambda i: abs(float(omega_smooth[i])))
-            )
-        t = int(max(0, min(n - 1, int(t_impact))))
-        roi_start, roi_end = error_diagnoser.slice_action_roi_bounds(t, n)
-        window = [round(float(v), 2) for v in omega_smooth[roi_start:roi_end]]
-        impact_index_in_window = int(t - roi_start)
-        return window, impact_index_in_window, int(roi_start)
-
-    def _compute_angular_velocity(self, angle: float) -> float:
-        """根据"当前帧角度 - 上一帧角度"除以帧间时间差，计算右膝角速度（deg/s）。
-        第一帧因为没有"上一帧"可比较，约定角速度为 0。
-
-        【V2.5】录像模式优先使用固定 fps 的 Δt，避免 wall-clock 抖动导致分数跳变。
-        """
-        angular_velocity = 0.0
-        if self._prev_angle is not None:
-            if self._fixed_frame_dt is not None and self._fixed_frame_dt > 0:
-                dt = self._fixed_frame_dt
-            else:
-                now = time.time()
-                dt = (now - self._prev_frame_time) if self._prev_frame_time is not None else 0.0
-            if dt > 0:
-                angular_velocity = (angle - self._prev_angle) / dt
-        self._prev_angle = angle
-        self._prev_frame_time = time.time()
-        self._velocity_window.append(angular_velocity)
-        return angular_velocity
-
-    def _compute_stability_index(self) -> int:
-        """根据最近滑动窗口内角速度的离散程度（标准差）换算「动平衡稳定指数」（0-100）。
-
-        设计思路：角速度标准差越小，说明摆动腿发力节奏越连贯、动作越"不抖"，
-        对应稳定指数越高；一旦出现忽快忽慢的剧烈波动，标准差变大，指数随之下降。
-        """
-        if len(self._velocity_window) < 2:
-            return 100
-        values = list(self._velocity_window)
-        mean_value = sum(values) / len(values)
-        variance = sum((v - mean_value) ** 2 for v in values) / len(values)
-        std_dev = variance ** 0.5
-        # 经验系数：标准差每增加 4 deg/s 扣 1 分，兜底裁剪到 [0, 100] 区间
-        index = 100 - std_dev / 4.0
-        return int(max(0, min(100, round(index))))
-
-    def _capture_impact_candidate(self, frame, landmarks, hip_px, knee_px, ankle_px, angle, status):
-        """【击球关键帧自动捕捉】把当前帧记录为"击球关键帧"候选：
-        整趟练习结束后，self.impact_frame 会一直保留角速度绝对值最大（即冲击最
-        剧烈、最贴近真实触球瞬间）的那一帧，供 /api/generate_report 生成矢量标注图。
-
-        重要：必须在 pt.apply_facial_anonymization()（或兼容别名 apply_face_blur）
-        之后、pt.draw_pose_landmarks() / pt.draw_right_knee_overlay() 之前调用——
-        既要保证脸部已经打码（隐私红线），又要保证存下来的是一张"干净"的画面，
-        方便后续单独叠加矢量标注，不会与实时预览用的白色骨骼线/粗染色线互相干扰。
-        """
-        height, width = frame.shape[:2]
-        left_hip = landmarks[23]
-        right_hip = landmarks[24]
-        mid_hip_px = (
-            int((left_hip.x + right_hip.x) / 2 * width),
-            int((left_hip.y + right_hip.y) / 2 * height),
-        )
-
-        # 【隐私红线】落盘/缓存前再次强制脱敏，杜绝任何旁路漏网的原始带脸帧
-        safe_frame = pt.apply_facial_anonymization(frame, landmarks)
-        self.impact_frame = safe_frame.copy()
-        self.impact_metrics = {
-            "hip_px": hip_px,
-            "knee_px": knee_px,
-            "ankle_px": ankle_px,
-            "mid_hip_px": mid_hip_px,
-            "angle": angle,
-            "status": status,
-        }
-
     def _push_frame_payload(self, payload: dict):
         """把一份处理好的帧数据放进队列。
 
         【V2.5】录像分析（file）严禁丢帧：阻塞式 put，保证 frame_count 绝对相等。
         仅实时摄像头模式允许在背压时丢弃最旧显示帧。
+        【Sprint 5】camera_lost / error / notice / stopped 等控制消息永不丢弃。
         """
-        if not self._drop_frames_on_backpressure:
+        msg_type = payload.get("type")
+        if (not self._drop_frames_on_backpressure) or msg_type in (
+            "camera_lost",
+            "error",
+            "notice",
+            "stopped",
+        ):
             self.frame_queue.put(payload)
             return
         try:
@@ -650,375 +467,76 @@ class AnalysisSession:
             except queue.Full:
                 pass
 
-    def _finalize_impact_with_parabolic_lock(self) -> None:
-        """分析结束后用 locate_impact_frame（抛物线插值）覆写流式峰值候选，零漂移锁帧。"""
-        n = len(self._trajectory_omega)
-        if n < 3 or len(self._trajectory_ankle_px) < n:
-            if n > 0:
-                self.t_impact = int(max(range(n), key=lambda i: abs(self._trajectory_omega[i])))
-            return
+    # ----------------------------------------------------------------------
+    # 转发代理：/api/generate_report 等既有调用方无需任何改动即可继续工作。
+    # 计算状态的唯一所有者是 ShotAnalysisPipeline；本类只做只读转发，
+    # 并在管线尚未构造（start() 之前）时返回与旧实现一致的空初值。
+    # ----------------------------------------------------------------------
 
-        # 球心代理：若无独立球检测，用整段踝坐标中位数作为静止球近似（操场固定机位）
-        ankles = self._trajectory_ankle_px[:n]
-        xs = [float(a[0]) for a in ankles]
-        ys = [float(a[1]) for a in ankles]
-        # 取踝轨迹 Y 较大的 15% 分位中位数作为触地球区近似球心
-        order = sorted(range(n), key=lambda i: ys[i])
-        tail = order[int(n * 0.85) :] or order[-1:]
-        ball_x = float(sum(xs[i] for i in tail) / len(tail))
-        ball_y = float(sum(ys[i] for i in tail) / len(tail))
-        ball_coords = [(ball_x, ball_y) for _ in range(n)]
+    @property
+    def _trajectory_angles(self) -> list:
+        return self.pipeline._trajectory_angles if self.pipeline else []
 
-        omega_smooth = pt.KinematicSignalProcessor.smooth_joint_trajectories(
-            list(self._trajectory_omega[:n])
-        )
-        t_impact = pt.locate_impact_frame(omega_smooth, ankles, ball_coords)
-        self.t_impact = int(t_impact)
-        safe_print(
-            f"【api_server】[V2.5] 抛物线触球锁帧 t_impact={self.t_impact} "
-            f"（同步总帧数 frame_count={self.sync_frame_count}）",
-            flush=True,
-        )
+    @property
+    def _trajectory_omega(self) -> list:
+        return self.pipeline._trajectory_omega if self.pipeline else []
 
-    def _run(self):
-        """后台工作线程主体：逐帧读取视频源 -> 姿态检测 -> 力学诊断 ->
-        骨骼染色 + 面部打码渲染 -> 编码成 Base64 JPEG -> 推入队列。
+    @property
+    def _trajectory_ankle_px(self) -> list:
+        return self.pipeline._trajectory_ankle_px if self.pipeline else []
 
-        这里的每一步算法逻辑，都是直接调用 pose_tracker.py (pt 模块) 里
-        已经写好、且已经在桌面版软件里验证过的函数，完全没有重新实现。
-        """
-        cap = None
-        landmarker = None
-        is_video_file_mode = self.source == "file"
-        video_fps = 30.0
+    @property
+    def _trajectory_pose_frames(self) -> list:
+        return self.pipeline._trajectory_pose_frames if self.pipeline else []
 
-        try:
-            pt.ensure_model_downloaded()
+    @property
+    def sync_frame_count(self) -> int:
+        return self.pipeline.sync_frame_count if self.pipeline else 0
 
-            if is_video_file_mode:
-                if not self.video_path or not os.path.exists(self.video_path):
-                    safe_print(f"【api_server】错误：未找到视频文件：{self.video_path}")
-                    self._push_frame_payload({
-                        "type": "error",
-                        "message": f"未找到视频文件：{self.video_path}",
-                    })
-                    return
-                cap, video_fps, _reported = pt.open_video_capture_deterministic(
-                    self.video_path, is_camera=False
-                )
-            else:
-                cap, video_fps, _reported = pt.open_video_capture_deterministic(
-                    "", is_camera=True, camera_index=self.camera_index
-                )
+    @property
+    def t_impact(self) -> Optional[int]:
+        return self.pipeline.t_impact if self.pipeline else None
 
-            if not cap.isOpened():
-                # 【新增】终端同步打印一条明确的错误提示：这是"点击开始分析后一直黑屏，
-                # 但终端看起来又没有任何异常"最常见的真实原因之一——摄像头被其他程序
-                # 占用、摄像头编号不对，或者根本没有摄像头设备。
-                safe_print("【api_server】错误：无法打开视频源（本地视频文件损坏，或摄像头被其他程序占用/无摄像头设备）。")
-                self._push_frame_payload({
-                    "type": "error",
-                    "message": "无法打开视频源（本地视频文件损坏，或摄像头被其他程序占用/无摄像头设备）。",
-                })
-                return
+    @property
+    def impact_frame(self):
+        """击球关键帧（已完成面部打码）。generate_report 会用重标定后的帧覆写。"""
+        return self.pipeline.impact_frame if self.pipeline else None
 
-            if is_video_file_mode:
-                # 【V2.5】录像分析：固定 Δt，角速度与 MediaPipe 时间戳完全由 fps 决定
-                self._fixed_frame_dt = 1.0 / float(video_fps)
-                frame_delay_seconds = self._fixed_frame_dt
-            else:
-                self._fixed_frame_dt = None
-                frame_delay_seconds = 0.0
+    @impact_frame.setter
+    def impact_frame(self, value) -> None:
+        if self.pipeline is not None:
+            self.pipeline.impact_frame = value
 
-            # 【V2.5】每次分析任务：销毁旧 PoseLandmarker/YOLO 记忆并重建干净实例
-            task_handles = pt.start_analysis_task(reset_yolo=True)
-            landmarker = task_handles["pose_landmarker"]
+    @property
+    def impact_metrics(self) -> Optional[dict]:
+        return self.pipeline.impact_metrics if self.pipeline else None
 
-            frame_interval_ms = int(round(1000.0 / float(video_fps)))
-            frame_timestamp_ms = 0
-            self.sync_frame_count = 0
+    @impact_metrics.setter
+    def impact_metrics(self, value: Optional[dict]) -> None:
+        if self.pipeline is not None:
+            self.pipeline.impact_metrics = value
 
-            # 【V2.5】同步阻断式 while cap.read()：录像路径严禁跳帧/丢帧
-            # 录像文件模式：忽略 stop_event，必须读到 EOF，避免报告竞态截断在 300/414 帧。
-            # 摄像头模式：允许 stop_event 提前结束。
-            while cap.isOpened():
-                if (not is_video_file_mode) and self.stop_event.is_set():
-                    break
+    def build_scoring_payloads(self) -> tuple[dict, dict]:
+        if self.pipeline is None:
+            raise RuntimeError("分析管线尚未启动，无法构造打分载荷")
+        return self.pipeline.build_scoring_payloads()
 
-                loop_start_time = time.time()
+    def build_time_series_velocity_window(
+        self, t_impact: Optional[int] = None
+    ) -> tuple[list, int, int]:
+        if self.pipeline is None:
+            return [], 0, 0
+        return self.pipeline.build_time_series_velocity_window(t_impact=t_impact)
 
-                ret, frame = cap.read()
-                if not ret:
-                    if self._pushed_frame_count == 0:
-                        # 【核心修复：黑屏"零帧"问题】cv2.VideoCapture(...) 的 isOpened()
-                        # 检查在 Windows/DirectShow(MSMF) 环境下经常会"虚报成功"——
-                        # 明明返回 True，但紧接着第一次 cap.read() 就直接失败（ret=False）。
-                        # 之前这里只有一个静默的 break，既不打印任何日志，也不往前端
-                        # 推送任何 error/notice 消息，效果等同于"正常播放完毕自动结束"，
-                        # 导致前端永远等不到第一帧画面、也看不到任何报错，
-                        # 表现为一开始就直接黑屏（也就是"视频流在第 0 秒就流产"）。
-                        failure_reason = (
-                            f"未能从{'本地视频文件' if is_video_file_mode else '摄像头'}"
-                            f"读取到任何一帧画面数据：cv2.VideoCapture 显示已成功打开，"
-                            f"但第一次 cap.read() 就直接失败。"
-                        )
-                        if is_video_file_mode:
-                            failure_reason += (
-                                f" 视频文件路径：{self.video_path}。请确认该文件本身没有损坏，"
-                                f"且编码格式受本机 OpenCV 支持（推荐使用 H.264 编码的 .mp4）。"
-                            )
-                        else:
-                            failure_reason += (
-                                " 常见原因：摄像头正被其他程序独占使用（如视频会议软件/OBS）、"
-                                "摄像头驱动异常，或该摄像头编号在系统里并不是真正可用的设备。"
-                                "请先关闭其他可能占用摄像头的程序，或重启电脑后重试。"
-                            )
-                        safe_print(f"【api_server】错误：{failure_reason}", flush=True)
-                        self._push_frame_payload({"type": "error", "message": failure_reason})
-                    else:
-                        safe_print(
-                            f"【api_server】提示：视频源已读取完毕或已断开"
-                            f"（本次分析同步读入 frame_count={self.sync_frame_count}，"
-                            f"成功推送 {self._pushed_frame_count} 帧），分析自然结束。",
-                            flush=True,
-                        )
-                    break
+    def rebuild_leg_annotation(self, score_detail=None, t_impact=None):
+        if self.pipeline is None:
+            return None, None
+        return self.pipeline.rebuild_leg_annotation(score_detail, t_impact=t_impact)
 
-                self.sync_frame_count += 1
-
-                if not is_video_file_mode:
-                    frame = cv2.flip(frame, 1)
-
-                # 【新增：黑屏问题自动诊断】统计推送帧数 + 检测"疑似全黑帧"。
-                # 这一步只做统计判断，绝不修改 frame 本身，不影响后续任何画面处理。
-                self._pushed_frame_count += 1
-                mean_brightness = float(frame.mean())
-
-                if self._pushed_frame_count == 1:
-                    safe_print(
-                        f"【api_server】[OK] 已成功读取到第 1 帧原始画面"
-                        f"（平均亮度 {mean_brightness:.1f}/255，数值越接近 0 代表画面越黑），"
-                        f"视频推理管线已正常启动（V2.5 同步顺序帧 / 模型热重置）。"
-                    )
-                elif self._pushed_frame_count % FRAME_PROGRESS_LOG_INTERVAL == 0:
-                    safe_print(
-                        f"【api_server】进度：已累计推送 {self._pushed_frame_count} 帧画面"
-                        f"（本帧平均亮度 {mean_brightness:.1f}/255）。"
-                    )
-
-                if mean_brightness < BLACK_FRAME_MEAN_BRIGHTNESS_THRESHOLD:
-                    self._consecutive_dark_frames += 1
-                else:
-                    self._consecutive_dark_frames = 0
-
-                if (
-                    not self._dark_frame_warning_sent
-                    and self._consecutive_dark_frames >= BLACK_FRAME_CONSECUTIVE_LIMIT
-                ):
-                    self._dark_frame_warning_sent = True
-                    dark_frame_hint = (
-                        "检测到摄像头已连续读取到多帧近乎全黑的画面（程序本身运行正常，没有发生异常）。"
-                        "在 Windows 系统上，这通常不是代码问题，而是以下几种情况之一："
-                        "① Windows 设置 -> 隐私和安全性 -> 相机，未授权「桌面应用」访问摄像头；"
-                        "② 摄像头正被其他程序占用（例如视频会议软件、OBS，请先关闭它们再重试）；"
-                        "③ 摄像头物理镜头被遮挡，或笔记本电脑的摄像头隐私挡片处于关闭状态。"
-                        "请检查以上几点后重新点击「开始分析」。"
-                    )
-                    safe_print(f"【api_server】警告：{dark_frame_hint}")
-                    # 用独立的 "notice" 消息类型推送提示：这是"非致命的诊断提醒"，
-                    # 不应该像 "error" 一样中断分析会话或关闭连接，只是让前端弹出
-                    # 一条醒目的黄色提示，方便老师/学生第一时间知道该去检查什么。
-                    self._push_frame_payload({"type": "notice", "message": dark_frame_hint})
-
-                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
-                # MediaPipe VIDEO 时间戳按真实 fps 递增，杜绝写死 33ms 造成的跨次漂移
-                frame_timestamp_ms += frame_interval_ms
-                results = landmarker.detect_for_video(mp_image, frame_timestamp_ms)
-
-                angle_value = None
-                status_value = None
-                angular_velocity_value = None
-                stability_index_value = None
-
-                # 【容错防呆】把"姿态诊断 + 角速度/稳定指数计算 + 骨骼渲染"这一整段
-                # 逐帧处理逻辑包在独立的 try/except 里：万一某一帧因为异常姿态数据
-                # （例如极端角度、瞬时坐标缺失等）导致计算异常，也只会跳过这一帧的
-                # 诊断信息渲染，绝不能让整条视频推理循环因此直接崩溃退出——否则
-                # 前端会表现为"点击开始分析后画面很快就变成一片黑屏，且没有任何
-                # 明确报错"，因为循环提前 return 之后就再也没有新的画面帧推送过来了。
-                try:
-                    if results.pose_landmarks:
-                        landmarks = results.pose_landmarks[0]
-                        angle, status, color, hip_px, knee_px, ankle_px = pt.compute_right_knee_diagnosis(
-                            frame, landmarks
-                        )
-
-                        # 【新增】逐帧计算右膝角速度（deg/s）与动平衡稳定指数，
-                        # 供前端「实时动力链角速度监控」波形图与稳定指数徽标使用。
-                        # 第一帧因为还没有"上一帧角度"可供比较，_compute_angular_velocity
-                        # 内部已经做好防呆（约定角速度为 0），这里不会出现除以零的情况。
-                        angular_velocity = self._compute_angular_velocity(angle)
-                        stability_index_value = self._compute_stability_index()
-
-                        # 轨迹缓存（供结束后抛物线锁帧）
-                        self._trajectory_angles.append(float(angle))
-                        self._trajectory_omega.append(float(angular_velocity))
-                        self._trajectory_ankle_px.append(
-                            (float(ankle_px[0]), float(ankle_px[1]))
-                        )
-                        # Sprint 1：支撑脚 / 摆腿时空热力图所需逐帧关键点
-                        try:
-                            world_lms = None
-                            if getattr(results, "pose_world_landmarks", None):
-                                world_lms = results.pose_world_landmarks[0]
-                            ts_sec = (
-                                float(self.sync_frame_count - 1) * float(self._fixed_frame_dt)
-                                if self._fixed_frame_dt
-                                else float(self.sync_frame_count - 1) / 30.0
-                            )
-                            self._trajectory_pose_frames.append(
-                                pt.serialize_pose_frame_record(
-                                    landmarks,
-                                    frame.shape,
-                                    timestamp_sec=ts_sec,
-                                    world_landmarks=world_lms,
-                                )
-                            )
-                        except Exception:  # noqa: BLE001 - 热力图序列化失败不阻断主诊断链路
-                            ts_sec = (
-                                float(self.sync_frame_count - 1) * float(self._fixed_frame_dt)
-                                if self._fixed_frame_dt
-                                else float(self.sync_frame_count - 1) / 30.0
-                            )
-                            self._trajectory_pose_frames.append(pt.empty_pose_frame_record(ts_sec))
-
-                        # 【绝对拦截器 / Choke Point】关键点提取后立即强制替换为脱敏安全帧，再画骨骼线；
-                        # 这是符合《未成年人保护法》与科研伦理审查的物理级脱敏，任何人不得在此行代码之前进行原图转存。
-                        # 顺序严格保持：先打码，再捕捉击球关键帧，最后叠加染色骨骼线。
-                        frame = pt.apply_facial_anonymization(frame, landmarks)
-
-                        # 【击球关键帧自动捕捉】在打码之后、骨骼线绘制之前，
-                        # 用"角速度绝对值是否为整趟练习目前最大值"来判定是否更新击球关键帧候选，
-                        # 角速度越大代表这一帧越接近真实的"发力冲击瞬间"。
-                        # 写入 impact_frame 的一定是无脸安全图像（错题本/对比照同理）。
-                        impact_score = abs(angular_velocity)
-                        if impact_score > self._best_impact_score:
-                            self._best_impact_score = impact_score
-                            self._capture_impact_candidate(
-                                frame, landmarks, hip_px, knee_px, ankle_px, angle, status
-                            )
-
-                        pt.draw_pose_landmarks(frame, results.pose_landmarks)
-                        pt.draw_right_knee_overlay(frame, hip_px, knee_px, ankle_px, color, angle, status)
-
-                        angle_value = round(float(angle), 1)
-                        status_value = status
-                        angular_velocity_value = round(float(angular_velocity), 1)
-
-                        record = {
-                            "timestamp": time.time(),
-                            "knee_angle": angle_value,
-                            "status": status_value,
-                            "angular_velocity": angular_velocity_value,
-                            "frame_index": self.sync_frame_count - 1,
-                        }
-                        with self._records_lock:
-                            self.records.append(record)
-                    else:
-                        # 无姿态帧：仍计入同步帧序列长度，用中性值填轨迹以保持索引对齐
-                        self._trajectory_angles.append(
-                            float(self._trajectory_angles[-1]) if self._trajectory_angles else 150.0
-                        )
-                        self._trajectory_omega.append(0.0)
-                        self._trajectory_ankle_px.append(
-                            self._trajectory_ankle_px[-1] if self._trajectory_ankle_px else (0.0, 0.0)
-                        )
-                        ts_sec = (
-                            float(self.sync_frame_count - 1) * float(self._fixed_frame_dt)
-                            if self._fixed_frame_dt
-                            else float(self.sync_frame_count - 1) / 30.0
-                        )
-                        self._trajectory_pose_frames.append(pt.empty_pose_frame_record(ts_sec))
-                except Exception as diagnosis_exc:  # noqa: BLE001 - 单帧诊断异常绝不能打断整条视频流
-                    safe_print(f"【api_server】单帧姿态诊断/角速度计算发生异常（已跳过该帧诊断信息，画面仍会继续推送）：{diagnosis_exc}")
-                    angle_value = None
-                    status_value = None
-                    angular_velocity_value = None
-                    stability_index_value = None
-                    self._trajectory_angles.append(
-                        float(self._trajectory_angles[-1]) if self._trajectory_angles else 150.0
-                    )
-                    self._trajectory_omega.append(0.0)
-                    self._trajectory_ankle_px.append(
-                        self._trajectory_ankle_px[-1] if self._trajectory_ankle_px else (0.0, 0.0)
-                    )
-                    ts_sec = (
-                        float(self.sync_frame_count - 1) * float(self._fixed_frame_dt)
-                        if self._fixed_frame_dt
-                        else float(self.sync_frame_count - 1) / 30.0
-                    )
-                    self._trajectory_pose_frames.append(pt.empty_pose_frame_record(ts_sec))
-
-                # 传输前按最大宽度等比例缩小，减轻 Base64 + WebSocket 的带宽压力
-                height, width = frame.shape[:2]
-                if width > MAX_TRANSMIT_WIDTH:
-                    scale = MAX_TRANSMIT_WIDTH / width
-                    frame = cv2.resize(frame, (MAX_TRANSMIT_WIDTH, int(height * scale)))
-
-                ok, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
-                if not ok:
-                    # 极少数情况下编码失败：跳过这一帧但绝不中断循环，下一帧会正常继续推送
-                    safe_print("【api_server】警告：本帧 JPEG 编码失败，已跳过，不影响后续帧的实时推送。")
-                    continue
-                base64_jpeg = base64.b64encode(buffer).decode("ascii")
-
-                # 【规范格式防呆】显式拼接标准的 data URI 前缀，确保前端 <img src={...}>
-                # 拿到的永远是浏览器能够直接识别渲染的合法 "data:image/jpeg;base64,xxxx" 格式。
-                image_data_uri = f"data:image/jpeg;base64,{base64_jpeg}"
-
-                self._push_frame_payload({
-                    "type": "frame",
-                    "image": image_data_uri,
-                    "angle": angle_value,
-                    "status": status_value,
-                    "angular_velocity": angular_velocity_value,
-                    "stability_index": stability_index_value,
-                    "frame_index": self.sync_frame_count - 1,
-                    "timestamp": time.time(),
-                })
-
-                if is_video_file_mode and frame_delay_seconds > 0:
-                    elapsed = time.time() - loop_start_time
-                    remaining = frame_delay_seconds - elapsed
-                    if remaining > 0:
-                        time.sleep(remaining)
-
-            # 录像跑完后：抛物线插值锁定全局唯一 t_impact
-            if is_video_file_mode:
-                self._finalize_impact_with_parabolic_lock()
-
-        except Exception as exc:  # noqa: BLE001 - 后台线程内的任何异常都不能让服务崩溃
-            # 【新增】同步把异常信息打印到服务端终端：之前这里只把错误通过 WebSocket
-            # 发给前端，终端里完全看不到任何报错痕迹，导致排查"黑屏"问题时无从下手。
-            safe_print(f"【api_server】后台推理线程发生异常，本次分析会话将提前结束：{exc}")
-            self._push_frame_payload({"type": "error", "message": f"后台推理线程发生异常：{exc}"})
-
-        finally:
-            if cap is not None:
-                cap.release()
-            if landmarker is not None:
-                pt.destroy_pose_landmarker(landmarker)
-            # 【V2.5】必须在推送 stopped 之前标记 COMPLETED，唤醒挂起的 generate_report
-            self.mark_completed()
-            self._push_frame_payload({
-                "type": "stopped",
-                "session_id": self.session_id,
-                "total_records": len(self.records),
-                "frame_count": self.sync_frame_count,
-                "t_impact": self.t_impact,
-                "task_status": self.task_status,
-            })
+    def get_blurred_frame(self, index: Optional[int]):
+        if self.pipeline is None:
+            return None
+        return self.pipeline.get_blurred_frame(index)
 
 
 # --------------------------------------------------------------------------
@@ -1095,7 +613,8 @@ async def websocket_analyze(websocket: WebSocket):
     服务端 -> 浏览器：
         {"type": "started", "session_id": "..."}
         {"type": "frame", "image": "data:image/jpeg;base64,...",
-         "angle": 142.3, "status": "Green", "timestamp": 1234567.89}
+         "angle": 142.3, "status": "Green", "timestamp": 1234567.89, "fps": 28}
+        {"type": "camera_lost", "message": "摄像头信号丢失，尝试重连..."}
         {"type": "stopped", "session_id": "...", "total_records": 87}
         {"type": "error", "message": "..."}
     """
@@ -1116,6 +635,7 @@ async def websocket_analyze(websocket: WebSocket):
             except Exception:
                 # 浏览器端已经断开连接，直接停止转发即可，不需要抛出异常
                 break
+            # camera_lost / notice / frame 均不结束泵送；仅 stopped / error 收尾
             if payload.get("type") in ("stopped", "error"):
                 break
 
@@ -1271,8 +791,20 @@ def generate_report(payload: GenerateReportRequest):
             final_score=float(deterministic_score),
         )
 
+    # 【关键接线】必须把 DeterministicScorer 的 score_detail 交给 AIGC（已含脏数据 fallback）。
+    diagnosis_for_aigc = None
+    if isinstance(score_detail, dict):
+        diagnosis_for_aigc = {"score_detail": score_detail}
+    print(
+        "【api_server】即将发给大模型的完整诊断 JSON：\n"
+        + json.dumps(diagnosis_for_aigc, indent=4, ensure_ascii=False, default=str)
+    )
     ai_result = llm_agent.generate_session_report(
-        hit_stats=hit_stats, student_number=payload.student_number, sample_angles=sample_angles
+        hit_stats=hit_stats,
+        student_number=payload.student_number,
+        sample_angles=sample_angles,
+        deterministic_score=deterministic_score,
+        diagnosis_json=diagnosis_for_aigc,
     )
 
     # 分数以确定性引擎为准；无轨迹时回退 LLM 分
@@ -1290,15 +822,38 @@ def generate_report(payload: GenerateReportRequest):
         f"{ai_result['prescription']}"
     )
 
-    # 【核心新增】图文并茂诊断报告：在这次分析全程自动捕捉到的"击球关键帧"上，
-    # 用 OpenCV 叠加髋-膝-踝矢量箭头 + 角度弧线 + 身体重心垂直虚线，
-    # 编码成 Base64 JPEG 字符串，随文字报告一起返回给前端左栏展示。
+    # 【大小腿夹角可视化】优先折叠极值帧 + 摆动腿关键点重标定；几何不合格则降级提示
     impact_frame_image = None
-    if session is not None and session.impact_frame is not None and session.impact_metrics is not None:
-        annotated_frame = draw_biomechanics_annotation(session.impact_frame, session.impact_metrics)
-        ok, buffer = cv2.imencode(".jpg", annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, IMPACT_FRAME_JPEG_QUALITY])
-        if ok:
-            impact_frame_image = f"data:image/jpeg;base64,{base64.b64encode(buffer).decode('ascii')}"
+    if session is not None:
+        try:
+            ann_frame, ann_metrics = session.rebuild_leg_annotation(
+                score_detail if isinstance(score_detail, dict) else None,
+                t_impact=t_impact_locked if t_impact_locked is not None else session.t_impact,
+            )
+            if ann_frame is not None and ann_metrics is not None:
+                session.impact_frame = ann_frame
+                session.impact_metrics = ann_metrics
+                annotated_frame = draw_biomechanics_annotation(ann_frame, ann_metrics)
+                ok, buffer = cv2.imencode(
+                    ".jpg", annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, IMPACT_FRAME_JPEG_QUALITY]
+                )
+                if ok:
+                    impact_frame_image = (
+                        f"data:image/jpeg;base64,{base64.b64encode(buffer).decode('ascii')}"
+                    )
+        except Exception as ann_exc:  # noqa: BLE001
+            safe_print(f"【api_server】大小腿夹角标注重建失败，回退旧链路：{ann_exc}")
+            if session.impact_frame is not None and session.impact_metrics is not None:
+                annotated_frame = draw_biomechanics_annotation(
+                    session.impact_frame, session.impact_metrics
+                )
+                ok, buffer = cv2.imencode(
+                    ".jpg", annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, IMPACT_FRAME_JPEG_QUALITY]
+                )
+                if ok:
+                    impact_frame_image = (
+                        f"data:image/jpeg;base64,{base64.b64encode(buffer).decode('ascii')}"
+                    )
 
     # V2.5 Kinovea 联动：全程角速度 + Action ROI 鞭打发力窗口（须在 pop 前读完）
     angular_velocities_out = None
@@ -1495,6 +1050,10 @@ def generate_aggregate_report(payload: GenerateAggregateReportRequest):
 
 
 class SaveWordReportRequest(BaseModel):
+    """前端归档载荷。V3.1 新增字段一律 Optional，避免严格校验导致 422。"""
+
+    model_config = ConfigDict(extra="ignore")
+
     # "realtime" | "delayed" —— 对应一级归档子文件夹「实时反馈」/「延时反馈」
     mode: str = "realtime"
     # 学校/机构名称、班级/实验组别名称 —— 拼接成二级归档子文件夹
@@ -1503,8 +1062,10 @@ class SaveWordReportRequest(BaseModel):
     # 学生编号/学号 —— 三级归档子文件夹，也用于 Word 文件命名
     studentNumber: str = ""
     # AI 诊断报告核心字段：发力综合评分、有效采样次数、痛点分析、改进建议
-    score: Optional[int] = None
-    totalAttempts: Optional[int] = None
+    # score 必须接受 float：DeterministicScorer 常返回 72.35 等小数，
+    # 若写成 Optional[int] 会在 Pydantic v2 直接 422（int_from_float）。
+    score: Optional[float] = None
+    totalAttempts: Optional[float] = None
     painPoint: str = ""
     prescription: str = ""
     # 报告生成时间戳（前端已格式化好的字符串），缺省时后端自动补当前时间
@@ -1528,6 +1089,28 @@ class SaveWordReportRequest(BaseModel):
     # 抽出脚踝刚性方差 / 支撑脚横纵偏差 / 五维雷达，供周成就引擎消费。
     scoreDetail: Optional[dict] = None
     score_detail: Optional[dict] = None
+    # 【V3.1】前端可能把 generate_report 顶层字段原样带回；一律 Optional 防 422
+    radar_scores: Optional[dict] = None
+    radarScores: Optional[dict] = None
+    spatial_trajectory: Optional[dict] = None
+    spatialTrajectory: Optional[dict] = None
+    avgKneeAngle: Optional[float] = None
+    t_impact: Optional[float] = None
+    tImpact: Optional[float] = None
+    time_series_velocity: Optional[list] = None
+    timeSeriesVelocity: Optional[list] = None
+    impact_index_in_window: Optional[float] = None
+    impactIndexInWindow: Optional[float] = None
+    frame_count: Optional[float] = None
+    frameCount: Optional[float] = None
+    angular_velocities: Optional[list] = None
+    angularVelocities: Optional[list] = None
+    action_roi: Optional[dict] = None
+    fullText: Optional[str] = None
+    scoringEngine: Optional[str] = None
+    task_status: Optional[str] = None
+    fatigue_warning: Optional[Any] = None
+    fatigueWarning: Optional[Any] = None
 
 
 # 【v3.0 新增：生物力学错误分类体系】
@@ -1626,6 +1209,82 @@ def _estimate_support_foot_distance(score: Optional[float]) -> float:
     return round(max(5.0, min(45.0, distance)), 1)
 
 
+def _provenance_from_indicator(entry: Any) -> Optional[str]:
+    """从 scoreDetail.indicators 条目读取 provenance。"""
+    if not isinstance(entry, dict):
+        return None
+    raw = entry.get("provenance")
+    if raw is None:
+        return None
+    text = str(raw).strip().lower()
+    return text or None
+
+
+def _resolve_archive_knee_flexion(
+    payload_knee: Any,
+    score: Any,
+    score_detail: Optional[dict],
+) -> tuple[float, str]:
+    """归档膝角：实测优先，否则启发式并打标 estimated。"""
+    indicators = {}
+    if isinstance(score_detail, dict) and isinstance(score_detail.get("indicators"), dict):
+        indicators = score_detail["indicators"]
+    impact_entry = indicators.get("impact_knee_angle")
+    if isinstance(impact_entry, dict) and impact_entry.get("value") is not None:
+        try:
+            return round(float(impact_entry["value"]), 1), (
+                _provenance_from_indicator(impact_entry) or "measured"
+            )
+        except (TypeError, ValueError):
+            pass
+    if isinstance(payload_knee, (int, float)):
+        return round(float(payload_knee), 1), "measured"
+    return _estimate_knee_flexion_angle(score), "estimated"
+
+
+def _resolve_archive_support_foot(
+    score: Any,
+    score_detail: Optional[dict],
+    snapshot: Optional[dict],
+) -> tuple[Optional[float], str]:
+    """归档支撑脚横距：仅 scoreDetail/snapshot 实测写入数值+provenance；否则估算并标 estimated。"""
+    indicators = {}
+    if isinstance(score_detail, dict) and isinstance(score_detail.get("indicators"), dict):
+        indicators = score_detail["indicators"]
+    dist_entry = indicators.get("distance_cm")
+    if isinstance(dist_entry, dict):
+        prov = _provenance_from_indicator(dist_entry)
+        value = dist_entry.get("value")
+        if value is None:
+            value = dist_entry.get("scoring_value")
+        # 仅 measured/calibrated 的对外 value 视为科研实测；否则若仅有 scoring_value 仍标 estimated
+        if prov in ("measured", "calibrated") and dist_entry.get("value") is not None:
+            try:
+                return round(float(dist_entry["value"]), 2), prov
+            except (TypeError, ValueError):
+                pass
+        if prov in ("default", "estimated", "missing") and value is not None:
+            try:
+                # 评分中性值可写入看板，但 provenance 不得伪装 measured
+                return round(float(value), 2), (
+                    "estimated" if prov in ("default", "estimated") else "missing"
+                )
+            except (TypeError, ValueError):
+                pass
+    if isinstance(snapshot, dict) and snapshot.get("supportFootDistance") is not None:
+        snap_prov = str(snapshot.get("supportFootDistanceProvenance") or "").strip().lower()
+        try:
+            val = round(float(snapshot["supportFootDistance"]), 2)
+        except (TypeError, ValueError):
+            val = None
+        if val is not None:
+            if snap_prov in ("measured", "calibrated"):
+                return val, snap_prov
+            # snapshot 来自 _nested_metric_value（可能含 scoring_value）→ 无明确实测则 unknown
+            return val, snap_prov or "unknown"
+    return _estimate_support_foot_distance(score), "estimated"
+
+
 def _extract_test_date(timestamp_text: Optional[str]) -> str:
     """从 "YYYY-MM-DD HH:mm:ss" 格式的时间戳字符串里安全提取出 "YYYY-MM-DD" 日期段，
     格式异常时兜底返回当前系统日期，确保导出的学术矩阵 test_date 列绝不出现空值。
@@ -1649,13 +1308,121 @@ def _load_global_records() -> list[dict]:
         return []
 
 
+def _is_soft_deleted_record(record: dict) -> bool:
+    """Sprint 5：判断全局 JSON 记录是否已软删除。缺省字段视为未删除。"""
+    raw = record.get("is_deleted", record.get("isDeleted", False))
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, (int, float)):
+        return bool(raw)
+    return str(raw or "").strip().lower() in {"1", "true", "yes", "y"}
+
+
+def _record_test_date(record: dict) -> str:
+    """从记录提取 YYYY-MM-DD 测试日期。"""
+    for key in ("testDate", "test_date", "session_date"):
+        value = str(record.get(key) or "").strip()
+        if len(value) >= 10 and value[4] == "-" and value[7] == "-":
+            return value[:10]
+    ts = str(record.get("timestamp") or "").strip()
+    if len(ts) >= 10 and ts[4] == "-" and ts[7] == "-":
+        return ts[:10]
+    return ""
+
+
+def _save_global_records(records: list[dict]) -> None:
+    """整体覆盖写回全局训练数据库（调用方须已持有 ``_global_db_lock``）。"""
+    with open(GLOBAL_DB_PATH, "w", encoding="utf-8") as f:
+        json.dump(records, f, ensure_ascii=False, indent=2)
+
+
 def _append_global_record(record: dict) -> None:
     """把一条新记录追加进全局训练数据库并整体覆盖落盘，用锁保证并发写入安全。"""
+    # Sprint 5：新归档默认未删除，供教练端软删除体系消费
+    if "is_deleted" not in record and "isDeleted" not in record:
+        record["is_deleted"] = False
     with _global_db_lock:
         records = _load_global_records()
         records.append(record)
-        with open(GLOBAL_DB_PATH, "w", encoding="utf-8") as f:
-            json.dump(records, f, ensure_ascii=False, indent=2)
+        _save_global_records(records)
+
+
+def _soft_delete_orm_shot_by_json_id(record_id: str) -> bool:
+    """若 cluster_rct.db 中存在可映射的射门行，同步置 is_deleted=True。
+
+    全局 JSON 以 UUID 为主键；ORM 以自增 int 为主键。此处尝试：
+      record_id 本身为数字 → 直接按 ORM id 软删。
+    匹配失败不视为错误（JSON 软删仍成功）。
+    """
+    try:
+        from db import init_db, session_scope
+        from models.shot_attempt_log import ShotAttemptLog
+
+        init_db()
+        with session_scope() as session:
+            if record_id.isdigit():
+                row = session.get(ShotAttemptLog, int(record_id))
+                if row is not None and not row.is_deleted:
+                    row.is_deleted = True
+                    return True
+                return False
+            return False
+    except Exception as exc:  # noqa: BLE001
+        safe_print(f"【api_server】同步 ORM 软删除失败（JSON 侧已处理）：{exc}")
+        return False
+
+
+def _soft_delete_orm_shot_matching(record: dict) -> bool:
+    """按被试 + 日期 + 总分在 ORM 中定位并软删（尽力匹配）。"""
+    try:
+        from datetime import date as date_cls
+
+        from db import init_db, session_scope
+        from models.shot_attempt_log import ShotAttemptLog
+        from sqlalchemy import select
+
+        anon = str(
+            record.get("anonymous_id")
+            or record.get("studentId")
+            or record.get("student_id")
+            or ""
+        ).strip()
+        day_text = _record_test_date(record)
+        if not anon or not day_text:
+            return False
+        try:
+            session_day = date_cls.fromisoformat(day_text[:10])
+        except ValueError:
+            return False
+        score = record.get("score")
+        score_f = float(score) if isinstance(score, (int, float)) else None
+
+        init_db()
+        with session_scope() as session:
+            candidates = list(
+                session.scalars(
+                    select(ShotAttemptLog).where(
+                        ShotAttemptLog.anonymous_id == anon,
+                        ShotAttemptLog.session_date == session_day,
+                        ShotAttemptLog.is_deleted.is_(False),
+                    )
+                ).all()
+            )
+            if not candidates:
+                return False
+            target = None
+            if score_f is not None:
+                for row in candidates:
+                    if row.total_score is not None and abs(float(row.total_score) - score_f) < 0.51:
+                        target = row
+                        break
+            if target is None:
+                target = candidates[-1]
+            target.is_deleted = True
+            return True
+    except Exception as exc:  # noqa: BLE001
+        safe_print(f"【api_server】ORM 近似软删除失败：{exc}")
+        return False
 
 
 # --------------------------------------------------------------------------
@@ -1718,13 +1485,13 @@ def _safe_float(value: Any) -> Optional[float]:
 
 
 def _nested_metric_value(container: Any, *keys: str) -> Optional[float]:
-    """从扁平字段 / indicators 嵌套 {value|variance} 中取第一个可用标量。"""
+    """从扁平字段 / indicators 嵌套 {value|scoring_value|variance} 中取第一个可用标量。"""
     if not isinstance(container, dict):
         return None
     for key in keys:
         entry = container.get(key)
         if isinstance(entry, dict):
-            for sub in ("variance", "value"):
+            for sub in ("value", "scoring_value", "variance", "scoring_variance"):
                 num = _safe_float(entry.get(sub))
                 if num is not None:
                     return num
@@ -2057,9 +1824,11 @@ def _metrics_snapshot_from_score_detail(score_detail: Optional[dict]) -> dict:
     indicators = score_detail.get("indicators") if isinstance(score_detail.get("indicators"), dict) else {}
     ankle = flat.get("ankle_rigidity")
     if ankle is None and isinstance(indicators.get("ankle_rigidity"), dict):
-        ankle = _safe_float(indicators["ankle_rigidity"].get("variance"))
-        if ankle is None:
-            ankle = _safe_float(indicators["ankle_rigidity"].get("value"))
+        ankle_entry = indicators["ankle_rigidity"]
+        for sub in ("value", "scoring_value", "variance", "scoring_variance"):
+            ankle = _safe_float(ankle_entry.get(sub))
+            if ankle is not None:
+                break
 
     lateral = _nested_metric_value(indicators, "distance_cm", "support_lateral_dist_cm")
     if lateral is None:
@@ -2110,7 +1879,16 @@ def _metrics_snapshot_from_score_detail(score_detail: Optional[dict]) -> dict:
     for key, entry in (indicators or {}).items():
         if isinstance(entry, dict):
             slim: dict[str, Any] = {}
-            for sub in ("value", "variance", "status", "penalty"):
+            for sub in (
+                "value",
+                "scoring_value",
+                "variance",
+                "status",
+                "penalty",
+                "provenance",
+                "method",
+                "stiffness_status",
+            ):
                 if sub in entry:
                     slim[sub] = entry[sub]
             if slim:
@@ -2121,6 +1899,16 @@ def _metrics_snapshot_from_score_detail(score_detail: Optional[dict]) -> dict:
             "radar_scores": radar if isinstance(radar, dict) else None,
             "t_impact": score_detail.get("t_impact"),
         }
+    # Phase 3：若横距指标带实测 provenance，同步到快照顶层
+    dist_entry = indicators.get("distance_cm") if isinstance(indicators, dict) else None
+    if isinstance(dist_entry, dict):
+        prov = str(dist_entry.get("provenance") or "").strip().lower()
+        if prov in ("measured", "calibrated") and dist_entry.get("value") is not None:
+            try:
+                snapshot["supportFootDistance"] = round(float(dist_entry["value"]), 2)
+                snapshot["supportFootDistanceProvenance"] = prov
+            except (TypeError, ValueError):
+                pass
     return snapshot
 
 
@@ -2155,6 +1943,29 @@ def save_word_report(payload: SaveWordReportRequest):
         record_timestamp = payload.generatedAt or time.strftime("%Y-%m-%d %H:%M:%S")
         biomechanical_errors = _classify_biomechanical_errors(payload.hitStats, payload.score)
 
+        # 【SDT】合并 scoreDetail 轻量快照（脚踝刚性 / 支撑横纵 / 五维雷达）
+        detail_payload = payload.scoreDetail or payload.score_detail
+        detail_dict = detail_payload if isinstance(detail_payload, dict) else None
+        snapshot = _metrics_snapshot_from_score_detail(detail_dict)
+        # 若 indicators.distance_cm 为 measured，覆盖 snapshot 并写入 provenance
+        if isinstance(detail_dict, dict):
+            ind = detail_dict.get("indicators") if isinstance(detail_dict.get("indicators"), dict) else {}
+            dist_ind = ind.get("distance_cm") if isinstance(ind, dict) else None
+            if isinstance(dist_ind, dict) and dist_ind.get("provenance") in (
+                "measured",
+                "calibrated",
+            ):
+                if dist_ind.get("value") is not None:
+                    snapshot["supportFootDistance"] = round(float(dist_ind["value"]), 2)
+                    snapshot["supportFootDistanceProvenance"] = str(dist_ind["provenance"])
+
+        knee_val, knee_prov = _resolve_archive_knee_flexion(
+            payload.kneeFlexionAngle, payload.score, detail_dict
+        )
+        support_val, support_prov = _resolve_archive_support_foot(
+            payload.score, detail_dict, snapshot
+        )
+
         record = {
             "id": str(uuid.uuid4()),
             "timestamp": record_timestamp,
@@ -2169,28 +1980,23 @@ def save_word_report(payload: SaveWordReportRequest):
             "heatmapBase64": payload.heatmapBase64 or payload.heatmap_base64,
             "path": result["path"],
             "directory": result.get("directory"),
-            # 【v4.0 新增：科研级数据矩阵字段】详见 project_plan.md 第4节新增需求——
-            # 供教练端「双轴运动学成长期刊图」与后台 /api/export_academic_matrix
-            # 学术统计矩阵导出直接消费，写入时一次性补全，避免看板/导出侧重复计算。
+            # 【v4.0 / Phase3】科研矩阵字段 + provenance（估算不得伪装实测）
             "testDate": _extract_test_date(record_timestamp),
             "groupTypeCode": 1 if record_type == "realtime" else 2,
-            "kneeFlexionAngle": (
-                round(float(payload.kneeFlexionAngle), 1)
-                if isinstance(payload.kneeFlexionAngle, (int, float))
-                else _estimate_knee_flexion_angle(payload.score)
-            ),
-            "supportFootDistance": _estimate_support_foot_distance(payload.score),
+            "kneeFlexionAngle": knee_val,
+            "kneeFlexionAngleProvenance": knee_prov,
+            "supportFootDistance": support_val,
+            "supportFootDistanceProvenance": support_prov,
             "primaryErrorCode": _derive_primary_error_code(biomechanical_errors),
         }
-        # 【SDT】合并 scoreDetail 轻量快照（脚踝刚性 / 支撑横纵 / 五维雷达）
-        detail_payload = payload.scoreDetail or payload.score_detail
-        snapshot = _metrics_snapshot_from_score_detail(
-            detail_payload if isinstance(detail_payload, dict) else None
-        )
-        if snapshot.get("supportFootDistance") is not None:
+        if snapshot.get("supportFootDistance") is not None and support_prov in (
+            "measured",
+            "calibrated",
+        ):
             record["supportFootDistance"] = snapshot["supportFootDistance"]
+            record["supportFootDistanceProvenance"] = support_prov
         for key, value in snapshot.items():
-            if key == "supportFootDistance":
+            if key in ("supportFootDistance", "supportFootDistanceProvenance"):
                 continue
             record[key] = value
         try:
@@ -2214,10 +2020,593 @@ def save_word_report(payload: SaveWordReportRequest):
 
 
 @app.get("/api/get_all_records")
-def get_all_records():
-    """供教练端数据看板一键拉取全量历史归档数据（实时反馈 A 组 + 延时反馈 B 组）。"""
+def get_all_records(include_deleted: bool = False):
+    """供教练端数据看板一键拉取全量历史归档数据（实时反馈 A 组 + 延时反馈 B 组）。
+
+    默认过滤 ``is_deleted == True`` 的废记录；传 ``include_deleted=true`` 可审计全量。
+    """
     records = _load_global_records()
+    if not include_deleted:
+        records = [r for r in records if isinstance(r, dict) and not _is_soft_deleted_record(r)]
     return {"success": True, "records": records, "count": len(records)}
+
+
+class DeleteCoachRecordRequest(BaseModel):
+    """教练端软删除：仅标记 is_deleted，绝不物理抹除。"""
+
+    id: str
+    recordId: Optional[str] = None
+
+
+class CalibrateCoachMetricRequest(BaseModel):
+    """Phase 4：教练人工标定焦点指标 → provenance=calibrated。"""
+
+    id: str
+    recordId: Optional[str] = None
+    metric_key: str
+    value: float
+    coach_id: Optional[str] = "coach"
+    note: Optional[str] = None
+
+
+@app.get("/api/coach/records")
+def coach_list_records(
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    student_id: Optional[str] = None,
+    group: Optional[str] = None,
+    class_group: Optional[str] = None,
+    include_deleted: bool = False,
+):
+    """【Sprint 5】教练端数据清道夫列表：支持日期范围 / 被试编号 / 组别过滤。
+
+    Query：
+        date_from / date_to —— YYYY-MM-DD，闭区间；
+        student_id —— 被试编号模糊匹配；
+        group —— 实验组别：realtime | delayed | A | B（亦接受 classGroup 中文别名）；
+        class_group —— 行政班/组别精确过滤；
+        include_deleted —— 默认 False，隐藏软删除废记录。
+    """
+    records = _load_global_records()
+    date_from_s = (date_from or "").strip()[:10]
+    date_to_s = (date_to or "").strip()[:10]
+    student_q = (student_id or "").strip().lower()
+    group_q = (group or "").strip().lower()
+    class_q = (class_group or "").strip()
+
+    group_aliases = {
+        "realtime": "realtime",
+        "a": "realtime",
+        "group_a": "realtime",
+        "group_a_realtime": "realtime",
+        "实验a组": "realtime",
+        "delayed": "delayed",
+        "b": "delayed",
+        "group_b": "delayed",
+        "group_b_delayed": "delayed",
+        "实验b组": "delayed",
+    }
+    group_norm = group_aliases.get(group_q, group_q) if group_q else ""
+
+    filtered: list[dict] = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        if not include_deleted and _is_soft_deleted_record(record):
+            continue
+
+        day = _record_test_date(record)
+        if date_from_s and (not day or day < date_from_s):
+            continue
+        if date_to_s and (not day or day > date_to_s):
+            continue
+
+        if student_q:
+            sid = str(
+                record.get("studentId")
+                or record.get("student_id")
+                or record.get("anonymous_id")
+                or ""
+            ).strip().lower()
+            if student_q not in sid:
+                continue
+
+        if group_norm in ("realtime", "delayed"):
+            rtype = str(record.get("type") or "").strip().lower()
+            code = record.get("groupTypeCode")
+            inferred = (
+                "realtime"
+                if rtype == "realtime" or code == 1
+                else "delayed"
+                if rtype == "delayed" or code == 2
+                else ""
+            )
+            if inferred != group_norm:
+                continue
+        elif group_q and group_norm not in ("realtime", "delayed"):
+            # 非 A/B 别名时，按 classGroup 子串匹配
+            cg = str(record.get("classGroup") or record.get("cluster_id") or "")
+            if group_q not in cg.lower():
+                continue
+
+        if class_q:
+            cg = str(record.get("classGroup") or record.get("cluster_id") or "").strip()
+            if cg != class_q:
+                continue
+
+        # 列表轻量投影：诊断快照截断，避免把 Base64 大图塞进 Data Grid
+        feedback = str(record.get("aiFeedback") or "").strip()
+        snapshot = feedback.replace("\n", " ")
+        if len(snapshot) > 120:
+            snapshot = snapshot[:117] + "…"
+
+        filtered.append(
+            {
+                "id": record.get("id"),
+                "timestamp": record.get("timestamp") or "",
+                "testDate": day or record.get("testDate") or "",
+                "studentId": record.get("studentId")
+                or record.get("anonymous_id")
+                or "",
+                "school": record.get("school") or "",
+                "classGroup": record.get("classGroup") or "",
+                "type": record.get("type") or "",
+                "groupTypeCode": record.get("groupTypeCode"),
+                "score": record.get("score"),
+                "diagnosisSnapshot": snapshot,
+                "aiFeedback": feedback,
+                "is_deleted": _is_soft_deleted_record(record),
+                "path": record.get("path"),
+                "directory": record.get("directory"),
+                # Phase 4：清道夫标定所需量纲快照
+                "supportFootDistance": record.get("supportFootDistance"),
+                "supportFootDistanceProvenance": record.get(
+                    "supportFootDistanceProvenance"
+                ),
+                "max_folding_angle": record.get("max_folding_angle")
+                or record.get("maxFoldingAngle"),
+                "maxFoldingAngleProvenance": record.get("maxFoldingAngleProvenance")
+                or record.get("max_folding_angle_provenance"),
+                "ankle_rigidity": record.get("ankle_rigidity")
+                or record.get("ankle_rigidity_variance"),
+                "ankleRigidityProvenance": record.get("ankleRigidityProvenance")
+                or record.get("ankle_rigidity_provenance"),
+                "lastCalibratedAt": record.get("lastCalibratedAt"),
+                "lastCalibratedMetric": record.get("lastCalibratedMetric"),
+            }
+        )
+
+    filtered.sort(key=lambda r: str(r.get("timestamp") or ""), reverse=True)
+    return {
+        "success": True,
+        "records": filtered,
+        "count": len(filtered),
+    }
+
+
+@app.post("/api/coach/delete_record")
+def coach_delete_record(payload: DeleteCoachRecordRequest):
+    """【Sprint 5】软删除：将指定记录 ``is_deleted`` 置为 True，保留审计痕迹。"""
+    record_id = (payload.id or payload.recordId or "").strip()
+    if not record_id:
+        return {"success": False, "message": "缺少记录 ID"}
+
+    with _global_db_lock:
+        records = _load_global_records()
+        target: Optional[dict] = None
+        for record in records:
+            if isinstance(record, dict) and str(record.get("id") or "") == record_id:
+                target = record
+                break
+        if target is None:
+            return {"success": False, "message": f"未找到记录：{record_id}"}
+
+        if _is_soft_deleted_record(target):
+            return {
+                "success": True,
+                "message": "该记录已标记为无效",
+                "id": record_id,
+                "alreadyDeleted": True,
+            }
+
+        target["is_deleted"] = True
+        _save_global_records(records)
+
+    # 尽力同步 ORM（失败不影响 JSON 软删成功）
+    orm_hit = _soft_delete_orm_shot_by_json_id(record_id)
+    if not orm_hit:
+        _soft_delete_orm_shot_matching(target)
+
+    return {
+        "success": True,
+        "message": "已标记为无效，该数据将不参与最终科研统计",
+        "id": record_id,
+        "is_deleted": True,
+    }
+
+
+@app.post("/api/coach/calibrate_metric")
+def coach_calibrate_metric(payload: CalibrateCoachMetricRequest):
+    """【Phase 4】教练人工覆写焦点指标，强制 provenance=calibrated 并写审计。"""
+    from coach_calibration import apply_coach_calibration
+
+    record_id = (payload.id or payload.recordId or "").strip()
+    if not record_id:
+        return {"success": False, "message": "缺少记录 ID"}
+
+    with _global_db_lock:
+        records = _load_global_records()
+        target: Optional[dict] = None
+        for record in records:
+            if isinstance(record, dict) and str(record.get("id") or "") == record_id:
+                target = record
+                break
+        if target is None:
+            return {"success": False, "message": f"未找到记录：{record_id}"}
+        if _is_soft_deleted_record(target):
+            return {"success": False, "message": "已删除记录不可标定"}
+
+        result = apply_coach_calibration(
+            target,
+            metric_key=payload.metric_key,
+            value=payload.value,
+            coach_id=payload.coach_id,
+            note=payload.note,
+        )
+        if not result.get("ok"):
+            return {"success": False, "message": result.get("message") or "标定失败"}
+        _save_global_records(records)
+
+    audit = result.get("audit") or {}
+    return {
+        "success": True,
+        "message": (
+            f"已人工标定 {audit.get('metric_key')}={audit.get('value')} "
+            f"（provenance=calibrated）"
+        ),
+        "id": record_id,
+        "audit": audit,
+        "supportFootDistance": target.get("supportFootDistance"),
+        "supportFootDistanceProvenance": target.get("supportFootDistanceProvenance"),
+        "max_folding_angle": target.get("max_folding_angle"),
+        "ankle_rigidity": target.get("ankle_rigidity"),
+    }
+
+
+# --------------------------------------------------------------------------
+# 个人纵向进步图谱：按测试日聚合 + 科研节点 (T0..T4) + 正负向诊断高亮
+# --------------------------------------------------------------------------
+
+_PROGRESS_PHASES = ("T0", "T1", "T2", "T3", "T4")
+
+_ERROR_PROGRESS_COPY = {
+    "支撑脚位置偏离": "支撑脚落位有进步",
+    "膝关节过度屈曲": "膝角控制有进步",
+    "随摆转髋不足": "转髋随摆有进步",
+    "身体重心偏移": "重心控制有进步",
+}
+
+_ERROR_DEFICIT_COPY = {
+    "支撑脚位置偏离": "支撑脚落位仍需校准",
+    "膝关节过度屈曲": "膝角仍偏屈曲",
+    "随摆转髋不足": "随摆转髋仍不足",
+    "身体重心偏移": "身体重心仍有偏移",
+}
+
+
+def _progress_record_date(record: dict) -> str:
+    """提取 YYYY-MM-DD；优先 testDate，其次 timestamp。"""
+    test_date = (record.get("testDate") or record.get("test_date") or "").strip()
+    if len(test_date) >= 10 and test_date[4] == "-" and test_date[7] == "-":
+        return test_date[:10]
+    return _extract_test_date(str(record.get("timestamp") or ""))
+
+
+def _progress_parse_phase(raw: Any) -> Optional[str]:
+    if raw is None:
+        return None
+    text = str(raw).strip().upper()
+    if not text:
+        return None
+    if text.isdigit():
+        text = f"T{text}"
+    return text if text in _PROGRESS_PHASES else None
+
+
+def _progress_axis_label(date_text: str, phase: str) -> str:
+    """Catapult 风格横轴：MM/DD (Tn)。"""
+    md = date_text[5:7] + "/" + date_text[8:10] if len(date_text) >= 10 else date_text
+    return f"{md} ({phase})"
+
+
+def _progress_first_clause(text: str, max_len: int = 28) -> str:
+    cleaned = " ".join((text or "").replace("\n", " ").split()).strip()
+    if not cleaned:
+        return ""
+    for sep in ("。", "！", "？", ".", "!", "?"):
+        if sep in cleaned:
+            cleaned = cleaned.split(sep, 1)[0].strip()
+            break
+    if len(cleaned) > max_len:
+        return cleaned[: max_len - 1] + "…"
+    return cleaned
+
+
+def _progress_pick_knee(record: dict) -> Optional[float]:
+    for key in (
+        "support_knee_angle_resolved",
+        "supportKneeAngleResolved",
+        "kneeFlexionAngle",
+    ):
+        num = _safe_float(record.get(key))
+        if num is not None:
+            return num
+    metrics = record.get("instepKickMetrics") or record.get("instep_kick_metrics")
+    if isinstance(metrics, dict):
+        for key in ("support_knee_angle", "impact_knee_angle"):
+            num = _safe_float(metrics.get(key))
+            if num is not None:
+                return num
+    return None
+
+
+def _progress_build_highlights(
+    *,
+    score: Optional[float],
+    prev_score: Optional[float],
+    errors: list[str],
+    prev_errors: list[str],
+    ai_feedback: str,
+    knee_angle: Optional[float] = None,
+    prev_knee_angle: Optional[float] = None,
+) -> tuple[Optional[str], Optional[str]]:
+    """返回 (positive_highlight, negative_highlight)。"""
+    positive: Optional[str] = None
+    negative: Optional[str] = None
+    knee_gold_min, knee_gold_max = 140.0, 160.0
+
+    cleared = [e for e in prev_errors if e and e not in errors]
+    if cleared:
+        lead = cleared[0]
+        positive = _ERROR_PROGRESS_COPY.get(lead, f"{lead}有改善")
+    elif (
+        prev_knee_angle is not None
+        and knee_angle is not None
+        and not (knee_gold_min <= prev_knee_angle <= knee_gold_max)
+        and knee_gold_min <= knee_angle <= knee_gold_max
+    ):
+        positive = "膝角进入黄金区间"
+    elif (
+        prev_score is not None
+        and score is not None
+        and score - prev_score >= 1.5
+    ):
+        delta = int(round(score - prev_score))
+        if any("踝" in e for e in prev_errors) or not errors:
+            positive = "脚踝锁紧有进步"
+        else:
+            positive = f"总分提升 {max(delta, 1)} 分"
+    elif score is not None and score >= 80 and not errors:
+        positive = "动力链传导更顺畅"
+    elif prev_errors and len(errors) < len(prev_errors):
+        positive = "动作缺陷维度收敛"
+
+    # 处方第二句常含正向动作暗示，仅在有前序节点时作兜底正向高亮
+    if not positive and prev_score is not None and ai_feedback:
+        parts = [p.strip() for p in ai_feedback.replace("\r", "").split("\n") if p.strip()]
+        if len(parts) >= 2:
+            cue = _progress_first_clause(parts[1], 24)
+            if cue:
+                positive = cue
+
+    if errors:
+        lead = errors[0]
+        negative = _ERROR_DEFICIT_COPY.get(lead, lead)
+    else:
+        clause = _progress_first_clause(ai_feedback)
+        if clause and (score is None or score < 85):
+            negative = clause
+
+    if (
+        prev_score is not None
+        and score is not None
+        and score - prev_score <= -5
+        and not negative
+    ):
+        negative = f"总分回落 {int(round(prev_score - score))} 分"
+
+    return positive, negative
+
+
+def _aggregate_progress_history(
+    records: list[dict],
+    *,
+    student_id: str,
+    school: str = "",
+    class_group: str = "",
+) -> list[dict]:
+    """按测试日聚合个人进步点：score 均值 + phase + 诊断高亮。"""
+    sid = (student_id or "").strip()
+    if not sid:
+        return []
+
+    school_f = (school or "").strip()
+    class_f = (class_group or "").strip()
+    filtered: list[dict] = []
+    for raw in records:
+        if not isinstance(raw, dict):
+            continue
+        rid = str(raw.get("studentId") or raw.get("student_id") or "").strip()
+        if rid != sid:
+            continue
+        if school_f and str(raw.get("school") or "").strip() != school_f:
+            continue
+        if class_f and str(raw.get("classGroup") or raw.get("class_group") or "").strip() != class_f:
+            continue
+        filtered.append(raw)
+
+    if not filtered:
+        return []
+
+    buckets: dict[str, list[dict]] = collections.defaultdict(list)
+    for raw in filtered:
+        buckets[_progress_record_date(raw)].append(raw)
+
+    ordered_dates = sorted(buckets.keys())
+    explicit_phase_by_date: dict[str, str] = {}
+    for day in ordered_dates:
+        for raw in buckets[day]:
+            phase = _progress_parse_phase(raw.get("timepoint") or raw.get("timePoint") or raw.get("phase"))
+            if phase:
+                explicit_phase_by_date[day] = phase
+                break
+
+    inferred: dict[str, str] = {}
+    for index, day in enumerate(ordered_dates):
+        inferred[day] = _PROGRESS_PHASES[min(index, len(_PROGRESS_PHASES) - 1)]
+
+    points: list[dict] = []
+    prev_score: Optional[float] = None
+    prev_errors: list[str] = []
+    prev_knee: Optional[float] = None
+
+    for day in ordered_dates:
+        day_rows = sorted(
+            buckets[day],
+            key=lambda r: str(r.get("timestamp") or ""),
+        )
+        scores = [
+            float(s)
+            for s in (_safe_float(r.get("score")) for r in day_rows)
+            if s is not None
+        ]
+        mean_score = round(sum(scores) / len(scores), 1) if scores else None
+
+        knees = [
+            float(k)
+            for k in (_progress_pick_knee(r) for r in day_rows)
+            if k is not None
+        ]
+        mean_knee = round(sum(knees) / len(knees), 1) if knees else None
+
+        # 错误标签：取当日出现频次最高的若干项（保持稳定顺序）
+        error_counter: collections.Counter[str] = collections.Counter()
+        for raw in day_rows:
+            errs = raw.get("biomechanicalErrors") or raw.get("biomechanical_errors") or []
+            if isinstance(errs, list):
+                for label in errs:
+                    text = str(label).strip()
+                    if text:
+                        error_counter[text] += 1
+        top_errors = [label for label, _ in error_counter.most_common(3)]
+
+        # 代表性反馈：取当日最高分尝试的 aiFeedback；同分取最新
+        best_row = None
+        best_score = None
+        for raw in day_rows:
+            s = _safe_float(raw.get("score"))
+            if best_row is None:
+                best_row = raw
+                best_score = s
+                continue
+            if s is None:
+                continue
+            if best_score is None or s > best_score or (
+                s == best_score and str(raw.get("timestamp") or "") >= str(best_row.get("timestamp") or "")
+            ):
+                best_row = raw
+                best_score = s
+
+        ai_feedback = str((best_row or {}).get("aiFeedback") or (best_row or {}).get("ai_feedback") or "")
+        phase = explicit_phase_by_date.get(day) or inferred[day]
+        positive, negative = _progress_build_highlights(
+            score=mean_score,
+            prev_score=prev_score,
+            errors=top_errors,
+            prev_errors=prev_errors,
+            ai_feedback=ai_feedback,
+            knee_angle=mean_knee,
+            prev_knee_angle=prev_knee,
+        )
+
+        latest_ts = str((day_rows[-1].get("timestamp") or f"{day} 12:00:00"))
+        points.append(
+            {
+                "date": day,
+                "phase": phase,
+                "timestamp": latest_ts,
+                "score": mean_score,
+                "kneeAngle": mean_knee,
+                "attemptCount": len(day_rows),
+                "label": _progress_axis_label(day, phase),
+                "positiveHighlight": positive,
+                "negativeHighlight": negative,
+                "biomechanicalErrors": top_errors,
+                "representativeRecordId": (best_row or {}).get("id"),
+                "aiFeedbackSnippet": _progress_first_clause(ai_feedback, 48) or None,
+            }
+        )
+        prev_score = mean_score
+        prev_errors = top_errors
+        prev_knee = mean_knee
+
+    return points
+
+
+@app.get("/api/progress/history")
+def progress_history(
+    student_id: str = "",
+    studentId: str = "",
+    school: str = "",
+    classGroup: str = "",
+    class_group: str = "",
+):
+    """【个人进步图谱】按测试日聚合分数，并附带标准日期与科研节点 (T0..T4)。
+
+    Query:
+        student_id / studentId —— 必填学号
+        school                 —— 可选学校过滤
+        classGroup / class_group —— 可选班级过滤
+
+    返回 points[]：date / phase / timestamp / score / label /
+    positiveHighlight / negativeHighlight / kneeAngle / attemptCount
+    """
+    sid = (student_id or studentId or "").strip()
+    if not sid:
+        return {
+            "success": False,
+            "message": "缺少 student_id 参数",
+            "studentId": "",
+            "points": [],
+            "count": 0,
+        }
+
+    school_f = (school or "").strip()
+    class_f = (classGroup or class_group or "").strip()
+    try:
+        points = _aggregate_progress_history(
+            _load_global_records(),
+            student_id=sid,
+            school=school_f,
+            class_group=class_f,
+        )
+        return {
+            "success": True,
+            "studentId": sid,
+            "school": school_f or None,
+            "classGroup": class_f or None,
+            "points": points,
+            "count": len(points),
+        }
+    except Exception as exc:  # noqa: BLE001
+        safe_print(f"【api_server】progress/history 失败：{exc}")
+        return {
+            "success": False,
+            "message": f"拉取个人进步历史失败：{exc}",
+            "studentId": sid,
+            "points": [],
+            "count": 0,
+        }
 
 
 @app.get("/api/achievements/weekly")
@@ -2356,21 +2745,37 @@ def reset_fatigue_alert(student_id: str = ""):
 
 
 @app.post("/api/export_academic_matrix")
-def export_academic_matrix():
+def export_academic_matrix(measured_only: bool = False):
     """【V3.1】一键导出全数字化 SPSS 标准宽表（JSON 元信息 + 落盘）。
 
     优先走 AcademicDataExporter 宽表主路径；同时保留长表旁路落盘供 ANOVA。
-    前端若需浏览器直接下载，请改用 GET ``/api/export/spss_matrix``。
+    【Phase 3】``measured_only=true`` 时宽表失败回退长表仅导出实测横距行。
     """
     try:
         exporter = academic_exporter.AcademicDataExporter.from_db()
         result = exporter.export_spss_matrix_file()
+        if measured_only:
+            # 宽表暂无逐字段 provenance；并行落盘实测长表供科研过滤
+            records = _load_global_records()
+            long_result = academic_exporter.export_academic_matrix(
+                records, measured_only=True
+            )
+            if long_result.get("success"):
+                result = {
+                    **result,
+                    "longFormatPath": long_result.get("path"),
+                    "longFormatFilename": long_result.get("filename"),
+                    "longFormatRowCount": long_result.get("rowCount"),
+                    "measuredOnly": True,
+                }
     except Exception as exc:  # noqa: BLE001
         safe_print(f"【api_server】导出 V3.1 科研宽表失败：{exc}")
         # 回退：旧成长表，避免教练端完全无法导出
         records = _load_global_records()
         try:
-            result = academic_exporter.export_academic_matrix(records)
+            result = academic_exporter.export_academic_matrix(
+                records, measured_only=measured_only
+            )
         except Exception as long_exc:  # noqa: BLE001
             return {"success": False, "message": f"导出学术统计矩阵失败：{long_exc}"}
 
@@ -2389,6 +2794,9 @@ def export_academic_matrix():
         "rowCount": result["rowCount"],
         "columnCount": result.get("columnCount"),
         "studentCount": result["studentCount"],
+        "measuredOnly": bool(result.get("measuredOnly", measured_only)),
+        "longFormatPath": result.get("longFormatPath"),
+        "longFormatFilename": result.get("longFormatFilename"),
         "downloadUrl": "/api/export/spss_matrix",
     }
 

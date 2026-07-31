@@ -35,6 +35,71 @@ def test_ankle_rigidity_score_normalization():
     assert ae.normalize_ankle_rigidity_score(5.0) == 0.5
 
 
+def test_wide_format_skips_soft_deleted_shots():
+    """Sprint 5：is_deleted 废记录绝对不得进入宽表汇聚。"""
+    exporter = ae.AcademicDataExporter(
+        student_profiles=[
+            {
+                "anonymous_id": "Sub_DEL",
+                "cluster_id": "Class_1",
+                "experimental_group": "GROUP_A",
+            },
+        ],
+        shot_logs=[
+            {
+                "anonymous_id": "Sub_DEL",
+                "timepoint": "T0",
+                "impact_knee_angle": 140.0,
+                "total_score": 88.0,
+                "is_deleted": False,
+            },
+            {
+                "anonymous_id": "Sub_DEL",
+                "timepoint": "T0",
+                "impact_knee_angle": 10.0,
+                "total_score": 5.0,
+                "is_deleted": True,
+            },
+        ],
+    )
+    wide = exporter.generate_wide_format_matrix()
+    assert list(wide["anonymous_id"]) == ["Sub_DEL"]
+    # 均值应仅来自未删除的 140°，而非与脏数据 10° 平均
+    assert float(wide.loc[0, "T0_Knee_Flexion"]) == 140.0
+    assert float(wide.loc[0, "T0_Impact_Score"]) == 88.0
+
+
+def test_from_global_records_skips_deleted():
+    exporter = ae.AcademicDataExporter.from_global_records(
+        [
+            {
+                "id": "keep-1",
+                "studentId": "S001",
+                "classGroup": "四年级1班",
+                "type": "realtime",
+                "score": 80,
+                "testDate": "2026-07-01",
+                "kneeFlexionAngle": 145.0,
+                "is_deleted": False,
+            },
+            {
+                "id": "drop-1",
+                "studentId": "S001",
+                "classGroup": "四年级1班",
+                "type": "realtime",
+                "score": 1,
+                "testDate": "2026-07-01",
+                "kneeFlexionAngle": 20.0,
+                "is_deleted": True,
+            },
+        ]
+    )
+    assert len(exporter.shot_logs) == 1
+    assert exporter.shot_logs[0]["total_score"] == 80.0
+    wide = exporter.generate_wide_format_matrix()
+    assert float(wide.loc[0, "T0_Impact_Score"]) == 80.0
+
+
 def test_wide_format_fully_numeric_and_dummies():
     exporter = ae.AcademicDataExporter(
         student_profiles=[

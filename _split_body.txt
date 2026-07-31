@@ -1,0 +1,1374 @@
+# 各项最高扣分（合计 91，最差分不低于 9.00）
+_MAX_PENALTY_DISTANCE_CM = 12.0
+_MAX_PENALTY_TOE_ANGLE = 10.0
+_MAX_PENALTY_FOLDING = 12.0
+_MAX_PENALTY_WHIPPING = 10.0
+_MAX_PENALTY_IMPACT_KNEE = 12.0
+_MAX_PENALTY_ANKLE = 15.0  # 脚踝锁紧度：方差 > 5.0 直接扣满分
+_MAX_PENALTY_SUPPORT_KNEE = 10.0
+_MAX_PENALTY_HIP_TORSION = 10.0
+
+# 脚踝锁紧方差阈值（用户规格）
+ANKLE_VARIANCE_GREEN = 2.0
+ANKLE_VARIANCE_YELLOW_HIGH = 5.0
+
+# --------------------------------------------------------------------------
+# Kinematic Boundary Guard（特斯拉 FSD 风格人体生理学硬拦截）
+# --------------------------------------------------------------------------
+# 触球瞬间摆动腿必为伸展态；点乘锐角假象阈值 + 绝对生理钳位区间
+KINEMATIC_KNEE_SUPPLEMENT_THRESHOLD_DEG = 100.0
+KINEMATIC_KNEE_PHYSIO_MIN_DEG = 120.0
+KINEMATIC_KNEE_PHYSIO_MAX_DEG = 175.0
+# YOLO 球框漂移导致的离谱横距：>40cm 触发降级钳制
+KINEMATIC_DISTANCE_RUNAWAY_CM = 40.0
+KINEMATIC_DISTANCE_CLAMP_CM = 28.5
+# 踝角方差切片错位 / 关键点闪烁防暴走
+KINEMATIC_ANKLE_VARIANCE_RUNAWAY = 50.0
+KINEMATIC_ANKLE_VARIANCE_MAX_ALLOWED = 12.0
+
+
+# --------------------------------------------------------------------------
+# 经验阈值中央化读取（empirical_thresholds.py 为唯一权威源）
+# --------------------------------------------------------------------------
+# 【设计约束】评分函数内不得再出现绿/黄带字面量。所有区间一律经本函数取值，
+# 便于凭实际教学数据迭代（改 empirical_thresholds.json 即可，无需动评分代码）。
+# 依据/校准日期注释随值写在 empirical_thresholds.DEFAULT_THRESHOLDS 各区块。
+# 模块缺失或 JSON 损坏时回退到与现网同源的硬编码字面量，绝不抛崩。
+_SCORING_BAND_FALLBACK: dict[str, tuple[float, ...]] = {
+    "distance_cm": (15.0, 20.0, 10.0, 25.0, 17.5),
+    "toe_angle": (15.0, 25.0),
+    "max_folding_angle": (70.0, 90.0, 55.0, 105.0, 80.0),
+    "whipping_velocity": (450.0, 320.0, 0.55),
+    "impact_knee_angle": (140.0, 160.0, 125.0, 175.0, 150.0),
+    "support_knee_angle": (140.0, 165.0, 125.0, 175.0, 155.0),
+    "hip_torsion_angle": (15.0, 40.0, 5.0, 55.0, 25.0),
+}
+_RADAR_CONFIG_FALLBACK: dict[str, float] = {
+    "ankle_locked_score": 20.0,
+    "ankle_slight_score": 15.0,
+    "ankle_yielding_score": 5.0,
+    "whipping_full_score_deg_s": 450.0,
+    "approach_rhythm_floor": 16.0,
+    "approach_rhythm_ceiling": 20.0,
+    "approach_penalty_slope": 0.05,
+}
+_SHANK_ONLY_FOLD_MAX_FALLBACK = 165.0
+
+
+def _scoring_bands() -> dict[str, tuple[float, ...]]:
+    """取全部评分带阈值；任一环节异常即整体回退现网默认（可复现，零随机）。"""
+    bands = dict(_SCORING_BAND_FALLBACK)
+    try:
+        from empirical_thresholds import (
+            get_folding_bands,
+            get_hip_torsion_thresholds,
+            get_impact_knee_thresholds,
+            get_support_distance_bands,
+            get_support_knee_thresholds,
+            get_toe_angle_thresholds,
+            get_whipping_thresholds,
+        )
+
+        loaded = {
+            "distance_cm": get_support_distance_bands(),
+            "toe_angle": get_toe_angle_thresholds(),
+            "max_folding_angle": get_folding_bands(),
+            "whipping_velocity": get_whipping_thresholds(),
+            "impact_knee_angle": get_impact_knee_thresholds(),
+            "support_knee_angle": get_support_knee_thresholds(),
+            "hip_torsion_angle": get_hip_torsion_thresholds(),
+        }
+    except Exception:  # noqa: BLE001
+        return bands
+
+    for key, values in loaded.items():
+        expected = len(_SCORING_BAND_FALLBACK[key])
+        try:
+            coerced = tuple(float(v) for v in values)
+        except (TypeError, ValueError):
+            continue
+        if len(coerced) == expected and all(np.isfinite(v) for v in coerced):
+            bands[key] = coerced
+    return bands
+
+
+def _radar_config() -> dict[str, float]:
+    """取五维雷达映射参数；异常回退现网默认。"""
+    cfg = dict(_RADAR_CONFIG_FALLBACK)
+    try:
+        from empirical_thresholds import get_radar_config
+
+        loaded = get_radar_config() or {}
+    except Exception:  # noqa: BLE001
+        return cfg
+    for key, default in _RADAR_CONFIG_FALLBACK.items():
+        try:
+            value = float(loaded.get(key, default))
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(value):
+            cfg[key] = value
+    return cfg
+
+
+def _shank_only_fold_max() -> float:
+    """ERR_B2 折叠角上界；异常回退 165.0。"""
+    try:
+        from empirical_thresholds import get_shank_only_fold_max
+
+        value = float(get_shank_only_fold_max())
+    except Exception:  # noqa: BLE001
+        return _SHANK_ONLY_FOLD_MAX_FALLBACK
+    if not np.isfinite(value) or value <= 0:
+        return _SHANK_ONLY_FOLD_MAX_FALLBACK
+    return value
+
+
+def _guard_knee_extension_angle(angle_deg: float) -> tuple[float, bool]:
+    """触球伸展语境下的膝角解剖学矫正 + 生理区间钳位。
+
+    Returns:
+        (guarded_angle_deg, did_supplementary_flip)
+    """
+    angle = float(angle_deg)
+    if not np.isfinite(angle):
+        return float(KINEMATIC_KNEE_PHYSIO_MIN_DEG), False
+    flipped = False
+    # 3D 向量点乘常把伸展钝角算成锐角补角 → 强制翻转为伸展角
+    if angle < KINEMATIC_KNEE_SUPPLEMENT_THRESHOLD_DEG:
+        angle = 180.0 - angle
+        flipped = True
+    angle = min(
+        max(angle, KINEMATIC_KNEE_PHYSIO_MIN_DEG),
+        KINEMATIC_KNEE_PHYSIO_MAX_DEG,
+    )
+    return float(angle), flipped
+
+
+def apply_kinematic_physical_guards(
+    *,
+    impact_knee_angle: float,
+    support_knee_angle: float,
+    distance_cm: float,
+    ankle_variance: float,
+) -> dict[str, Any]:
+    """绝对安全的人体生理学硬拦截器（Kinematic Boundary Guard）。
+
+    在 DeterministicScorer 扣分 / 雷达 / 对外 JSON 组装之前调用，防止离谱量纲
+    （锐角补角假象、YOLO 球框漂移横距、踝关键点闪烁方差）击穿评分与雷达。
+
+    设计对标特斯拉 FSD：物理运动学边界约束优先于上层决策。
+    """
+    warnings: list[str] = []
+    events: list[dict[str, Any]] = []
+
+    raw_impact = float(impact_knee_angle)
+    raw_support = float(support_knee_angle)
+    raw_distance = float(distance_cm)
+    raw_ankle = float(ankle_variance)
+
+    impact_knee, impact_flipped = _guard_knee_extension_angle(raw_impact)
+    if impact_flipped or abs(impact_knee - raw_impact) > 1e-9:
+        msg = (
+            f"impact_knee_angle {raw_impact:.2f}° → {impact_knee:.2f}° "
+            f"(supplement={'yes' if impact_flipped else 'no'}, "
+            f"physio=[{KINEMATIC_KNEE_PHYSIO_MIN_DEG}, {KINEMATIC_KNEE_PHYSIO_MAX_DEG}])"
+        )
+        warnings.append(msg)
+        events.append(
+            {
+                "metric": "impact_knee_angle",
+                "action": "knee_anatomy_guard",
+                "raw": round(raw_impact, 4),
+                "guarded": round(impact_knee, 4),
+                "supplementary_flip": bool(impact_flipped),
+            }
+        )
+
+    support_knee, support_flipped = _guard_knee_extension_angle(raw_support)
+    if support_flipped or abs(support_knee - raw_support) > 1e-9:
+        msg = (
+            f"support_knee_angle {raw_support:.2f}° → {support_knee:.2f}° "
+            f"(supplement={'yes' if support_flipped else 'no'}, "
+            f"physio=[{KINEMATIC_KNEE_PHYSIO_MIN_DEG}, {KINEMATIC_KNEE_PHYSIO_MAX_DEG}])"
+        )
+        warnings.append(msg)
+        events.append(
+            {
+                "metric": "support_knee_angle",
+                "action": "knee_anatomy_guard",
+                "raw": round(raw_support, 4),
+                "guarded": round(support_knee, 4),
+                "supplementary_flip": bool(support_flipped),
+            }
+        )
+
+    distance = raw_distance if np.isfinite(raw_distance) else 17.5
+    distance_clamped = False
+    if np.isfinite(raw_distance) and raw_distance > KINEMATIC_DISTANCE_RUNAWAY_CM:
+        distance = float(min(raw_distance, KINEMATIC_DISTANCE_CLAMP_CM))
+        distance_clamped = True
+        msg = (
+            f"distance_cm {raw_distance:.2f}cm > {KINEMATIC_DISTANCE_RUNAWAY_CM}cm "
+            f"→ clamped to {distance:.2f}cm (Warning)"
+        )
+        warnings.append(msg)
+        events.append(
+            {
+                "metric": "distance_cm",
+                "action": "distance_runaway_clamp",
+                "raw": round(raw_distance, 4),
+                "guarded": round(distance, 4),
+                "status": "WARNING",
+            }
+        )
+        print(f"【Warning】KinematicBoundaryGuard 支撑脚横距暴走：{msg}")
+
+    ankle = raw_ankle if np.isfinite(raw_ankle) else 0.0
+    ankle_clamped = False
+    if np.isfinite(raw_ankle) and raw_ankle > KINEMATIC_ANKLE_VARIANCE_RUNAWAY:
+        # 平滑缩放到绝对安全上限，避免雷达 / 评分因切片错位彻底归零崩溃
+        ankle = float(min(raw_ankle, KINEMATIC_ANKLE_VARIANCE_MAX_ALLOWED))
+        ankle_clamped = True
+        msg = (
+            f"ankle_rigidity variance {raw_ankle:.4f} > {KINEMATIC_ANKLE_VARIANCE_RUNAWAY} "
+            f"→ scaled to {ankle:.4f} (max_allowed={KINEMATIC_ANKLE_VARIANCE_MAX_ALLOWED})"
+        )
+        warnings.append(msg)
+        events.append(
+            {
+                "metric": "ankle_rigidity",
+                "action": "ankle_variance_anti_runaway",
+                "raw": round(raw_ankle, 4),
+                "guarded": round(ankle, 4),
+                "status": "WARNING",
+            }
+        )
+        print(f"【Warning】KinematicBoundaryGuard 脚踝方差防暴走：{msg}")
+
+    return {
+        "impact_knee_angle": float(impact_knee),
+        "support_knee_angle": float(support_knee),
+        "distance_cm": float(distance),
+        "ankle_variance": float(ankle),
+        "distance_clamped": bool(distance_clamped),
+        "ankle_clamped": bool(ankle_clamped),
+        "impact_knee_flipped": bool(impact_flipped),
+        "support_knee_flipped": bool(support_flipped),
+        "warnings": warnings,
+        "events": events,
+        "raw": {
+            "impact_knee_angle": raw_impact if np.isfinite(raw_impact) else None,
+            "support_knee_angle": raw_support if np.isfinite(raw_support) else None,
+            "distance_cm": raw_distance if np.isfinite(raw_distance) else None,
+            "ankle_variance": raw_ankle if np.isfinite(raw_ankle) else None,
+        },
+    }
+
+
+def slice_action_roi_bounds(
+    impact_frame_idx: int,
+    total_frames: int,
+    half_window: int = ACTION_ROI_HALF_FRAMES,
+) -> tuple[int, int]:
+    """以 t_impact 为中心裁剪核心动作窗口 [start, end)（半开区间，最长 60 帧）。
+
+    action_window = [max(0, t-30), min(N, t+30))
+    """
+    n = max(0, int(total_frames))
+    t = int(impact_frame_idx)
+    if n <= 0:
+        return 0, 0
+    t = int(max(0, min(n - 1, t)))
+    start = max(0, t - int(half_window))
+    end = min(n, t + int(half_window))
+    if end <= start:
+        end = min(n, start + 1)
+    return int(start), int(end)
+
+
+def _roi_max_folding_angle(
+    frames: list[dict],
+    t_impact: int,
+    roi_start: int,
+    roi_end: int,
+    *,
+    swing_side: str = "right",
+    min_valid_frames: int = FOLD_ROI_MIN_VALID_FRAMES,
+) -> tuple[Optional[float], int, bool]:
+    """【V3.1/Phase2】后摆最大折叠角：ROI 内触球前摆动腿 3D 膝角绝对极小值。
+
+    对外 ``max_folding_angle`` = ``180 - min(膝内角)``。
+    返回 ``(max_folding_angle|None, 极值帧索引, ok)``。
+    ``ok=False``：有效帧不足 ``min_valid_frames`` 或无有限膝角。
+    """
+    fallback_idx = int(max(roi_start, min(max(roi_start, roi_end - 1), t_impact)))
+    if not frames:
+        return None, fallback_idx, False
+    hip_k, knee_k, ankle_k, _foot_k = swing_leg_joint_keys(swing_side)
+    t = int(max(roi_start, min(roi_end - 1, t_impact)))
+    best_interior = None
+    best_idx = fallback_idx
+    valid_count = 0
+    for i in range(roi_start, min(roi_end, t + 1)):
+        try:
+            rec = frames[i]
+            knee = float(
+                calculate_3d_joint_angle(rec[hip_k], rec[knee_k], rec[ankle_k])
+            )
+            if not np.isfinite(knee) or knee <= 0.0:
+                continue
+            valid_count += 1
+            if best_interior is None or knee < best_interior:
+                best_interior = knee
+                best_idx = int(i)
+        except Exception:
+            continue
+    if best_interior is None or valid_count < int(min_valid_frames):
+        return None, fallback_idx, False
+    max_folding = float(max(0.0, 180.0 - float(best_interior)))
+    return max_folding, int(best_idx), True
+
+
+def _roi_whipping_velocity(
+    frames: list[dict],
+    trajectory_data: dict,
+    roi_start: int,
+    roi_end: int,
+) -> tuple[float, int]:
+    """仅在 ROI 内取小腿/膝角速度 |ω| 峰值。
+
+    返回 (|ω|_peak, 峰值所在帧索引)。
+    """
+    fallback_idx = int(max(roi_start, min(max(roi_start, roi_end - 1), (roi_start + roi_end) // 2)))
+    omega_series = trajectory_data.get("angular_velocities") or trajectory_data.get(
+        "knee_angular_velocities"
+    )
+    if omega_series is not None and len(omega_series) > 0:
+        lo = max(0, min(len(omega_series), roi_start))
+        hi = max(lo, min(len(omega_series), roi_end))
+        peak = 0.0
+        peak_idx = fallback_idx
+        for i in range(lo, hi):
+            mag = abs(float(omega_series[i]))
+            if mag >= peak:
+                peak = mag
+                peak_idx = int(i)
+        if peak > 0.0:
+            return float(peak), int(peak_idx)
+
+    knee_angles = trajectory_data.get("knee_angles")
+    timestamps = trajectory_data.get("timestamps_sec")
+    if knee_angles is not None and len(knee_angles) >= 2:
+        lo = max(0, min(len(knee_angles), roi_start))
+        hi = max(lo + 1, min(len(knee_angles), roi_end))
+        peak = 0.0
+        peak_idx = fallback_idx
+        for i in range(lo + 1, hi):
+            if timestamps is not None and len(timestamps) > i:
+                dt = float(timestamps[i]) - float(timestamps[i - 1])
+            else:
+                dt = 1.0 / 30.0
+            if dt <= 1e-9:
+                continue
+            mag = abs(float(knee_angles[i]) - float(knee_angles[i - 1])) / dt
+            if mag >= peak:
+                peak = mag
+                peak_idx = int(i)
+        if peak > 0.0:
+            return float(peak), int(peak_idx)
+
+    # 从 ROI 帧几何反推膝角再差分
+    if frames and roi_end - roi_start >= 2:
+        angles: list[float] = []
+        times: list[float] = []
+        for i in range(roi_start, roi_end):
+            rec = frames[i]
+            try:
+                angles.append(
+                    float(calculate_angle(rec["right_hip"], rec["right_knee"], rec["right_ankle"]))
+                )
+            except Exception:
+                angles.append(angles[-1] if angles else 150.0)
+            times.append(float(rec.get("timestamp_sec", i / 30.0)))
+        peak = 0.0
+        peak_idx = fallback_idx
+        for i in range(1, len(angles)):
+            dt = times[i] - times[i - 1]
+            if dt <= 1e-9:
+                dt = 1.0 / 30.0
+            mag = abs(angles[i] - angles[i - 1]) / dt
+            if mag >= peak:
+                peak = mag
+                peak_idx = int(roi_start + i)
+        return float(peak), int(peak_idx)
+    return 0.0, fallback_idx
+
+
+def _linear_band_penalty(
+    value: float,
+    green_low: float,
+    green_high: float,
+    yellow_low: float,
+    yellow_high: float,
+    max_penalty: float,
+) -> tuple[float, str]:
+    """区间型指标：GREEN 内扣 0；YELLOW 带线性扣分；RED 外线性至满分。"""
+    v = float(value)
+    if green_low <= v <= green_high:
+        return 0.0, STATUS_GREEN
+    if yellow_low <= v < green_low:
+        span = max(1e-9, green_low - yellow_low)
+        ratio = (green_low - v) / span
+        return round(min(max_penalty, max_penalty * 0.55 * ratio), 2), STATUS_YELLOW
+    if green_high < v <= yellow_high:
+        span = max(1e-9, yellow_high - green_high)
+        ratio = (v - green_high) / span
+        return round(min(max_penalty, max_penalty * 0.55 * ratio), 2), STATUS_YELLOW
+    # RED：超出黄带，继续线性爬升至满分
+    if v < yellow_low:
+        span = max(1e-9, yellow_low - (yellow_low - (green_high - green_low)))
+        excess = yellow_low - v
+        ratio = min(1.0, 0.55 + 0.45 * (excess / max(span, green_high - green_low, 1.0)))
+    else:
+        excess = v - yellow_high
+        span = max(1e-9, green_high - green_low)
+        ratio = min(1.0, 0.55 + 0.45 * (excess / span))
+    return round(min(max_penalty, max_penalty * ratio), 2), STATUS_RED
+
+
+def _extract_ankle_window_angles(
+    frames: list[dict],
+    t_impact: int,
+    precomputed: Optional[list] = None,
+) -> tuple[list[float], bool]:
+    """提取 t_impact 前后各 1 帧（共 3 点）的踝关节夹角。
+
+    返回 ``(angles, ok)``。``ok=False`` 表示无有效实测窗（不得把假 140° 标成 measured）。
+    """
+    if precomputed is not None and len(precomputed) >= 3:
+        vals = [float(precomputed[0]), float(precomputed[1]), float(precomputed[2])]
+        if all(np.isfinite(v) for v in vals):
+            return vals, True
+        return [], False
+    n = len(frames) if frames else 0
+    if n == 0:
+        return [], False
+    t = int(max(0, min(n - 1, t_impact)))
+    idxs = [max(0, t - 1), t, min(n - 1, t + 1)]
+    angles: list[float] = []
+    real_count = 0
+    for i in idxs:
+        rec = frames[i]
+        try:
+            ang = float(
+                calculate_angle(rec["right_knee"], rec["right_ankle"], rec["right_foot_index"])
+            )
+            if np.isfinite(ang):
+                angles.append(ang)
+                real_count += 1
+            else:
+                angles.append(float("nan"))
+        except Exception:
+            angles.append(float("nan"))
+    finite = [a for a in angles if np.isfinite(a)]
+    if real_count <= 0 or not finite:
+        return [], False
+    # 短窗：用有限值填补至 3 点（仍视为实测窗，因至少有 1 个真实角）
+    while len(finite) < 3:
+        finite.append(finite[-1])
+    return finite[:3], True
+
+
+def _ankle_series_has_valid_window(
+    series: list,
+    t_impact: int,
+    *,
+    fps: float = DEFAULT_VIDEO_FPS,
+    half_window_ms: float = ANKLE_IMPACT_HALF_WINDOW_MS,
+) -> bool:
+    """判断踝角序列在冲击时长窗内是否存在有限实测点。"""
+    if not series:
+        return False
+    n = len(series)
+    lo, hi, _half = slice_ankle_impact_window_bounds(
+        n, t_impact, fps=fps, half_window_ms=half_window_ms
+    )
+    if hi < lo:
+        return False
+    for i in range(lo, hi + 1):
+        try:
+            if np.isfinite(float(series[i])):
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+class DeterministicScorer:
+    """V2.5 纯数学生物力学评分器。
+
+    严禁 LLM / 随机源参与任何扣分或等级判定。总分自 100.00 起按量纲线性扣减，
+    保留两位小数；同一输入保证浮点误差为 0.0 的位级可复现。
+
+    【V2.5 Action ROI】所有极值/方差量纲仅在 t_impact ± 30 帧核心窗口内解算。
+    【Kinematic Boundary Guard】扣分前经 ``apply_kinematic_physical_guards`` 硬拦截。
+    """
+
+    def calculate_biomechanical_score(
+        self,
+        impact_frame_data: dict,
+        trajectory_data: dict,
+    ) -> tuple[float, dict]:
+        """主入口：在固定 Action ROI 内纯数学解算 8 大量纲，返回 (TotalScore, detail)。
+
+        detail 同时携带 V3.1 ``radar_scores`` 五维独立量化（每维满分 20）。
+        """
+        impact_frame_data = impact_frame_data or {}
+        trajectory_data = trajectory_data or {}
+
+        # 【Item 8】评分带阈值统一自 empirical_thresholds.py 取，禁止散落魔数
+        _bands = _scoring_bands()
+        dist_gl, dist_gh, dist_yl, dist_yh, dist_center = _bands["distance_cm"]
+        toe_green_high, toe_red_low = _bands["toe_angle"]
+        fold_gl, fold_gh, fold_yl, fold_yh, fold_center = _bands["max_folding_angle"]
+        whip_green_low, whip_yellow_low, whip_yellow_ratio = _bands["whipping_velocity"]
+        ik_gl, ik_gh, ik_yl, ik_yh, ik_fallback = _bands["impact_knee_angle"]
+        sk_gl, sk_gh, sk_yl, sk_yh, sk_fallback = _bands["support_knee_angle"]
+        hip_gl, hip_gh, hip_yl, hip_yh, hip_fallback = _bands["hip_torsion_angle"]
+
+        t_impact = int(
+            impact_frame_data.get(
+                "t_impact",
+                impact_frame_data.get("contact_frame_index", trajectory_data.get("t_impact", 0)),
+            )
+            or 0
+        )
+        frames = impact_frame_data.get("frames") or trajectory_data.get("frames") or []
+        knee_angles_full = trajectory_data.get("knee_angles") or impact_frame_data.get("knee_angles")
+
+        # ---------- Action ROI 裁剪（数学保护层）----------
+        if frames:
+            total_n = len(frames)
+        elif knee_angles_full is not None:
+            total_n = len(knee_angles_full)
+        else:
+            total_n = int(
+                trajectory_data.get("total_frames")
+                or impact_frame_data.get("total_frames")
+                or 0
+            )
+        if total_n <= 0:
+            total_n = max(1, t_impact + 1)
+        t_impact = int(max(0, min(total_n - 1, t_impact)))
+        roi_start, roi_end = slice_action_roi_bounds(t_impact, total_n)
+        roi_frames = frames[roi_start:roi_end] if frames else []
+
+        # 瞬时量纲锚点：全局 t_impact 对应帧（必然落在 ROI 内）
+        impact_rec = None
+        if frames:
+            impact_rec = frames[t_impact]
+
+        # ---- a) 支撑脚偏移 distance_cm：[15, 20] GREEN ----
+        # 【V3.1/Phase2】PCR + 球框 QA；不合格不得标 measured
+        distance_cm = dist_center
+        distance_provenance = PROVENANCE_DEFAULT
+        distance_method = "neutral_band_center"
+        distance_confidence = 0.0
+        distance_qa: dict[str, Any] = {}
+        pcr_used = False
+        video_fps = float(
+            impact_frame_data.get("fps")
+            or trajectory_data.get("fps")
+            or DEFAULT_VIDEO_FPS
+        )
+        try:
+            from empirical_thresholds import get_ankle_half_window_ms
+
+            ankle_half_ms = float(get_ankle_half_window_ms())
+        except Exception:  # noqa: BLE001
+            ankle_half_ms = float(ANKLE_IMPACT_HALF_WINDOW_MS)
+        if not np.isfinite(ankle_half_ms) or ankle_half_ms <= 0:
+            ankle_half_ms = float(ANKLE_IMPACT_HALF_WINDOW_MS)
+        world_lateral = impact_frame_data.get("support_lateral_dist_cm")
+        if world_lateral is None:
+            world_lateral = trajectory_data.get("support_lateral_dist_cm")
+        if world_lateral is None and impact_frame_data.get("world_support_lateral_cm") is not None:
+            world_lateral = impact_frame_data.get("world_support_lateral_cm")
+
+        for key_src in (impact_frame_data, trajectory_data):
+            ankle_px = key_src.get("support_ankle_px") or key_src.get("ankle_pixel_coords")
+            ball_bbox = key_src.get("ball_pixel_bbox") or key_src.get("ball_bbox")
+            if ankle_px is None or ball_bbox is None:
+                continue
+            try:
+                body_h_px = key_src.get("body_h_px")
+                if body_h_px is None and impact_rec is not None:
+                    body_h_px = estimate_body_height_px(landmarks=impact_rec)
+                detail = calculate_support_foot_offset_detailed(
+                    ankle_px, ball_bbox, body_h_px=body_h_px
+                )
+                distance_qa = detail.get("qa") or {}
+                if not detail.get("ok"):
+                    # 【PCR 质量标记传播】ok=False 说明 PCR 走了兜底通道
+                    # （fallback_body_pcr / fallback_empirical_pcr）。此处必须把来源
+                    # 记进 method，否则下游 sanitizer 与 Markdown 只会看到
+                    # "fallback_default"，无法告知用户"该数值为估算、精度低"。
+                    _fb_method = detail.get("method") or "fallback_empirical_pcr"
+                    if distance_method == "neutral_band_center":
+                        distance_method = str(_fb_method)
+                        distance_provenance = PROVENANCE_ESTIMATED
+                        distance_confidence = 0.3
+                    continue
+                distance_cm = float(detail["offset_cm"])
+                pcr_used = True
+                distance_provenance = PROVENANCE_MEASURED
+                distance_method = "ball_pcr"
+                distance_confidence = 0.9
+                xcheck = crosscheck_pcr_vs_world_lateral(distance_cm, world_lateral)
+                if not xcheck.get("skipped"):
+                    distance_qa = {**distance_qa, "world_crosscheck": xcheck}
+                    distance_confidence = round(
+                        float(distance_confidence) * float(xcheck.get("confidence_factor") or 1.0),
+                        3,
+                    )
+                    if not xcheck.get("agree"):
+                        # 交叉不一致：降置信，仍保留 measured 但 method 标注
+                        distance_method = "ball_pcr_world_disagree"
+                        if distance_confidence < 0.5:
+                            distance_provenance = PROVENANCE_ESTIMATED
+                            distance_method = "ball_pcr_unreliable"
+                break
+            except Exception:
+                continue
+        if not pcr_used and impact_rec is not None:
+            try:
+                ankle_px = impact_rec.get("left_ankle_px") or impact_rec.get("left_ankle")
+                ball_bbox = (
+                    impact_frame_data.get("ball_pixel_bbox")
+                    or impact_rec.get("ball_pixel_bbox")
+                    or impact_rec.get("ball_bbox")
+                )
+                if ankle_px is not None and ball_bbox is not None:
+                    body_h_px = estimate_body_height_px(landmarks=impact_rec)
+                    detail = calculate_support_foot_offset_detailed(
+                        ankle_px, ball_bbox, body_h_px=body_h_px
+                    )
+                    distance_qa = detail.get("qa") or {}
+                    if not detail.get("ok"):
+                        # 【PCR 质量标记传播】同上：保留兜底 PCR 来源标记
+                        _fb_method = detail.get("method") or "fallback_empirical_pcr"
+                        if distance_method == "neutral_band_center":
+                            distance_method = str(_fb_method)
+                            distance_provenance = PROVENANCE_ESTIMATED
+                            distance_confidence = 0.3
+                    if detail.get("ok"):
+                        distance_cm = float(detail["offset_cm"])
+                        pcr_used = True
+                        distance_provenance = PROVENANCE_MEASURED
+                        distance_method = "ball_pcr"
+                        distance_confidence = 0.9
+                        xcheck = crosscheck_pcr_vs_world_lateral(distance_cm, world_lateral)
+                        if not xcheck.get("skipped"):
+                            distance_qa = {**distance_qa, "world_crosscheck": xcheck}
+                            distance_confidence = round(
+                                float(distance_confidence)
+                                * float(xcheck.get("confidence_factor") or 1.0),
+                                3,
+                            )
+                            if not xcheck.get("agree") and distance_confidence < 0.5:
+                                distance_provenance = PROVENANCE_ESTIMATED
+                                distance_method = "ball_pcr_unreliable"
+            except Exception:
+                pcr_used = False
+        if not pcr_used:
+            for key_src in (impact_frame_data, trajectory_data):
+                if key_src.get("distance_cm") is not None:
+                    distance_cm = float(key_src["distance_cm"])
+                    distance_provenance = PROVENANCE_MEASURED
+                    distance_method = "upstream_explicit"
+                    distance_confidence = 0.75
+                    break
+                if key_src.get("support_lateral_dist_cm") is not None:
+                    distance_cm = float(key_src["support_lateral_dist_cm"])
+                    distance_provenance = PROVENANCE_MEASURED
+                    distance_method = "upstream_explicit"
+                    distance_confidence = 0.75
+                    break
+        # pen_dist 延后至 Kinematic Boundary Guard 之后
+
+        # ---- b) 支撑脚尖指向角 toe_angle：[0, 15] GREEN；>25 RED 满分 ----
+        toe_angle = float(
+            impact_frame_data.get("toe_angle", trajectory_data.get("toe_angle", 0.0)) or 0.0
+        )
+        if "toe_angle" not in impact_frame_data and "toe_angle" not in trajectory_data and impact_rec is not None:
+            try:
+                ball = impact_frame_data.get("ball_center")
+                toe_angle = _support_toe_angle_deg(impact_rec, ball)
+            except Exception:
+                toe_angle = 0.0
+        if 0.0 <= toe_angle <= toe_green_high:
+            pen_toe, st_toe = 0.0, STATUS_GREEN
+        elif toe_angle > toe_red_low:
+            pen_toe, st_toe = float(_MAX_PENALTY_TOE_ANGLE), STATUS_RED
+        else:
+            ratio = (toe_angle - toe_green_high) / max(1e-9, toe_red_low - toe_green_high)
+            pen_toe = round(min(_MAX_PENALTY_TOE_ANGLE, _MAX_PENALTY_TOE_ANGLE * ratio), 2)
+            st_toe = STATUS_YELLOW
+
+        # ---- c) 摆动腿后摆折叠角：【仅 ROI 内】解算；无帧时回退预计算标量 ----
+        # 【Phase 1/2】缺测不得把 80° 缺省标成 measured；按摆动腿选侧 + ROI 有效帧门槛
+        fold_extreme_idx = int(t_impact)
+        fold_provenance = PROVENANCE_DEFAULT
+        fold_method = "neutral_band_center"
+        fold_confidence = 0.0
+        max_folding = fold_center
+        swing_side = infer_swing_leg_side(
+            frames,
+            t_impact,
+            ball_center=impact_frame_data.get("ball_center")
+            or trajectory_data.get("ball_center"),
+            explicit_side=impact_frame_data.get("swing_leg")
+            or impact_frame_data.get("kicking_foot")
+            or trajectory_data.get("swing_leg"),
+        )
+        if frames:
+            fold_val, fold_extreme_idx, fold_ok = _roi_max_folding_angle(
+                frames,
+                t_impact,
+                roi_start,
+                roi_end,
+                swing_side=swing_side,
+            )
+            if fold_ok and fold_val is not None:
+                max_folding = float(fold_val)
+                fold_provenance = PROVENANCE_MEASURED
+                fold_method = f"roi_3d_knee_min_{swing_side}"
+                fold_confidence = 0.85
+            else:
+                upstream_fold = trajectory_data.get("max_folding_angle")
+                if upstream_fold is None and trajectory_data.get("swing_fold_angle") is not None:
+                    upstream_fold = max(0.0, 180.0 - float(trajectory_data["swing_fold_angle"]))
+                if upstream_fold is not None:
+                    max_folding = float(upstream_fold)
+                    fold_provenance = PROVENANCE_MEASURED
+                    fold_method = "upstream_explicit"
+                    fold_confidence = 0.75
+        else:
+            max_folding_raw = trajectory_data.get("max_folding_angle")
+            if max_folding_raw is None and trajectory_data.get("swing_fold_angle") is not None:
+                max_folding_raw = max(0.0, 180.0 - float(trajectory_data["swing_fold_angle"]))
+            if max_folding_raw is not None:
+                max_folding = float(max_folding_raw)
+                fold_provenance = PROVENANCE_MEASURED
+                fold_method = "upstream_explicit"
+                fold_confidence = 0.75
+            fold_extreme_idx = int(
+                trajectory_data.get(
+                    "backswing_extreme_frame_index",
+                    impact_frame_data.get("backswing_extreme_frame_index", max(0, t_impact - 8)),
+                )
+                or max(0, t_impact - 8)
+            )
+        pen_fold, st_fold = _linear_band_penalty(
+            max_folding, fold_gl, fold_gh, fold_yl, fold_yh, _MAX_PENALTY_FOLDING
+        )
+
+        # ---- d) 小腿鞭打速度：【仅 ROI 内】|ω| 峰值 ----
+        whip_extreme_idx = int(max(0, t_impact - 2))
+        if frames or knee_angles_full is not None or trajectory_data.get("angular_velocities"):
+            whipping, whip_extreme_idx = _roi_whipping_velocity(
+                frames, trajectory_data, roi_start, roi_end
+            )
+            # 若 ROI 差分得到 0 且外部给了标量，仅在完全无序列时才回退
+            if whipping <= 0.0 and not frames and knee_angles_full is None:
+                whipping = float(
+                    trajectory_data.get(
+                        "whipping_velocity",
+                        trajectory_data.get(
+                            "whipping_speed_peak",
+                            impact_frame_data.get("whipping_velocity", 0.0),
+                        ),
+                    )
+                    or 0.0
+                )
+        else:
+            whipping = float(
+                trajectory_data.get(
+                    "whipping_velocity",
+                    trajectory_data.get(
+                        "whipping_speed_peak", impact_frame_data.get("whipping_velocity", 0.0)
+                    ),
+                )
+                or 0.0
+            )
+        if whipping >= whip_green_low:
+            pen_whip, st_whip = 0.0, STATUS_GREEN
+        elif whipping >= whip_yellow_low:
+            ratio = (whip_green_low - whipping) / max(1e-9, whip_green_low - whip_yellow_low)
+            pen_whip = round(min(_MAX_PENALTY_WHIPPING, _MAX_PENALTY_WHIPPING * whip_yellow_ratio * ratio), 2)
+            st_whip = STATUS_YELLOW
+        else:
+            ratio = min(1.0, (whip_yellow_low - whipping) / max(1e-9, whip_yellow_low))
+            pen_whip = round(
+                min(_MAX_PENALTY_WHIPPING, _MAX_PENALTY_WHIPPING * (whip_yellow_ratio + (1.0 - whip_yellow_ratio) * ratio)), 2
+            )
+            st_whip = STATUS_RED
+
+        # ---- e) 触球瞬间膝关节夹角（触球帧，属 ROI）----
+        impact_knee = impact_frame_data.get("impact_knee_angle")
+        if impact_knee is None and impact_rec is not None:
+            try:
+                impact_knee = calculate_angle(
+                    impact_rec["right_hip"],
+                    impact_rec["right_knee"],
+                    impact_rec["right_ankle"],
+                    is_knee_extension=True,
+                )
+            except Exception:
+                impact_knee = ik_fallback
+        if impact_knee is None:
+            impact_knee = ik_fallback
+        impact_knee = float(impact_knee)
+        # 锐角补角 / 生理钳位统一由 apply_kinematic_physical_guards 处理
+
+        # ---- f) 脚踝锁紧度：【V3.1/Phase2】按时长冲击窗角方差 + LOCKED/SLIGHT/YIELDING ----
+        # 【Phase 1】空窗/假填充不得标成 measured LOCKED
+        ankle_provenance = PROVENANCE_MISSING
+        ankle_method = "impact_window_var"
+        ankle_confidence = 0.0
+        ankle_angles: list[float] = []
+        ankle_variance = 0.0
+        stiffness_status = ANKLE_STIFFNESS_LOCKED
+        ankle_dorsi_drop: Optional[float] = None
+        ankle_half_frames = ankle_half_window_frames(video_fps, ankle_half_ms)
+        _hip_k, knee_k, ankle_k, foot_k = swing_leg_joint_keys(swing_side)
+
+        precomputed_window = impact_frame_data.get("ankle_angles_window") or trajectory_data.get(
+            "ankle_angles_window"
+        )
+        ankle_series = impact_frame_data.get("ankle_angles_time_series") or trajectory_data.get(
+            "ankle_angles_time_series"
+        )
+        series_from_frames = False
+        ankle_vis_series = impact_frame_data.get(
+            "ankle_landmark_visibility_series"
+        ) or trajectory_data.get("ankle_landmark_visibility_series")
+        if ankle_series is None and frames:
+            built: list[float] = []
+            built_vis: list[float] = []
+            real_pts = 0
+            for i in range(len(frames)):
+                try:
+                    ang = float(
+                        calculate_3d_joint_angle(
+                            frames[i][knee_k],
+                            frames[i][ankle_k],
+                            frames[i][foot_k],
+                        )
+                    )
+                    if np.isfinite(ang):
+                        built.append(ang)
+                        real_pts += 1
+                    else:
+                        built.append(float("nan"))
+                except Exception:
+                    built.append(float("nan"))
+                try:
+                    built_vis.append(
+                        min(
+                            _landmark_visibility(frames[i], knee_k),
+                            _landmark_visibility(frames[i], ankle_k),
+                            _landmark_visibility(frames[i], foot_k),
+                        )
+                    )
+                except Exception:
+                    built_vis.append(0.0)
+            if real_pts > 0:
+                ankle_series = built
+                ankle_vis_series = built_vis
+                series_from_frames = True
+
+        if ankle_series is not None and _ankle_series_has_valid_window(
+            ankle_series, t_impact, fps=video_fps, half_window_ms=ankle_half_ms
+        ):
+            ankle_variance, stiffness_status = calculate_ankle_stiffness_variance(
+                ankle_series,
+                t_impact,
+                fps=video_fps,
+                half_window_ms=ankle_half_ms,
+                landmark_visibility_series=ankle_vis_series,
+            )
+            n_ser = len(ankle_series)
+            lo_a, hi_a, _hf = slice_ankle_impact_window_bounds(
+                n_ser, t_impact, fps=video_fps, half_window_ms=ankle_half_ms
+            )
+            window_vals = []
+            for i in range(lo_a, hi_a + 1):
+                try:
+                    v = float(ankle_series[i])
+                    if np.isfinite(v):
+                        window_vals.append(v)
+                except (TypeError, ValueError):
+                    continue
+            while len(window_vals) < 3 and window_vals:
+                window_vals.append(window_vals[-1])
+            ankle_angles = list(window_vals) if window_vals else []
+            ankle_dorsi_drop = ankle_window_dorsiflex_drop_deg(ankle_angles)
+            ankle_provenance = PROVENANCE_MEASURED
+            ankle_method = (
+                f"impact_window_var_frames_{swing_side}"
+                if series_from_frames
+                else "impact_window_var"
+            )
+            ankle_confidence = 0.8
+        else:
+            ankle_angles, ankle_ok = _extract_ankle_window_angles(
+                frames,
+                t_impact,
+                precomputed=precomputed_window,
+            )
+            if ankle_ok and ankle_angles:
+                local_t = 1 if len(ankle_angles) >= 3 else 0
+                ankle_variance, stiffness_status = calculate_ankle_stiffness_variance(
+                    ankle_angles,
+                    local_t,
+                    fps=video_fps,
+                    half_window_frames=1,
+                )
+                ankle_dorsi_drop = ankle_window_dorsiflex_drop_deg(ankle_angles)
+                ankle_provenance = PROVENANCE_MEASURED
+                ankle_method = (
+                    "impact_window_var_precomputed"
+                    if precomputed_window is not None
+                    else "impact_window_var"
+                )
+                ankle_confidence = 0.8
+            else:
+                # 缺测：评分沿用中性 0 方差（与旧空窗行为一致），但 provenance=missing
+                ankle_variance = 0.0
+                stiffness_status = ANKLE_STIFFNESS_LOCKED
+                ankle_angles = []
+                ankle_dorsi_drop = None
+                ankle_provenance = PROVENANCE_MISSING
+                ankle_method = "missing_window"
+                ankle_confidence = 0.0
+
+        # ---- g1) 支撑腿膝关节角度（触球帧）----
+        support_knee = impact_frame_data.get(
+            "support_knee_angle", trajectory_data.get("support_knee_angle")
+        )
+        if support_knee is None and impact_rec is not None:
+            try:
+                support_knee = calculate_angle(
+                    impact_rec["left_hip"],
+                    impact_rec["left_knee"],
+                    impact_rec["left_ankle"],
+                    is_knee_extension=True,
+                )
+            except Exception:
+                support_knee = sk_fallback
+        if support_knee is None:
+            support_knee = sk_fallback
+        support_knee = float(support_knee)
+
+        # ---- Kinematic Boundary Guard：输出 / 扣分前的人体生理学硬拦截 ----
+        kinematic_guards = apply_kinematic_physical_guards(
+            impact_knee_angle=impact_knee,
+            support_knee_angle=support_knee,
+            distance_cm=distance_cm,
+            ankle_variance=ankle_variance,
+        )
+        impact_knee = float(kinematic_guards["impact_knee_angle"])
+        support_knee = float(kinematic_guards["support_knee_angle"])
+        distance_cm = float(kinematic_guards["distance_cm"])
+        ankle_variance = float(kinematic_guards["ankle_variance"])
+        if kinematic_guards.get("ankle_clamped"):
+            # 方差被防暴走滤波后，刚度档位与钳制后方差对齐
+            if ankle_variance < ANKLE_VARIANCE_GREEN:
+                stiffness_status = ANKLE_STIFFNESS_LOCKED
+            elif ankle_variance <= ANKLE_VARIANCE_YELLOW_HIGH:
+                stiffness_status = ANKLE_STIFFNESS_SLIGHT_DEFORMATION
+            else:
+                stiffness_status = ANKLE_STIFFNESS_YIELDING
+        if kinematic_guards.get("distance_clamped"):
+            # 离谱横距降级：方法标注 + 置信下调，保留 Warning 痕迹
+            distance_method = f"{distance_method}|kinematic_clamp"
+            distance_confidence = round(min(float(distance_confidence), 0.55), 3)
+
+        pen_dist, st_dist = _linear_band_penalty(
+            distance_cm, dist_gl, dist_gh, dist_yl, dist_yh, _MAX_PENALTY_DISTANCE_CM
+        )
+        if kinematic_guards.get("distance_clamped") and st_dist == STATUS_GREEN:
+            st_dist = STATUS_YELLOW
+
+        # 【T0 精度等级】fallback_midframe 时 T0 定位精度不足（无抛物线三点），
+        # 放宽膝关节黄灯阈值 ±5°，避免因帧级抖动触发误扣分
+        _T0_FALLBACK_KNEE_SLACK = 5.0
+        _t0_quality = (impact_frame_data.get("t0_quality") or "")
+        if _t0_quality == "fallback_midframe":
+            ik_yl = ik_yl - _T0_FALLBACK_KNEE_SLACK
+            ik_yh = ik_yh + _T0_FALLBACK_KNEE_SLACK
+            sk_yl = sk_yl - _T0_FALLBACK_KNEE_SLACK
+            sk_yh = sk_yh + _T0_FALLBACK_KNEE_SLACK
+
+        pen_iknee, st_iknee = _linear_band_penalty(
+            impact_knee, ik_gl, ik_gh, ik_yl, ik_yh, _MAX_PENALTY_IMPACT_KNEE
+        )
+        pen_sknee, st_sknee = _linear_band_penalty(
+            support_knee, sk_gl, sk_gh, sk_yl, sk_yh, _MAX_PENALTY_SUPPORT_KNEE
+        )
+
+        if ankle_variance < ANKLE_VARIANCE_GREEN:
+            pen_ankle, st_ankle = 0.0, STATUS_GREEN
+        elif ankle_variance <= ANKLE_VARIANCE_YELLOW_HIGH:
+            ratio = (ankle_variance - ANKLE_VARIANCE_GREEN) / (
+                ANKLE_VARIANCE_YELLOW_HIGH - ANKLE_VARIANCE_GREEN
+            )
+            pen_ankle = round(min(_MAX_PENALTY_ANKLE, _MAX_PENALTY_ANKLE * 0.55 * ratio), 2)
+            st_ankle = STATUS_YELLOW
+        else:
+            pen_ankle, st_ankle = float(_MAX_PENALTY_ANKLE), STATUS_RED
+
+        # ---- g2) 髋关节相对扭转角（触球帧）----
+        hip_torsion = impact_frame_data.get(
+            "hip_torsion_angle", trajectory_data.get("hip_torsion_angle")
+        )
+        if hip_torsion is None and impact_rec is not None:
+            try:
+                hip_torsion = _hip_relative_torsion_deg(impact_rec)
+            except Exception:
+                hip_torsion = hip_fallback
+        if hip_torsion is None:
+            hip_torsion = hip_fallback
+        hip_torsion = float(hip_torsion)
+        pen_hip, st_hip = _linear_band_penalty(
+            hip_torsion, hip_gl, hip_gh, hip_yl, hip_yh, _MAX_PENALTY_HIP_TORSION
+        )
+
+        total_penalty = (
+            pen_dist
+            + pen_toe
+            + pen_fold
+            + pen_whip
+            + pen_iknee
+            + pen_ankle
+            + pen_sknee
+            + pen_hip
+        )
+        total_score = round(max(0.0, 100.00 - float(total_penalty)), 2)
+
+        # ---------- V3.1 五维独立量化雷达（每维满分 20，保底 0，1 位小数）----------
+        radar_scores = self._compose_radar_scores(
+            pen_dist=pen_dist,
+            pen_sknee=pen_sknee,
+            pen_fold=pen_fold,
+            ankle_variance=ankle_variance,
+            whipping=whipping,
+            total_penalty=float(total_penalty),
+        )
+
+        landing_idx = int(
+            impact_frame_data.get(
+                "landing_frame_index",
+                trajectory_data.get("landing_frame_index", max(0, t_impact - 3)),
+            )
+            or max(0, t_impact - 3)
+        )
+
+        ankle_measured = is_aigc_measurable_provenance(ankle_provenance)
+        dist_extra = {}
+        if distance_qa:
+            dist_extra["ball_bbox_qa"] = {
+                "ok": distance_qa.get("ok"),
+                "reason": distance_qa.get("reason"),
+                "diameter_px": distance_qa.get("diameter_px"),
+                "aspect_ratio": distance_qa.get("aspect_ratio"),
+            }
+            if distance_qa.get("world_crosscheck") is not None:
+                dist_extra["ball_bbox_qa"]["world_crosscheck"] = distance_qa.get(
+                    "world_crosscheck"
+                )
+        if kinematic_guards.get("distance_clamped"):
+            dist_extra["kinematic_guard"] = {
+                "status": "WARNING",
+                "action": "distance_runaway_clamp",
+                "raw": (kinematic_guards.get("raw") or {}).get("distance_cm"),
+                "guarded": round(distance_cm, 2),
+            }
+        fold_extra = {"swing_leg": swing_side}
+        ankle_extra = {
+            "variance": round(ankle_variance, 4) if ankle_measured else None,
+            "scoring_variance": round(ankle_variance, 4),
+            "stiffness_status": stiffness_status if ankle_measured else None,
+            "ankle_angles_window": (
+                [round(a, 2) for a in ankle_angles] if ankle_measured else []
+            ),
+            "dorsiflex_drop_deg": (
+                round(float(ankle_dorsi_drop), 2)
+                if ankle_measured and ankle_dorsi_drop is not None
+                else None
+            ),
+            "window_half_frames": int(ankle_half_frames),
+            "fps": round(float(video_fps), 3),
+            "swing_leg": swing_side,
+        }
+        if kinematic_guards.get("ankle_clamped"):
+            ankle_extra["kinematic_guard"] = {
+                "status": "WARNING",
+                "action": "ankle_variance_anti_runaway",
+                "raw": (kinematic_guards.get("raw") or {}).get("ankle_variance"),
+                "guarded": round(ankle_variance, 4),
+            }
+        indicators = {
+            "distance_cm": pack_focus_indicator(
+                scoring_value=distance_cm,
+                provenance=distance_provenance,
+                method=distance_method,
+                confidence=distance_confidence,
+                unit="cm",
+                status=st_dist,
+                penalty=pen_dist,
+                green_band=[dist_gl, dist_gh],
+                extreme_frame_index=int(landing_idx),
+                extra=dist_extra or None,
+            ),
+            "toe_angle": {
+                "value": round(toe_angle, 2),
+                "unit": "deg",
+                "status": st_toe,
+                "penalty": pen_toe,
+                "green_band": [0.0, toe_green_high],
+                "extreme_frame_index": int(landing_idx),
+                "provenance": PROVENANCE_MEASURED,
+                "method": "impact_frame",
+            },
+            "max_folding_angle": pack_focus_indicator(
+                scoring_value=max_folding,
+                provenance=fold_provenance,
+                method=fold_method,
+                confidence=fold_confidence,
+                unit="deg",
+                status=st_fold,
+                penalty=pen_fold,
+                green_band=[fold_gl, fold_gh],
+                extreme_frame_index=int(fold_extreme_idx),
+                extra=fold_extra,
+            ),
+            "whipping_velocity": {
+                "value": round(whipping, 2),
+                "unit": "deg/s",
+                "status": st_whip,
+                "penalty": pen_whip,
+                "green_band": [whip_green_low, None],
+                "extreme_frame_index": int(whip_extreme_idx),
+                "provenance": PROVENANCE_MEASURED,
+                "method": "roi_peak",
+            },
+            "impact_knee_angle": {
+                "value": round(impact_knee, 2),
+                "unit": "deg",
+                "status": st_iknee,
+                "penalty": pen_iknee,
+                "green_band": [ik_gl, ik_gh],
+                "extreme_frame_index": int(t_impact),
+                "provenance": PROVENANCE_MEASURED,
+                "method": "impact_frame",
+            },
+            "ankle_rigidity": pack_focus_indicator(
+                scoring_value=ankle_variance,
+                provenance=ankle_provenance,
+                method=ankle_method,
+                confidence=ankle_confidence,
+                unit="variance",
+                status=st_ankle,
+                penalty=pen_ankle,
+                green_band=[0.0, ANKLE_VARIANCE_GREEN],
+                extreme_frame_index=int(t_impact),
+                decimals=4,
+                extra=ankle_extra,
+            ),
+            "support_knee_angle": {
+                "value": round(support_knee, 2),
+                "unit": "deg",
+                "status": st_sknee,
+                "penalty": pen_sknee,
+                "green_band": [sk_gl, sk_gh],
+                "extreme_frame_index": int(landing_idx),
+                "provenance": PROVENANCE_MEASURED,
+                "method": "impact_frame",
+            },
+            "hip_torsion_angle": {
+                "value": round(hip_torsion, 2),
+                "unit": "deg",
+                "status": st_hip,
+                "penalty": pen_hip,
+                "green_band": [hip_gl, hip_gh],
+                "extreme_frame_index": int(t_impact),
+                "provenance": PROVENANCE_MEASURED,
+                "method": "impact_frame",
+            },
+        }
+        # 膝角解剖学矫正痕迹写入指标（仅在实际发生翻转/钳位时）
+        raw_map = kinematic_guards.get("raw") or {}
+        if kinematic_guards.get("impact_knee_flipped") or (
+            raw_map.get("impact_knee_angle") is not None
+            and abs(float(raw_map["impact_knee_angle"]) - float(impact_knee)) > 1e-6
+        ):
+            indicators["impact_knee_angle"]["kinematic_guard"] = {
+                "action": "knee_anatomy_guard",
+                "raw": raw_map.get("impact_knee_angle"),
+                "guarded": round(impact_knee, 2),
+                "supplementary_flip": bool(kinematic_guards.get("impact_knee_flipped")),
+            }
+        if kinematic_guards.get("support_knee_flipped") or (
+            raw_map.get("support_knee_angle") is not None
+            and abs(float(raw_map["support_knee_angle"]) - float(support_knee)) > 1e-6
+        ):
+            indicators["support_knee_angle"]["kinematic_guard"] = {
+                "action": "knee_anatomy_guard",
+                "raw": raw_map.get("support_knee_angle"),
+                "guarded": round(support_knee, 2),
+                "supplementary_flip": bool(kinematic_guards.get("support_knee_flipped")),
+            }
+
+        # 【脏数据拦截】任一量纲 None/NaN → 默认值 + YELLOW，禁止 null 流向 LLM/前端
+        indicators = sanitize_eight_dimension_indicators(indicators)
+
+        metric_extreme_frames = {
+            key: int(item["extreme_frame_index"]) for key, item in indicators.items()
+        }
+
+        # ---- Sprint 1：支撑脚 / 摆腿时空热力图（有完整帧序列时生成）----
+        heatmap_base64 = None
+        spatial_trajectory = None
+        if frames:
+            ball_center = (
+                impact_frame_data.get("ball_center")
+                or trajectory_data.get("ball_center")
+                or (impact_rec.get("right_foot_index") if impact_rec else None)
+            )
+            try:
+                heat_payload = build_spatial_heatmap_payload(
+                    frames, t_impact, ball_center_t_impact=ball_center
+                )
+                heat_payload.pop("_canvas_bgr", None)
+                heatmap_base64 = heat_payload.get("heatmap_base64")
+                spatial_trajectory = {
+                    k: v
+                    for k, v in heat_payload.items()
+                    if k not in ("heatmap_base64", "heatmap_data_uri", "_canvas_bgr")
+                }
+            except Exception:
+                heatmap_base64 = None
+                spatial_trajectory = None
+
+        detail = {
+            "TotalScore": total_score,
+            "t_impact": int(t_impact),
+            "base_score": 100.00,
+            "total_penalty": round(float(total_penalty), 2),
+            "indicators": indicators,
+            "metric_extreme_frames": metric_extreme_frames,
+            "radar_scores": radar_scores,
+            "scoring_engine": "DeterministicScorer_V3.1",
+            "llm_participated": False,
+            "swing_leg": swing_side,
+            "kinematic_guards": {
+                "warnings": list(kinematic_guards.get("warnings") or []),
+                "events": list(kinematic_guards.get("events") or []),
+                "distance_clamped": bool(kinematic_guards.get("distance_clamped")),
+                "ankle_clamped": bool(kinematic_guards.get("ankle_clamped")),
+            },
+            "action_roi": {
+                "start": int(roi_start),
+                "end": int(roi_end),
+                "half_window": int(ACTION_ROI_HALF_FRAMES),
+                "length": int(max(0, roi_end - roi_start)),
+                "roi_frame_count": int(len(roi_frames)) if roi_frames else int(max(0, roi_end - roi_start)),
+            },
+            # Sprint 1：单趟次支撑脚 / 摆腿时空热力图（PNG base64，无 data URI 前缀）
+            "heatmap_base64": heatmap_base64,
+            "spatial_trajectory": spatial_trajectory,
+        }
+        return total_score, detail
+
+    @staticmethod
+    def _clamp_radar(value: float) -> float:
+        """雷达维分数：[0, 20]，保留 1 位小数。"""
+        return round(max(0.0, min(20.0, float(value))), 1)
+
+    def _compose_radar_scores(
+        self,
+        *,
+        pen_dist: float,
+        pen_sknee: float,
+        pen_fold: float,
+        ankle_variance: float,
+        whipping: float,
+        total_penalty: float,
+    ) -> dict[str, float]:
+        """
+        V3.1 五维儿童游戏化雷达：与单一 TotalScore 并行输出。
+
+        - support_stability：支撑脚偏移 + 支撑膝缓冲惩罚折算
+        - backswing_folding：后摆最大折叠角惩罚折算
+        - ankle_rigidity：脚踝方差分档（阈值源自 _radar_config()['ankle_*_score']）
+        - whipping_velocity：小腿峰值角速度（>= radar['whipping_full_score_deg_s'] → 20，否则线性递减）
+        - approach_rhythm：助跑占位，由整体流畅度映射到 [floor, ceiling]（确定性，零随机）
+        """
+        rc = _radar_config()
+        ankle_locked_score: float = rc["ankle_locked_score"]
+        ankle_slight_score: float = rc["ankle_slight_score"]
+        ankle_yielding_score: float = rc["ankle_yielding_score"]
+        whip_full: float = rc["whipping_full_score_deg_s"]
+        rhythm_floor: float = rc["approach_rhythm_floor"]
+        rhythm_ceiling: float = rc["approach_rhythm_ceiling"]
+        rhythm_slope: float = rc["approach_penalty_slope"]
+
+        # 支撑与稳固：两路惩罚按各自满分权重折算到 20 分制
+        support_denom = _MAX_PENALTY_DISTANCE_CM + _MAX_PENALTY_SUPPORT_KNEE
+        support_stability = self._clamp_radar(
+            20.0 * (1.0 - (float(pen_dist) + float(pen_sknee)) / support_denom)
+        )
+
+        # 蓄力与折叠：折叠惩罚满扣 → 0 分
+        backswing_folding = self._clamp_radar(
+            20.0 * (1.0 - float(pen_fold) / _MAX_PENALTY_FOLDING)
+        )
+
+        # 锁踝与刚性：离散档位（与 ANKLE_VARIANCE_* 阈值对齐）
+        if ankle_variance < ANKLE_VARIANCE_GREEN:
+            ankle_rigidity = ankle_locked_score
+        elif ankle_variance <= ANKLE_VARIANCE_YELLOW_HIGH:
+            ankle_rigidity = ankle_slight_score
+        else:
+            ankle_rigidity = ankle_yielding_score
+
+        # 鞭打与随摆：>= whip_full → 满分，否则按比例递减至 0
+        if whipping >= whip_full:
+            whipping_velocity = 20.0
+        else:
+            whipping_velocity = self._clamp_radar((float(whipping) / whip_full) * 20.0)
+
+        # 助跑与进袭：占位符 —— 用总惩罚映射流畅度到 [floor, ceiling]，保持确定性可复现
+        # total_penalty≈0 → ceiling；惩罚升高逐步贴近 floor；永不低于 floor（鼓励性保底）
+        approach_rhythm = self._clamp_radar(
+            max(rhythm_floor, min(rhythm_ceiling, rhythm_ceiling - float(total_penalty) * rhythm_slope))
+        )
+
+        return {
+            "support_stability": support_stability,
+            "backswing_folding": backswing_folding,
+            "ankle_rigidity": ankle_rigidity,
+            "whipping_velocity": whipping_velocity,
+            "approach_rhythm": approach_rhythm,
+        }
+
+
+def calculate_biomechanical_score(
+    impact_frame_data: dict,
+    trajectory_data: dict,
+) -> tuple[float, dict]:
+    """模块级入口：委托 DeterministicScorer，便于测试与外部直接调用。"""
+    return DeterministicScorer().calculate_biomechanical_score(impact_frame_data, trajectory_data)

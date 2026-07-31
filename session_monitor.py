@@ -55,8 +55,12 @@ def flatten_eight_metrics(source: Mapping[str, Any] | None) -> dict[str, Optiona
         entry = pool.get(key)
         if isinstance(entry, Mapping):
             raw = entry.get("value")
+            if raw is None:
+                raw = entry.get("scoring_value")
             if raw is None and key == "ankle_rigidity":
                 raw = entry.get("variance")
+            if raw is None and key == "ankle_rigidity":
+                raw = entry.get("scoring_variance")
         else:
             raw = entry
         if isinstance(raw, (int, float)):

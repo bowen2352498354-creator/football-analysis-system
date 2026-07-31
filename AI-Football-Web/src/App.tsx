@@ -50,7 +50,11 @@ function App() {
         >
           {activeView === 'realtime' && <RealtimeWorkspace globalSettings={globalSettings} />}
           {activeView === 'zen' && <ZenWorkspace globalSettings={globalSettings} />}
-          {activeView === 'coach' && <CoachDashboard />}
+          {activeView === 'coach' && (
+            <div className="flex h-full min-h-0 flex-1 flex-col overflow-hidden">
+              <CoachDashboard />
+            </div>
+          )}
         </motion.main>
       </AnimatePresence>
     </div>

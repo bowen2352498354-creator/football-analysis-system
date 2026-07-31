@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useMemo, useRef, useState } from 'react'
 import {
   CartesianGrid,
   ComposedChart,
@@ -11,6 +11,7 @@ import {
   YAxis,
 } from 'recharts'
 import type { AngularVelocityPoint, KineticChainDiagnosis } from '../types'
+import { IMPACT_WINDOW_HALF } from './VideoWorkspace'
 
 export interface KineticVelocityChartProps {
   /** 髋/膝/踝角速度时序；缺省或空数组时展示零状态引导 */
@@ -23,6 +24,22 @@ export interface KineticVelocityChartProps {
    */
   highlightTimeMs?: number | null
   onHoverTimeMs?: (timeMs: number | null) => void
+  /**
+   * 点击 / 拖拽波形点时回调窗口内索引 x_index（0~60）。
+   * 调用方必须映射：absolute_frame = action_roi.start + x_index，
+   * 再 video.currentTime = absolute_frame / 30.0 —— 绝不用 x_index 直接跳视频。
+   */
+  onSeekXIndex?: (xIndex: number) => void
+  /**
+   * 视频播放驱动的窗口内游标索引（0~60）；越界传 null 则隐藏高亮线。
+   * 正确算法：x_index = floor(currentTime * 30) - action_roi.start
+   */
+  highlightXIndex?: number | null
+  /**
+   * 触球点在当前窗口内的索引（红色虚线）；缺省 30。
+   * 对应后端 impact_index_in_window。
+   */
+  impactIndexInWindow?: number | null
   compact?: boolean
   className?: string
 }
@@ -35,7 +52,7 @@ function sanitizeProfile(raw: AngularVelocityPoint[] | null | undefined): Angula
     const time_ms = typeof row.time_ms === 'number' ? row.time_ms : Number(row.time_ms)
     if (!Number.isFinite(time_ms)) continue
     out.push({
-      frame: typeof row.frame === 'number' ? row.frame : out.length + 1,
+      frame: typeof row.frame === 'number' ? row.frame : out.length,
       time_ms,
       hip_vel: Number.isFinite(Number(row.hip_vel)) ? Number(row.hip_vel) : 0,
       knee_vel: Number.isFinite(Number(row.knee_vel)) ? Number(row.knee_vel) : 0,
@@ -61,31 +78,81 @@ function diagnosisTone(status: string | undefined): { border: string; bg: string
   return { border: 'border-white/10', bg: 'bg-white/5', text: 'text-white/50' }
 }
 
+function resolveXIndexFromPayload(
+  state: { activeTooltipIndex?: number | string | null; activeLabel?: unknown } | null | undefined,
+  data: AngularVelocityPoint[],
+): number | null {
+  if (!state || data.length === 0) return null
+  const tipIdx = state.activeTooltipIndex
+  if (typeof tipIdx === 'number' && tipIdx >= 0 && tipIdx < data.length) return tipIdx
+  if (typeof tipIdx === 'string' && tipIdx !== '') {
+    const parsed = Number(tipIdx)
+    if (Number.isFinite(parsed) && parsed >= 0 && parsed < data.length) return Math.round(parsed)
+  }
+  const label = state.activeLabel
+  const ms = typeof label === 'number' ? label : Number(label)
+  if (!Number.isFinite(ms)) return null
+  let best = 0
+  let bestDist = Number.POSITIVE_INFINITY
+  for (let i = 0; i < data.length; i += 1) {
+    const dist = Math.abs(data[i].time_ms - ms)
+    if (dist < bestDist) {
+      bestDist = dist
+      best = i
+    }
+  }
+  return best
+}
+
 /**
  * 动力链多关节角速度时序图：三曲线同步 + 触球零点参考线 + 诊断印章。
- * 支持 Hover / 外部播控高亮指示线；老 JSON 无时序时平滑零状态，绝不抛错。
+ * 点击 / 拖拽仅回调窗口内 x_index（0~60）；绝对帧映射由 VideoWorkspace 完成。
  */
 export default function KineticVelocityChart({
   profile,
   diagnosis = null,
   highlightTimeMs = null,
   onHoverTimeMs,
+  onSeekXIndex,
+  highlightXIndex = null,
+  impactIndexInWindow = IMPACT_WINDOW_HALF,
   compact = false,
   className = '',
 }: KineticVelocityChartProps) {
   const data = useMemo(() => sanitizeProfile(profile), [profile])
   const [localHoverMs, setLocalHoverMs] = useState<number | null>(null)
+  const draggingRef = useRef(false)
+
+  /** 优先使用绝对帧映射得到的窗口索引高亮；否则回退 time_ms Hover */
+  const activeMsFromXIndex =
+    typeof highlightXIndex === 'number' &&
+    highlightXIndex >= 0 &&
+    highlightXIndex < data.length
+      ? data[highlightXIndex]?.time_ms ?? null
+      : null
 
   const activeMs =
     typeof localHoverMs === 'number'
       ? localHoverMs
-      : typeof highlightTimeMs === 'number'
-        ? highlightTimeMs
-        : null
+      : typeof activeMsFromXIndex === 'number'
+        ? activeMsFromXIndex
+        : typeof highlightTimeMs === 'number'
+          ? highlightTimeMs
+          : null
 
   const status = diagnosis?.status
   const tone = diagnosisTone(status)
   const hasData = data.length >= 2
+  const impactX =
+    typeof impactIndexInWindow === 'number' && Number.isFinite(impactIndexInWindow)
+      ? Math.max(0, Math.min(data.length > 0 ? data.length - 1 : IMPACT_WINDOW_HALF, Math.round(impactIndexInWindow)))
+      : IMPACT_WINDOW_HALF
+  const impactTimeMs = data[impactX]?.time_ms ?? 0
+
+  const emitSeek = (xIndex: number | null) => {
+    if (xIndex == null || !onSeekXIndex) return
+    onSeekXIndex(Math.max(0, Math.min(Math.max(0, data.length - 1), Math.round(xIndex))))
+  }
 
   return (
     <div className={`kinetic-velocity-chart ${compact ? 'kinetic-velocity-chart--compact' : ''} ${className}`.trim()}>
@@ -109,7 +176,7 @@ export default function KineticVelocityChart({
             <p className="text-sm text-white/45">暂无关节角速度时序</p>
             <p className="max-w-sm text-[11px] leading-relaxed text-white/25">
               老版本归档 JSON 可能不含 angularVelocityProfile。完成新一次分析后，将在此绘制髋（红虚线）/ 膝（黄）/
-              踝（绿）三曲线，并以触球瞬间为绝对零点。
+              踝（绿）三曲线，并以触球瞬间为绝对零点。点击 / 拖拽曲线可联动视频跳转到窗口帧。
             </p>
           </div>
         ) : (
@@ -117,14 +184,32 @@ export default function KineticVelocityChart({
             <ComposedChart
               data={data}
               margin={{ top: 8, right: 12, left: 0, bottom: 4 }}
+              onMouseDown={(state) => {
+                draggingRef.current = true
+                emitSeek(resolveXIndexFromPayload(state, data))
+              }}
               onMouseMove={(state) => {
                 const label = state?.activeLabel
                 const ms = typeof label === 'number' ? label : Number(label)
-                if (!Number.isFinite(ms)) return
-                setLocalHoverMs(ms)
-                onHoverTimeMs?.(ms)
+                if (Number.isFinite(ms)) {
+                  setLocalHoverMs(ms)
+                  onHoverTimeMs?.(ms)
+                }
+                if (draggingRef.current) {
+                  emitSeek(resolveXIndexFromPayload(state, data))
+                }
+              }}
+              onMouseUp={(state) => {
+                if (draggingRef.current) {
+                  emitSeek(resolveXIndexFromPayload(state, data))
+                }
+                draggingRef.current = false
+              }}
+              onClick={(state) => {
+                emitSeek(resolveXIndexFromPayload(state, data))
               }}
               onMouseLeave={() => {
+                draggingRef.current = false
                 setLocalHoverMs(null)
                 onHoverTimeMs?.(null)
               }}
@@ -137,7 +222,7 @@ export default function KineticVelocityChart({
                 tick={{ fill: 'rgba(255,255,255,0.35)', fontSize: 10 }}
                 tickFormatter={(v) => `${v}`}
                 label={{
-                  value: 'time_ms（触球=0）',
+                  value: 'time_ms（触球=0）· 窗内 0~60',
                   position: 'insideBottomRight',
                   offset: -2,
                   style: { fill: 'rgba(255,255,255,0.25)', fontSize: 10 },
@@ -166,15 +251,16 @@ export default function KineticVelocityChart({
                 wrapperStyle={{ fontSize: 11, color: 'rgba(255,255,255,0.55)' }}
                 iconType="plainline"
               />
-              {/* ⚽ 触球瞬间绝对零点 */}
+              {/* ⚽ 触球瞬间（红色虚线，对应 backend impact 窗内索引） */}
               <ReferenceLine
-                x={0}
-                stroke="rgba(255,255,255,0.85)"
-                strokeWidth={1.5}
+                x={impactTimeMs}
+                stroke="rgba(239,68,68,0.95)"
+                strokeWidth={1.75}
+                strokeDasharray="5 4"
                 label={{
                   value: '⚽ 触球瞬间',
                   position: 'insideTopLeft',
-                  fill: 'rgba(255,255,255,0.75)',
+                  fill: 'rgba(248,113,113,0.9)',
                   fontSize: 11,
                 }}
               />
@@ -224,19 +310,38 @@ export default function KineticVelocityChart({
 }
 
 /**
+ * 将视频播放进度映射为窗口内 x_index / 相对触球 time_ms。
+ * absolute_frame = floor(currentTime * fps)；x_index = absolute_frame - actionRoiStart。
+ * 越出 0~60（或数据长度）返回 null —— 调用方应隐藏高亮游标。
+ */
+export function mapVideoTimeToWaveformXIndex(
+  currentTimeSec: number,
+  actionRoiStart: number,
+  fps = 30,
+  windowLength = IMPACT_WINDOW_HALF * 2 + 1,
+): number | null {
+  if (!Number.isFinite(currentTimeSec) || !Number.isFinite(actionRoiStart)) return null
+  const xIndex = Math.floor(currentTimeSec * fps) - Math.round(actionRoiStart)
+  if (xIndex < 0 || xIndex >= windowLength) return null
+  return xIndex
+}
+
+/**
  * 将视频播放进度粗映射为相对触球的 time_ms，供播控协同高亮。
- * 无时序数据时返回 null（调用方安全忽略）。
+ * 必须传入 action_roi.start；禁止用整段视频进度线性拉伸到波形轴（会造成绝对错位）。
  */
 export function estimateHighlightTimeMs(
   profile: AngularVelocityPoint[] | null | undefined,
   positionMs: number | null | undefined,
-  durationMs: number | null | undefined,
+  _durationMs: number | null | undefined,
+  actionRoiStart?: number | null,
+  fps = 30,
 ): number | null {
   const data = sanitizeProfile(profile)
   if (data.length < 2) return null
-  if (typeof positionMs !== 'number' || typeof durationMs !== 'number' || durationMs <= 0) return null
-  const tMin = data[0].time_ms
-  const tMax = data[data.length - 1].time_ms
-  const progress = Math.max(0, Math.min(1, positionMs / durationMs))
-  return Math.round(tMin + progress * (tMax - tMin))
+  if (typeof positionMs !== 'number' || !Number.isFinite(positionMs)) return null
+  if (typeof actionRoiStart !== 'number' || !Number.isFinite(actionRoiStart)) return null
+  const xIndex = mapVideoTimeToWaveformXIndex(positionMs / 1000, actionRoiStart, fps, data.length)
+  if (xIndex == null) return null
+  return data[xIndex]?.time_ms ?? null
 }

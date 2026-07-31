@@ -59,6 +59,20 @@ _LIVE_POST_PEAK_FRAMES: int = 8  # 峰值后再观察若干帧再锁帧，避免
 _REPLAY_BUFFER_MAX: int = 60  # GROUP_A 时空胶囊半速回放缓冲
 # ~10s @30fps：运动学轨迹有界，防止整堂课无限 append 导致 OOM
 _TRAJECTORY_MAXLEN: int = 300
+# 【Sprint 5】连续空帧 / 读取失败阈值：达到后发 camera_lost_signal 并自愈重开，绝不裸崩溃
+_CAMERA_READ_FAIL_LIMIT: int = 50
+_CAMERA_REOPEN_SLEEP_SEC: float = 0.45
+
+
+def _is_empty_or_failed_frame(ret: bool, frame: Any) -> bool:
+    """判定 cap.read() 是否得到可用画面（空帧 / None / 零尺寸均视为失败）。"""
+    if not ret or frame is None:
+        return True
+    if not isinstance(frame, np.ndarray):
+        return True
+    if frame.size == 0:
+        return True
+    return False
 
 
 class InferenceWorker(QThread):
@@ -73,6 +87,9 @@ class InferenceWorker(QThread):
             课堂疲劳变形熔断报警（由 FatigueMonitor 转发）。
         error_occurred_signal(str)
             帧异常 / 计算越界时的安全报错，绝不让线程裸崩溃拖死 GUI。
+        camera_lost_signal(str)
+            连续空帧达到阈值时上抛；主线程提示「摄像头信号丢失，尝试重连...」，
+            Worker 内部执行 cap.release()+cap.open() 自愈，不结束训练会话。
         log_message(str)
             运行日志（兼容原主窗口日志区）。
     """
@@ -83,6 +100,8 @@ class InferenceWorker(QThread):
     fatigue_warning_signal = pyqtSignal(dict)
     capture_discarded_signal = pyqtSignal(str)
     error_occurred_signal = pyqtSignal(str)
+    # 【Sprint 5】摄像头丢信号自愈（非致命，不断开会话）
+    camera_lost_signal = pyqtSignal(str)
     log_message = pyqtSignal(str)
     # 【V3.1 Sprint 2】无感自动切片：FSM 状态 / 切片落盘完成（均不阻塞 GUI）
     fsm_state_changed_signal = pyqtSignal(str)
@@ -175,10 +194,11 @@ class InferenceWorker(QThread):
         self.fatigue_monitor.reset_session(student_id=sid)
 
         # 【V3.1 Sprint 2】滚动时间机器 + 射门 FSM（异步落盘，不阻塞本 QThread）
+        # rolling_maxlen 不再传入，由引擎按 fps 自动推导（≈5s 帧数）；
+        # 真实 fps 在打开摄像头/视频文件后由 _apply_fps() setter 即时修正。
         self._auto_capture = AutoShotCaptureEngine(
             output_dir=getattr(pt, "AUTO_CAPTURE_CLIPS_DIR", None),
             fps=self._video_fps,
-            rolling_maxlen=int(getattr(pt, "SHOT_FRAME_BUFFER_MAX", 150)),
             pre_frames=int(getattr(pt, "SHOT_PRE_IMPACT_FRAMES", 60)),
             post_frames=int(getattr(pt, "SHOT_POST_IMPACT_FRAMES", 30)),
             cooldown_sec=float(getattr(pt, "SHOT_IMPACT_COOLDOWN_SEC", 3.5)),
@@ -474,6 +494,31 @@ class InferenceWorker(QThread):
             return
         self.frame_ready_signal.emit(frame_bgr.copy())
 
+    def _try_reopen_camera(self, cap: Any) -> Tuple[Any, bool]:
+        """Sprint 5 自愈：释放后重新 open 摄像头。返回 (新 cap, 是否成功)。"""
+        try:
+            if cap is not None:
+                cap.release()
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(_CAMERA_REOPEN_SLEEP_SEC)
+        try:
+            new_cap, video_fps, _reported = pt.open_video_capture_deterministic(
+                "", is_camera=True, camera_index=self.camera_index
+            )
+            if video_fps and video_fps > 1:
+                self._video_fps = float(video_fps)
+                self._fixed_frame_dt = 1.0 / float(self._video_fps)
+                self._auto_capture.fps = float(self._video_fps)
+            if new_cap is not None and new_cap.isOpened():
+                self.log_message.emit(
+                    f"摄像头自愈成功：已重新打开设备 #{self.camera_index}。"
+                )
+                return new_cap, True
+        except Exception as reopen_exc:  # noqa: BLE001
+            self.log_message.emit(f"摄像头自愈打开失败：{reopen_exc}")
+        return None, False
+
     def _build_biomechanics_payload(self, t_impact: int) -> dict[str, Any]:
         """KinematicSignalProcessor → ImpactFrameLocator → DeterministicScorer。"""
         n = len(self._trajectory_omega)
@@ -504,6 +549,8 @@ class InferenceWorker(QThread):
             "total_frames": n,
             "impact_knee_angle": impact_knee,
             "contact_frame_index": t_impact,
+            # 【Phase 4】真实采集帧率传入 Scorer，踝冲击窗按时长自适应
+            "fps": float(self._video_fps) if self._video_fps and self._video_fps > 1 else 30.0,
         }
         trajectory_data = {
             "knee_angles": list(self._trajectory_angles[:n]),
@@ -511,6 +558,7 @@ class InferenceWorker(QThread):
             "timestamps_sec": [i * dt for i in range(n)],
             "total_frames": n,
             "t_impact": t_impact,
+            "fps": float(self._video_fps) if self._video_fps and self._video_fps > 1 else 30.0,
             "whipping_velocity": float(
                 max((abs(v) for v in omega_smooth), default=0.0)
             ),
@@ -800,8 +848,10 @@ class InferenceWorker(QThread):
 
             frame_interval_ms = int(round(1000.0 / float(video_fps)))
             frame_timestamp_ms = 0
+            consecutive_read_fails = 0
+            camera_lost_emitted = False
 
-            while self._running and cap.isOpened():
+            while self._running and cap is not None and cap.isOpened():
                 if self._is_paused_for_capsule():
                     time.sleep(0.05)
                     continue
@@ -811,20 +861,45 @@ class InferenceWorker(QThread):
                 try:
                     ret, frame = cap.read()
                 except Exception as read_exc:  # noqa: BLE001
-                    self.error_occurred_signal.emit(f"读取视频帧异常：{read_exc}")
-                    break
+                    ret, frame = False, None
+                    self.log_message.emit(f"读取视频帧异常（计入空帧计数）：{read_exc}")
 
-                if not ret:
+                if _is_empty_or_failed_frame(ret, frame):
                     if is_video_file_mode:
                         self.log_message.emit(
                             f"本地视频文件已播放完毕（同步读入 {sync_frame_count} 帧），"
                             "训练自动结束。"
                         )
-                    else:
-                        self.error_occurred_signal.emit(
-                            "读取画面失败，摄像头可能已断开。"
-                        )
-                    break
+                        break
+
+                    # 【Sprint 5】摄像头空帧 / 读取失败：累计至阈值后发信号并自愈，绝不裸崩
+                    consecutive_read_fails += 1
+                    if consecutive_read_fails >= _CAMERA_READ_FAIL_LIMIT:
+                        if not camera_lost_emitted:
+                            self.camera_lost_signal.emit(
+                                "摄像头信号丢失，尝试重连..."
+                            )
+                            camera_lost_emitted = True
+                            self.log_message.emit(
+                                f"连续 {consecutive_read_fails} 帧 cap.read() 失败，"
+                                "触发摄像头自愈（release → open）。"
+                            )
+                        cap, reopened = self._try_reopen_camera(cap)
+                        consecutive_read_fails = 0
+                        if not reopened:
+                            self.error_occurred_signal.emit(
+                                "摄像头自愈失败：无法重新打开设备，请检查连接后重试。"
+                            )
+                            break
+                        # 自愈后继续循环，等待下一帧；不中断 MediaPipe / 训练会话
+                        continue
+                    time.sleep(0.01)
+                    continue
+
+                consecutive_read_fails = 0
+                if camera_lost_emitted:
+                    camera_lost_emitted = False
+                    self.log_message.emit("摄像头信号已恢复，继续静默/实时推流。")
 
                 sync_frame_count += 1
                 frame_index = sync_frame_count - 1
@@ -894,12 +969,15 @@ class InferenceWorker(QThread):
 
                         elif self.group == "B":
                             # 断开骨骼连线：仅静默采集；画面已在拦截器处打码
+                            # Ghost Monitor：仍向主线程推送脱敏实况，供右下角画中画
                             self._record_b_group_data(angle, status)
                             if not is_video_file_mode:
                                 self._update_live_impact_detector(omega)
+                            self._emit_frame_ready(frame)
                     else:
                         self._append_neutral_trajectory()
-                        if self.group == "A":
+                        if self.group in ("A", "B"):
+                            # B 组无姿态时也推幽灵帧，证明引擎仍在跑
                             self._emit_frame_ready(frame)
 
                     # 【Sprint 2】时间机器：仅接受拦截器之后的安全帧入滚动缓冲
@@ -912,7 +990,7 @@ class InferenceWorker(QThread):
                         f"单帧处理异常（已跳过，画面继续）：{frame_exc}"
                     )
                     self._append_neutral_trajectory()
-                    if self.group in ("A", "C"):
+                    if self.group in ("A", "B", "C"):
                         try:
                             self._emit_frame_ready(frame)
                         except Exception:  # noqa: BLE001

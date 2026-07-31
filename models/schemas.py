@@ -88,6 +88,7 @@ class ShotAttemptLogCreate(BaseModel):
     support_knee_angle: Optional[float] = None
     hip_torsion_angle: Optional[float] = None
     total_score: Optional[float] = Field(None, ge=0, le=100)
+    is_deleted: bool = False
 
 
 class ShotAttemptLogRead(BaseModel):
@@ -107,6 +108,7 @@ class ShotAttemptLogRead(BaseModel):
     support_knee_angle: Optional[float] = None
     hip_torsion_angle: Optional[float] = None
     total_score: Optional[float] = None
+    is_deleted: bool = False
     recorded_at: datetime
 
 

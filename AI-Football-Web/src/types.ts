@@ -317,9 +317,12 @@ export interface GlobalTrainingRecord {
    */
   /** 测试日期，YYYY-MM-DD 格式字符串，用于顶栏「📅 测试日期」级联筛选器 */
   testDate?: string
+  /** 科研纵向节点 T0..T4（若后端/归档已写入） */
+  timepoint?: string
+  phase?: string
   /** 击球瞬间膝关节屈曲角度（度），优先为真实测量均值，缺失历史记录会退化为估算值 */
   kneeFlexionAngle?: number | null
-  /** 支撑脚离球距离（cm），当前版本为启发式估算值（尚未接入真实多点位测量） */
+  /** 支撑脚离球距离（cm）；有 PCR/上游实测时为真实值，缺测时可能为空（勿将启发式当作实测） */
   supportFootDistance?: number | null
   /** 支撑脚横向距离 / 前后偏移（SDT 成就引擎） */
   support_lateral_dist_cm?: number | null
@@ -360,7 +363,45 @@ export interface GlobalTrainingRecord {
   bandUpper?: number | null
   band_lower?: number | null
   bandLower?: number | null
+  /**
+   * Sprint 5 数据治理：软删除标记。
+   * true = 误测/脏数据，默认不出现在教练看板与科研宽表；物理记录仍保留供审计。
+   */
+  is_deleted?: boolean
+  isDeleted?: boolean
 }
+
+/** GET /api/coach/records 列表行（诊断快照已截断，不含大图 Base64） */
+export interface CoachSanitizerRecord {
+  id: string
+  timestamp: string
+  testDate?: string
+  studentId: string
+  school?: string
+  classGroup: string
+  type: FeedbackRecordType | string
+  groupTypeCode?: 1 | 2 | number | null
+  score: number | null
+  diagnosisSnapshot?: string
+  aiFeedback?: string
+  is_deleted?: boolean
+  path?: string | null
+  directory?: string | null
+  /** Phase 4：清道夫人工标定所需字段 */
+  supportFootDistance?: number | null
+  supportFootDistanceProvenance?: string | null
+  max_folding_angle?: number | null
+  maxFoldingAngleProvenance?: string | null
+  ankle_rigidity?: number | null
+  ankleRigidityProvenance?: string | null
+  lastCalibratedAt?: string | null
+  lastCalibratedMetric?: string | null
+}
+
+export type CoachCalibrateMetricKey =
+  | 'distance_cm'
+  | 'max_folding_angle'
+  | 'ankle_rigidity'
 
 /* ------------------------------------------------------------------ */
 /* 以下为「教练端科研指挥中心」v3.0 新增类型定义                          */
@@ -386,6 +427,36 @@ export interface IndividualSummaryReport {
   strengths: string
   weaknesses: string
   generatedAt: string
+}
+
+/**
+ * GET /api/progress/history 单点：按测试日聚合的个人进步图谱数据
+ * （Catapult 风格横轴：date + phase，如 07/21 (T1)）
+ */
+export interface ProgressHistoryPoint {
+  date: string
+  phase: string
+  timestamp: string
+  score: number | null
+  label: string
+  attemptCount?: number
+  kneeAngle?: number | null
+  positiveHighlight?: string | null
+  negativeHighlight?: string | null
+  biomechanicalErrors?: string[]
+  representativeRecordId?: string | null
+  aiFeedbackSnippet?: string | null
+}
+
+/** GET /api/progress/history 响应 */
+export interface ProgressHistoryResponse {
+  success: boolean
+  message?: string
+  studentId?: string
+  school?: string | null
+  classGroup?: string | null
+  points: ProgressHistoryPoint[]
+  count?: number
 }
 
 /** 教练端看板视角切换：全班集体宏观诊断 / 个体纵向进化追踪 */
@@ -483,15 +554,26 @@ export type BiomechStatusCode = 'GREEN_OPTIMAL' | 'YELLOW_APPROACHING' | 'RED_DE
 
 /** 单条量纲实测条目 */
 export interface BiomechIndicatorValue {
-  value: number
+  /** 对外实测值；缺测时可为 null（评分侧另有 scoring_value） */
+  value?: number | null
+  scoring_value?: number | null
   unit?: string
   status: BiomechStatusCode | string
   penalty?: number
   green_band?: Array<number | null>
   extreme_frame_index?: number | null
-  variance?: number
+  variance?: number | null
+  scoring_variance?: number | null
+  stiffness_status?: string | null
   ankle_angles_window?: number[]
+  /** Phase 1：measured|calibrated 才可视为可复述实测 */
+  provenance?: string
+  method?: string
+  confidence?: number
 }
+
+/** 整趟分析总体合规态：仅 PERFECT 允许右栏绿色「全部合规」提示 */
+export type OverallComplianceStatus = 'PERFECT' | 'IMPERFECT' | string
 
 /** POST /api/generate_report 返回的 scoreDetail 结构 */
 export interface ScoreDetailPayload {
@@ -499,6 +581,12 @@ export interface ScoreDetailPayload {
   t_impact?: number
   base_score?: number
   total_penalty?: number
+  /**
+   * 整趟合规总览。仅当明确为 `PERFECT`（或 8 项均非 RED/YELLOW）时，
+   * 前端才允许渲染绿色「全部合规」框。
+   */
+  overall_status?: OverallComplianceStatus | null
+  overallStatus?: OverallComplianceStatus | null
   indicators?: Partial<Record<BiomechIndicatorKey, BiomechIndicatorValue>>
   metric_extreme_frames?: Partial<Record<BiomechIndicatorKey, number>>
   /** V3.1 五维独立量化雷达（每维满分 20） */

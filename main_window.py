@@ -5,8 +5,12 @@ main_window.py
 
 【V3.1 Sprint 4】所有视频采集 / MediaPipe / 运动学清洗 / 触球锁帧 / 确定性打分
 均在 ``workers.inference_worker.InferenceWorker`` 从线程中完成；本窗口仅通过
-``frame_ready_signal`` / ``diagnostics_ready_signal`` 无锁总线被动更新 UI，
-并按 Active_Group 条件接线。主线程严禁 ``cv2.read()`` 或任何推理调用。
+``frame_ready_signal`` / ``diagnostics_ready_signal`` / ``camera_lost_signal``
+无锁总线被动更新 UI，并按 Active_Group 条件接线。主线程严禁 ``cv2.read()``
+或任何推理调用。
+
+【Sprint 5】GROUP_B 主画面保持黑屏静默；右下角 Ghost Monitor 画中画消费
+``frame_ready_signal`` 实时帧 + FPS，证明引擎存活但不干扰场上学员。
 """
 
 from __future__ import annotations
@@ -204,6 +208,9 @@ class MainWindow(QMainWindow):
         self._capsule_active = False
         self._checkpoint_store = checkpoint_store or default_store
         self._pending_recovery: SessionSnapshot | None = pending_recovery
+        # Sprint 5：Ghost Monitor 画中画可见性 + FPS 滑动窗口
+        self._ghost_monitor_visible = True
+        self._fps_timestamps: list[float] = []
         self._build_ui()
         self._apply_group_ui_policy()
         if self._pending_recovery is not None:
@@ -238,6 +245,66 @@ class MainWindow(QMainWindow):
         root_layout.addWidget(self.video_host, stretch=1)
 
         self.capsule_overlay = SpaceTimeCapsuleOverlay(self.video_host)
+
+        # 【Sprint 5】GROUP_B Ghost Monitor PiP：绝对定位于 video_host 右下角
+        self.camera_lost_banner = QLabel(self.video_host)
+        self.camera_lost_banner.setAlignment(Qt.AlignCenter)
+        self.camera_lost_banner.setStyleSheet(
+            "QLabel {"
+            "  background-color: rgba(180, 120, 20, 210);"
+            "  color: #fff8e1;"
+            "  font-size: 12px;"
+            "  padding: 6px 14px;"
+            "  border-radius: 8px;"
+            "  border: 1px solid #ffb74d;"
+            "}"
+        )
+        self.camera_lost_banner.hide()
+
+        self.ghost_toggle_btn = QPushButton("[隐藏监控]", self.video_host)
+        self.ghost_toggle_btn.setFixedHeight(24)
+        self.ghost_toggle_btn.setStyleSheet(
+            "QPushButton {"
+            "  background-color: rgba(0,0,0,170);"
+            "  color: #80cbc4;"
+            "  font-size: 10px;"
+            "  border: 1px solid #455a64;"
+            "  border-radius: 4px;"
+            "  padding: 2px 8px;"
+            "}"
+            "QPushButton:hover { border-color: #26a69a; color: #b2dfdb; }"
+        )
+        self.ghost_toggle_btn.clicked.connect(self._toggle_ghost_monitor)
+        self.ghost_toggle_btn.hide()
+
+        self.ghost_pip_label = QLabel(self.video_host)
+        self.ghost_pip_label.setAlignment(Qt.AlignCenter)
+        self.ghost_pip_label.setFixedSize(280, 158)
+        self.ghost_pip_label.setStyleSheet(
+            "QLabel {"
+            "  background-color: #0a0a0a;"
+            "  color: #666;"
+            "  font-size: 10px;"
+            "  border: 1px solid #26a69a;"
+            "}"
+        )
+        self.ghost_pip_label.setText("Ghost Monitor\n等待推流…")
+        self.ghost_pip_label.hide()
+
+        self.ghost_fps_label = QLabel("-- FPS", self.video_host)
+        self.ghost_fps_label.setStyleSheet(
+            "QLabel {"
+            "  background-color: rgba(0,0,0,200);"
+            "  color: #4db6ac;"
+            "  font-size: 9px;"
+            "  font-weight: 700;"
+            "  padding: 2px 6px;"
+            "  border-radius: 3px;"
+            "}"
+        )
+        self.ghost_fps_label.hide()
+
+        QTimer.singleShot(0, self._layout_ghost_monitor)
 
     def _build_control_panel(self) -> QWidget:
         panel = QWidget()
@@ -463,6 +530,7 @@ class MainWindow(QMainWindow):
         # 【Sprint 4】无锁信号总线：主线程只 connect，收到数据后立刻刷新控件
         self.video_worker.frame_ready_signal.connect(self._on_frame_ready)
         self.video_worker.error_occurred_signal.connect(self._on_worker_error)
+        self.video_worker.camera_lost_signal.connect(self._on_camera_lost)
         self.video_worker.log_message.connect(self._append_log)
         self.video_worker.capture_discarded_signal.connect(self._on_capture_discarded)
         self.video_worker.finished.connect(self._on_worker_finished)
@@ -487,6 +555,15 @@ class MainWindow(QMainWindow):
 
         if policy.silent_recording:
             self._append_log("路由：GROUP_B 静默录制，骨骼指示已屏蔽")
+            self._ensure_b_group_black_canvas()
+            self._show_ghost_monitor_chrome(True)
+            self._fps_timestamps.clear()
+        else:
+            self._show_ghost_monitor_chrome(False)
+            self.video_label.setStyleSheet(
+                "background-color: #202020; color: #cccccc; font-size: 16px; "
+                "border: 1px solid #444;"
+            )
 
         self.video_worker.start()
         self._set_controls_enabled(is_training=True)
@@ -502,7 +579,14 @@ class MainWindow(QMainWindow):
     def _on_worker_finished(self) -> None:
         self._capsule_active = False
         self._set_controls_enabled(is_training=False)
+        self._show_ghost_monitor_chrome(False)
+        self.camera_lost_banner.hide()
+        self._fps_timestamps.clear()
         self.video_label.clear()
+        self.video_label.setStyleSheet(
+            "background-color: #202020; color: #cccccc; font-size: 16px; "
+            "border: 1px solid #444;"
+        )
         self.video_label.setText(
             "训练已结束，请选择数据源与实验组别后，点击「开始训练」"
         )
@@ -544,7 +628,10 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _on_frame_ready(self, frame_bgr: np.ndarray) -> None:
-        """frame_ready_signal：立刻把脱敏骨骼画面刷到 QLabel。"""
+        """frame_ready_signal：立刻把脱敏骨骼画面刷到 QLabel。
+
+        GROUP_B：主画面保持黑屏静默，实时帧仅刷入右下角 Ghost Monitor 画中画。
+        """
         if self._capsule_active:
             return
         if frame_bgr is None or not isinstance(frame_bgr, np.ndarray):
@@ -552,6 +639,26 @@ class MainWindow(QMainWindow):
         if frame_bgr.ndim != 3 or frame_bgr.shape[2] < 3:
             return
 
+        # 收到有效帧 → 清除丢信号提示，并刷新 FPS
+        if self.camera_lost_banner.isVisible():
+            self.camera_lost_banner.hide()
+        self._note_frame_for_fps()
+
+        if self.group_router.Active_Group == GROUP_B:
+            if self.video_label.pixmap() is not None or not self.video_label.text():
+                self._ensure_b_group_black_canvas()
+            if self._ghost_monitor_visible:
+                self._paint_ndarray_to_label(self.ghost_pip_label, frame_bgr)
+                self.ghost_pip_label.show()
+                self.ghost_fps_label.show()
+                self.ghost_toggle_btn.show()
+                self._layout_ghost_monitor()
+            return
+
+        self._paint_ndarray_to_label(self.video_label, frame_bgr)
+
+    def _paint_ndarray_to_label(self, label: QLabel, frame_bgr: np.ndarray) -> None:
+        """把 BGR 帧缩放到目标 QLabel（槽返回后局部引用交 GC）。"""
         rgb = np.ascontiguousarray(frame_bgr[:, :, ::-1])
         height, width, channels = rgb.shape
         bytes_per_line = channels * width
@@ -560,12 +667,99 @@ class MainWindow(QMainWindow):
         ).copy()
         pixmap = QPixmap.fromImage(qimage)
         scaled = pixmap.scaled(
-            self.video_label.size(),
+            label.size(),
             Qt.KeepAspectRatio,
             Qt.SmoothTransformation,
         )
-        self.video_label.setPixmap(scaled)
-        # 槽返回后局部 frame_bgr / rgb 失去引用 → GC（QImage 已 .copy）
+        label.setPixmap(scaled)
+
+    def _ensure_b_group_black_canvas(self) -> None:
+        """B 组主视口固定黑屏文案，避免全尺寸实况暴露给场上学员。"""
+        self.video_label.clear()
+        self.video_label.setText("静默采集中，请专心练习")
+        self.video_label.setStyleSheet(
+            "background-color: #000000; color: #e0e0e0; font-size: 18px; "
+            "border: 1px solid #333;"
+        )
+
+    def _note_frame_for_fps(self) -> None:
+        now = time.time()
+        self._fps_timestamps = [t for t in self._fps_timestamps if now - t < 1.0]
+        self._fps_timestamps.append(now)
+        self.ghost_fps_label.setText(f"{len(self._fps_timestamps)} FPS")
+
+    def _toggle_ghost_monitor(self) -> None:
+        self._ghost_monitor_visible = not self._ghost_monitor_visible
+        self.ghost_toggle_btn.setText(
+            "[隐藏监控]" if self._ghost_monitor_visible else "[显示监控]"
+        )
+        if self._ghost_monitor_visible and self.group_router.Active_Group == GROUP_B:
+            self.ghost_pip_label.show()
+            self.ghost_fps_label.show()
+        else:
+            self.ghost_pip_label.hide()
+            self.ghost_fps_label.hide()
+        self._layout_ghost_monitor()
+
+    def _show_ghost_monitor_chrome(self, visible: bool) -> None:
+        if visible and self.group_router.Active_Group == GROUP_B:
+            self.ghost_toggle_btn.show()
+            if self._ghost_monitor_visible:
+                self.ghost_pip_label.show()
+                self.ghost_fps_label.show()
+            self._layout_ghost_monitor()
+        else:
+            self.ghost_toggle_btn.hide()
+            self.ghost_pip_label.hide()
+            self.ghost_fps_label.hide()
+
+    def _layout_ghost_monitor(self) -> None:
+        """把幽灵监控控件钉在 video_host 右下角（宽不超过 300px）。"""
+        host = self.video_host
+        if host is None:
+            return
+        margin = 14
+        pip_w = min(280, max(160, host.width() - 40))
+        pip_h = int(pip_w * 9 / 16)
+        self.ghost_pip_label.setFixedSize(pip_w, pip_h)
+
+        btn_w = self.ghost_toggle_btn.sizeHint().width() + 8
+        btn_h = 24
+        x = max(margin, host.width() - pip_w - margin)
+        y_pip = max(margin, host.height() - pip_h - margin)
+        y_btn = max(4, y_pip - btn_h - 4)
+
+        self.ghost_toggle_btn.setGeometry(x + pip_w - btn_w, y_btn, btn_w, btn_h)
+        self.ghost_pip_label.move(x, y_pip)
+        self.ghost_fps_label.adjustSize()
+        self.ghost_fps_label.move(x + 6, y_pip + 6)
+        self.ghost_toggle_btn.raise_()
+        self.ghost_pip_label.raise_()
+        self.ghost_fps_label.raise_()
+
+        banner_w = min(420, max(200, host.width() - 80))
+        self.camera_lost_banner.adjustSize()
+        self.camera_lost_banner.setFixedWidth(banner_w)
+        self.camera_lost_banner.move(
+            max(20, (host.width() - banner_w) // 2),
+            48,
+        )
+        self.camera_lost_banner.raise_()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._layout_ghost_monitor()
+        if hasattr(self, "capsule_overlay") and self.capsule_overlay.isVisible():
+            self.capsule_overlay.setGeometry(self.video_host.rect())
+
+    def _on_camera_lost(self, message: str) -> None:
+        """camera_lost_signal：非致命提示，会话继续，等待 Worker 自愈重开。"""
+        text = message or "摄像头信号丢失，尝试重连..."
+        self._append_log(f"【摄像头自愈】{text}")
+        self.camera_lost_banner.setText(text)
+        self.camera_lost_banner.show()
+        self.ghost_fps_label.setText("-- FPS")
+        self._layout_ghost_monitor()
 
     def _on_diagnostics_ready(self, payload: dict) -> None:
         """diagnostics_ready_signal：射门锁定后的 8 大量纲 → 时空胶囊模态。"""

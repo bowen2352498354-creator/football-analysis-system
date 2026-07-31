@@ -1,18 +1,17 @@
 # -*- coding: utf-8 -*-
 """
 llm_agent.py
-v3.0 科研级生物力学诊断转译引擎（大模型代理模块）——职责严格解耦
+小学五年级足球教练隐喻转译引擎（大模型代理模块）——职责严格解耦
 
 【权限铁律】
     大语言模型完全不接触数值评分计算。评分由 error_diagnoser.DeterministicScorer
-    纯数学独占；本模块只允许接收其输出的 JSON 诊断报告，转译为严谨的
-    三节制科研诊断 Markdown（客观实测 / 致错根因 / 临床纠正）。
+    纯数学独占；本模块只允许接收其输出的缺陷 JSON，转译为鼓励孩子的一句隐喻。
 
 功能说明：
     1. 使用官方 openai Python 库调用 DeepSeek（OpenAI 兼容协议）；
-    2. 核心函数 generate_feedback(diagnosis_json)：输入诊断 JSON，返回三节制科研诊断 Markdown；
-    3. System Prompt 强制：高校运动生物力学专家口径；绝对禁止比喻、拟人、情绪化修辞；
-    4. temperature 强制锁定 LLM_TEMPERATURE=0.1，彻底压制发散性自回归输出。
+    2. 核心函数 generate_feedback(diagnosis_json)：输入诊断 JSON，返回一句隐喻短语；
+    3. System Prompt 强制：小学五年级足球教练口径；绝对禁止专业术语；
+    4. temperature 强制锁定 LLM_TEMPERATURE=0.2。
 """
 
 import json
@@ -21,6 +20,10 @@ import re
 
 from dotenv import load_dotenv
 from openai import OpenAI
+
+from error_diagnoser import (
+    is_aigc_measurable_provenance,
+)
 
 # --------------------------------------------------------------------------
 # 第一步：配置 DeepSeek 的 API Key 与接口地址
@@ -51,51 +54,27 @@ DEEPSEEK_MODEL_NAME = "deepseek-chat"
 client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
 
 # --------------------------------------------------------------------------
-# 第二步：System Prompt —— V3.0 科研级生物力学诊断（严禁修辞发散）
+# 第二步：System Prompt —— 小学五年级足球教练（一句隐喻，不可违抗）
 # --------------------------------------------------------------------------
 
-# 【权限铁律】大模型完全不接触数值评分计算。它只能接收 error_diagnoser.py
-# 输出的 JSON 诊断报告，强制复述实测数值并给出力学致错根因与厘米级纠正指令。
-# temperature 强制锁定 0.1，彻底封杀发散性自回归输出。
-LLM_TEMPERATURE = 0.1
-
-# 三节制科研诊断输出的唯一合法骨架（SYSTEM / REPORT 共用）
-_CLINICAL_MARKDOWN_CONTRACT = """\
-【最高级别身份与禁令——违背即判定为严重错误】
-你是严谨的高校运动生物力学专家，正在撰写科研级诊断意见书。
-绝对禁止使用任何修辞手法、比喻（如木棍、弹簧、弹簧门、滑滑梯、扫把、弓弦、大树、铁板、瓶盖、陀螺、冻住的小木棍等）、拟人或情绪化词汇。
-绝对禁止寒暄、过渡句、鼓励语、口语化表达。
-禁止输出评分、扣分、评级或对评分结果的任何评论。
-禁止编造 JSON 中不存在的数值；JSON 缺测值时写“该指标未提供实测值”，不得虚构。
-必须使用简体中文、专业生物力学术语（矢状面、额状面、动量、转动惯量、重心投影、折叠鞭打等）。
-
-【输出格式——必须且只能输出以下纯 Markdown 文本，首行即【一、】，末行结束于第三节正文】
-【一、 客观实测面诊】
-（必须强制提取并复述传入 JSON 中的支撑脚横距、膝关节角度、折叠角、踝关节刚度等具体数值，并给出偏差定性。示例口径：“实测支撑脚距球心横距 28.5cm，严重偏宽。”禁止空泛描述。）
-
-【二、 生物力学致错根因】
-（纯力学原理解释，禁止比喻。示例口径：“支撑脚偏远导致身体重心过度侧倾，摆动腿无法在矢状面完成折叠鞭打，动量流失。”）
-
-【三、 临床纠正药方】
-（给出明确的厘米级或空间定位纠正指令。示例口径：“支撑脚落地需卡在球心侧方 15-20 厘米处。”禁止模糊建议。）
-
-【硬性否决条款】
-- 若输出中出现任何比喻/拟人/情绪词/寒暄/过渡句 → 整份报告作废级错误。
-- 若缺少上述三个标题中的任何一个 → 整份报告作废级错误。
-- 若第一节未复述至少一项具体数值（含单位 cm 或 °）→ 整份报告作废级错误。
-- 除上述三节 Markdown 外，不得输出任何其他字符（含前言、后记、代码围栏）。
-"""
+# 【权限铁律】大模型完全不接触数值评分计算。它只能把缺陷 JSON 翻译成鼓励孩子的隐喻。
+# temperature 强制锁定 0.2。
+LLM_TEMPERATURE = 0.2
 
 SYSTEM_PROMPT = (
-    "你是严谨的高校运动生物力学专家。绝对禁止使用任何修辞手法、比喻"
-    "（如木棍、弹簧、弹簧门、滑滑梯、扫把、弓弦、大树、铁板等）、拟人或情绪化词汇。"
-    "违背此规则将被判定为严重错误！\n\n"
-    "你只能依据传入的诊断 JSON 撰写报告；优先级聚焦："
-    "脚踝锁紧 > 支撑脚 > 摆动腿折叠 > 膝夹角。\n\n"
-    + _CLINICAL_MARKDOWN_CONTRACT
+    "你是一名小学五年级足球教练。你的唯一任务是将传入的缺陷JSON，翻译为鼓励孩子的【一句】童话或生活隐喻。\n"
+    "【绝对禁令】：严禁使用'矢状面'、'生物力学'、'实测值'、'方差'等任何专业术语。\n"
+    "【强制话术库参考】：\n"
+    " - 支撑脚问题：'像大树的根一样深深扎进泥土里'\n"
+    " - 折叠角/膝盖：'像把弓弦拉到最满，然后嗖的一下射出'\n"
+    " - 脚踝未锁紧：'把脚面变成一块坚硬的铁板'\n"
+    "直接输出隐喻短语，字数限制在 60 字以内，禁止任何列表或段落格式。"
 )
 
-# 红色缺陷优先级（与 SYSTEM_PROMPT 一致，供兜底规则使用）
+# 会话报告与单次反馈共用同一不可违抗命令
+REPORT_SYSTEM_PROMPT = SYSTEM_PROMPT
+
+# 红色缺陷优先级（供兜底规则选用对应话术）
 _RED_DEFECT_PRIORITY = (
     "ankle_rigidity",
     "distance_cm",
@@ -108,18 +87,18 @@ _RED_DEFECT_PRIORITY = (
 )
 
 _INDICATOR_LABEL_ZH = {
-    "ankle_rigidity": "踝关节跖屈刚度方差",
-    "distance_cm": "支撑脚距球心横距",
-    "toe_angle": "支撑脚尖朝向角",
-    "max_folding_angle": "摆动腿最大折叠角",
-    "impact_knee_angle": "触球瞬间膝关节角",
-    "support_knee_angle": "支撑腿膝关节角",
-    "hip_torsion_angle": "髋部相对扭转角",
-    "whipping_velocity": "鞭打峰值角速度",
+    "ankle_rigidity": "脚踝锁紧",
+    "distance_cm": "支撑脚站位",
+    "toe_angle": "支撑脚尖方向",
+    "max_folding_angle": "摆动腿折叠",
+    "impact_knee_angle": "触球膝盖",
+    "support_knee_angle": "支撑膝盖",
+    "hip_torsion_angle": "转髋",
+    "whipping_velocity": "摆腿速度",
 }
 
 _INDICATOR_UNIT = {
-    "ankle_rigidity": "",
+    "ankle_rigidity": "variance",  # 无量纲角速度方差；前端渲染为 σ²
     "distance_cm": "cm",
     "toe_angle": "°",
     "max_folding_angle": "°",
@@ -129,71 +108,68 @@ _INDICATOR_UNIT = {
     "whipping_velocity": "°/s",
 }
 
+# 缺陷键 → 强制话术库隐喻（模型失败时的规则化兜底）
+_METAPHOR_FALLBACK_BY_DEFECT = {
+    "ankle_rigidity": "把脚面变成一块坚硬的铁板，踢球时稳稳顶住小球。",
+    "distance_cm": "像大树的根一样深深扎进泥土里，站稳了再踢球。",
+    "toe_angle": "像大树的根一样深深扎进泥土里，脚尖对准前方目标。",
+    "max_folding_angle": "像把弓弦拉到最满，然后嗖的一下射出。",
+    "impact_knee_angle": "像把弓弦拉到最满，然后嗖的一下射出。",
+    "support_knee_angle": "像大树的根一样深深扎进泥土里，膝盖微微弯着更稳。",
+    "hip_torsion_angle": "像把弓弦拉到最满，然后嗖的一下射出。",
+    "whipping_velocity": "像把弓弦拉到最满，然后嗖的一下射出。",
+}
+
+# ── Fallback 分级：第二节「为什么会这样」，第三节「下次怎么做」 ────────────────
+# 【设计约束】LLM 不可用时，孩子仍必须拿到两件不同的信息：
+#   · 第二节 = 原因说明（用同一套隐喻解释这一脚为什么没踢好，只讲现象与成因）；
+#   · 第三节 = 行动指令（下一脚具体做什么，必须是孩子能立刻执行的一个动作）。
+# 两者严禁复用同一句话，否则等于只给了一半反馈。
+# 话术同样遵守 SYSTEM_PROMPT 铁律：不出现任何专业术语、不出现任何数值。
+_FALLBACK_CAUSE_BY_DEFECT = {
+    "ankle_rigidity": "你的脚面这一下软软的，像一块没绷紧的海绵，力气都被它自己吃掉了，没能传给小球。",
+    "distance_cm": "你站的位置离小球有点不合适，身子还在晃，就像小树的根没扎稳，风一吹就摇。",
+    "toe_angle": "你支撑那只脚的脚尖歪向了别处，身子被它带着跑偏，球自然也跟着往旁边跑。",
+    "max_folding_angle": "你的腿是直着甩出去的，就像弓弦只拉开一点点就放手，攒不住劲儿。",
+    "impact_knee_angle": "碰到球的那一瞬间膝盖伸得太开了，弓弦提前松掉，最后一下没能弹出来。",
+    "support_knee_angle": "你支撑的那条腿绷得太直，像一根硬木棍撑在地上，站不住也缓不住劲。",
+    "hip_torsion_angle": "你只用了腿在踢，腰和屁股没转过来，就像拧发条只拧了一半就放手。",
+    "whipping_velocity": "你的小腿甩过来的时候慢慢的，像慢慢推门而不是弹簧弹开，速度没攒够。",
+}
+
+_FALLBACK_ACTION_BY_DEFECT = {
+    "ankle_rigidity": "下一脚记住：踢之前先把脚面绷紧，把它想成一块坚硬的铁板，用铁板稳稳顶一下小球。",
+    "distance_cm": "下一脚记住：先站到球的旁边一小步的地方，双脚像大树的根扎进泥土里，站稳了再踢。",
+    "toe_angle": "下一脚记住：踢之前低头看一眼支撑脚的脚尖，让它直直指向你想让球去的地方，再出脚。",
+    "max_folding_angle": "下一脚记住：出脚前先把小腿往屁股方向折一下，像把弓弦拉到最满，再嗖的一下射出去。",
+    "impact_knee_angle": "下一脚记住：碰到球的那一刻膝盖再多留一点弯，等脚背贴上球，才把腿甩直。",
+    "support_knee_angle": "下一脚记住：支撑腿的膝盖微微弯一点点，像准备起跳那样，弯着站反而更稳更有劲。",
+    "hip_torsion_angle": "下一脚记住：先把肚子和肩膀一起转向球门，让腰带着腿一块儿甩出去，别只用腿。",
+    "whipping_velocity": "下一脚记住：把小腿当成弹簧，折起来之后猛地弹出去，越快越好，试着比刚才快一点。",
+}
+
+
+def _cause_fallback_for_defect(defect: str) -> str:
+    """第二节话术（原因说明）；未知缺陷键回落到折叠角。"""
+    return _FALLBACK_CAUSE_BY_DEFECT.get(
+        defect, _FALLBACK_CAUSE_BY_DEFECT["max_folding_angle"]
+    )
+
+
+def _action_fallback_for_defect(defect: str) -> str:
+    """第三节话术（行动指令）；未知缺陷键回落到折叠角。"""
+    return _FALLBACK_ACTION_BY_DEFECT.get(
+        defect, _FALLBACK_ACTION_BY_DEFECT["max_folding_angle"]
+    )
+
+
 _RED_DEFECT_FALLBACK_LINES = {
-    "ankle_rigidity": (
-        "【一、 客观实测面诊】\n"
-        "触球窗口踝关节角度方差偏大，跖屈锁定不足。\n\n"
-        "【二、 生物力学致错根因】\n"
-        "踝关节刚性不足导致触球瞬间足段形变吸收动能，动量向球体传递效率下降。\n\n"
-        "【三、 临床纠正药方】\n"
-        "触球前主动跖屈并维持踝关节锁定至随摆结束；触球面保持足背中段稳定接触。"
-    ),
-    "distance_cm": (
-        "【一、 客观实测面诊】\n"
-        "支撑脚距球心横距偏离目标区间（目标约 15-20cm）。\n\n"
-        "【二、 生物力学致错根因】\n"
-        "支撑脚横距过大导致躯干额状面侧倾，摆动腿难以在矢状面完成折叠鞭打，动量横向流失。\n\n"
-        "【三、 临床纠正药方】\n"
-        "支撑脚落地需卡在球心侧方 15-20 厘米处，脚尖指向踢球方向。"
-    ),
-    "toe_angle": (
-        "【一、 客观实测面诊】\n"
-        "支撑脚尖朝向角偏离踢球前进方向。\n\n"
-        "【二、 生物力学致错根因】\n"
-        "支撑脚外展/内收改变骨盆定向，髋-膝运动链偏离矢状面，击球矢量偏移。\n\n"
-        "【三、 临床纠正药方】\n"
-        "支撑脚尖指向目标方向，允许偏差不超过约 10°。"
-    ),
-    "max_folding_angle": (
-        "【一、 客观实测面诊】\n"
-        "摆动腿后摆最大折叠角不足。\n\n"
-        "【二、 生物力学致错根因】\n"
-        "膝屈曲不足使小腿转动惯量偏大，角速度峰值受限，鞭打链条中断。\n\n"
-        "【三、 临床纠正药方】\n"
-        "后摆极端位将摆动腿膝屈曲增大至充分折叠，再在矢状面加速伸展击球。"
-    ),
-    "impact_knee_angle": (
-        "【一、 客观实测面诊】\n"
-        "触球瞬间摆动腿膝关节角偏离最优区间。\n\n"
-        "【二、 生物力学致错根因】\n"
-        "触球膝角异常改变末端环节有效质量与接触几何，冲量方向失控。\n\n"
-        "【三、 临床纠正药方】\n"
-        "触球瞬间保持摆动腿膝关节适度屈曲，避免过伸直腿鞭打或过度蹲踞。"
-    ),
-    "support_knee_angle": (
-        "【一、 客观实测面诊】\n"
-        "支撑腿膝关节角偏离稳定支撑所需区间。\n\n"
-        "【二、 生物力学致错根因】\n"
-        "支撑膝过伸或过屈削弱下肢刚度，重心垂直投影不稳，影响摆动腿平面约束。\n\n"
-        "【三、 临床纠正药方】\n"
-        "支撑腿落地后保持微屈缓冲，膝关节角稳定在可控屈曲区间至击球完成。"
-    ),
-    "hip_torsion_angle": (
-        "【一、 客观实测面诊】\n"
-        "髋部相对扭转角不足或过度。\n\n"
-        "【二、 生物力学致错根因】\n"
-        "骨盆-髋扭转不足使躯干角动量无法有效向摆动腿传递。\n\n"
-        "【三、 临床纠正药方】\n"
-        "击球过程完成骨盆向击球侧有控制的旋转，幅度与助跑方向一致。"
-    ),
-    "whipping_velocity": (
-        "【一、 客观实测面诊】\n"
-        "摆动腿鞭打峰值角速度偏低。\n\n"
-        "【二、 生物力学致错根因】\n"
-        "近端环节制动与远端加速时序失调，角速度峰值无法在触球前形成。\n\n"
-        "【三、 临床纠正药方】\n"
-        "后摆折叠后，髋先行加速、膝继发伸展，确保触球前达到角速度峰值。"
-    ),
+    key: (
+        f"【一、 客观实测面诊】\n{phrase}\n\n"
+        f"【二、 生物力学致错根因】\n{_cause_fallback_for_defect(key)}\n\n"
+        f"【三、 临床纠正药方】\n{_action_fallback_for_defect(key)}"
+    )
+    for key, phrase in _METAPHOR_FALLBACK_BY_DEFECT.items()
 }
 
 
@@ -237,8 +213,22 @@ def _pick_primary_red_defect(diagnosis: dict) -> str | None:
     return code_map.get(code)
 
 
+# 三个「焦点指标」由 pack_focus_indicator 构造，AIGC 抗幻觉合同最严格：
+# 非 measured/calibrated 时必须完全省略 value 键，并标注 note="未提供实测值"。
+_FOCUS_INDICATOR_KEYS: frozenset[str] = frozenset(
+    {"distance_cm", "max_folding_angle", "ankle_rigidity"}
+)
+
+
 def _extract_indicator_payload(diagnosis: dict) -> dict:
-    """提取指标 status + 实测 value（供模型复述），剥离评分/扣分字段。"""
+    """提取指标 status + value（供隐喻转译），剥离评分/扣分字段。
+
+    【AIGC 抗幻觉合同】
+    · 焦点指标（_FOCUS_INDICATOR_KEYS）非实测 provenance → 完全省略 "value" 键，
+      添加 note="未提供实测值"，measured=False。
+    · metrics 回填（backfill）仅在 provenance 为实测/校准时允许，
+      以免把 default/scoring 数值悄悄注入 AIGC。
+    """
     detail = diagnosis.get("score_detail") or {}
     indicators = detail.get("indicators") or diagnosis.get("indicators") or {}
     metrics = diagnosis.get("metrics") or {}
@@ -248,23 +238,45 @@ def _extract_indicator_payload(diagnosis: dict) -> dict:
     for key, item in indicators.items():
         if not isinstance(item, dict):
             continue
+        provenance = str(item.get("provenance") or "").strip().lower() or "unknown"
+        measurable = is_aigc_measurable_provenance(provenance)
+
         value = item.get("value")
         if value is None and key == "ankle_rigidity":
             value = item.get("variance")
-        if value is None and key in metrics:
-            value = metrics.get(key)
-        if value is None and key == "distance_cm":
-            value = metrics.get("support_lateral_dist_cm")
+        # metrics 回填：仅在实测/校准 provenance 下允许，防止 default 数值流入 AIGC
+        if measurable:
+            if value is None and key in metrics:
+                value = metrics.get(key)
+            if value is None and key == "distance_cm":
+                value = metrics.get("support_lateral_dist_cm")
+
         entry = {
             "label_zh": _INDICATOR_LABEL_ZH.get(key, key),
             "status": item.get("status"),
             "unit": _INDICATOR_UNIT.get(key, ""),
+            "provenance": provenance,
         }
-        if value is not None:
+
+        if key in _FOCUS_INDICATOR_KEYS and not measurable:
+            # 焦点指标 + 非实测：完全省略 value，添加 note 标记
+            entry["measured"] = False
+            entry["note"] = "未提供实测值"
+        elif value is not None:
             try:
                 entry["value"] = round(float(value), 2)
+                entry["measured"] = measurable
             except (TypeError, ValueError):
                 entry["value"] = value
+                entry["measured"] = measurable
+        else:
+            entry["measured"] = False
+
+        # stiffness_status 仅在实测 ankle_rigidity 且字段非空时透出
+        if key == "ankle_rigidity" and measurable and item.get("stiffness_status"):
+            entry["stiffness_status"] = item.get("stiffness_status")
+        if item.get("method"):
+            entry["method"] = item.get("method")
         out[key] = entry
     return out
 
@@ -279,42 +291,143 @@ def _strip_code_fences(text: str) -> str:
 
 
 def _split_clinical_markdown(text: str) -> tuple[str, str]:
-    """将三节制 Markdown 拆成 (一+二 → painPoint, 三 → prescription)。"""
+    """兼容旧三节制拆分；新口径下一句隐喻同时写入 painPoint / prescription。"""
     cleaned = _strip_code_fences(text)
     match = re.search(r"【三[、．.\s]*临床纠正药方】", cleaned)
     if match:
         pain_point = cleaned[: match.start()].strip()
         prescription = cleaned[match.start() :].strip()
         return pain_point, prescription
-    return cleaned, cleaned
+    metaphor = _clamp_metaphor_phrase(cleaned)
+    return metaphor, metaphor
+
+
+def _clamp_metaphor_phrase(text: str) -> str:
+    """压成单句隐喻：去围栏、去列表标记，硬裁 60 字。"""
+    cleaned = _strip_code_fences(text)
+    cleaned = re.sub(r"^[\s\-•*·、。]+", "", cleaned)
+    cleaned = re.sub(r"\s+", "", cleaned.replace("\n", ""))
+    if len(cleaned) > 60:
+        cleaned = cleaned[:60]
+    return cleaned or _METAPHOR_FALLBACK_BY_DEFECT["max_folding_angle"]
+
+
+def _pick_metaphor_fallback(diagnosis: dict) -> str:
+    """按红色缺陷优先级挑选话术库隐喻；无红则看黄，再兜底折叠角话术。"""
+    defect = _pick_primary_red_defect(diagnosis)
+    if not defect:
+        detail = (diagnosis or {}).get("score_detail") or {}
+        indicators = detail.get("indicators") or (diagnosis or {}).get("indicators") or {}
+        if isinstance(indicators, dict):
+            for key in _RED_DEFECT_PRIORITY:
+                item = indicators.get(key) or {}
+                if isinstance(item, dict) and item.get("status") == "YELLOW_APPROACHING":
+                    defect = key
+                    break
+    if not defect:
+        defect = "max_folding_angle"
+    return _METAPHOR_FALLBACK_BY_DEFECT.get(
+        defect, _METAPHOR_FALLBACK_BY_DEFECT["max_folding_angle"]
+    )
 
 
 def _build_clinical_fallback_markdown(diagnosis: dict) -> str:
-    """无模型可用时，用规则拼出合规的三节制科研诊断 Markdown。"""
-    defect = _pick_primary_red_defect(diagnosis) or "max_folding_angle"
-    template = _RED_DEFECT_FALLBACK_LINES.get(
-        defect, _RED_DEFECT_FALLBACK_LINES["max_folding_angle"]
+    """无模型可用时生成结构化三段式报告。
+
+    【一、 客观实测面诊】—— 仅引用 measured/calibrated 数值；
+                          焦点指标非实测则写"未提供实测值"，绝不引用 scoring_value。
+    【二、 生物力学致错根因】—— 原因说明：用隐喻解释这一脚「为什么」没踢好。
+    【三、 临床纠正药方】   —— 行动指令：告诉孩子「下次怎么做」的单个可执行动作。
+                          二、三节话术分别取自 _FALLBACK_CAUSE_BY_DEFECT /
+                          _FALLBACK_ACTION_BY_DEFECT，严禁复用同一句。
+    """
+    diagnosis = diagnosis or {}
+    detail = diagnosis.get("score_detail") or {}
+    indicators = detail.get("indicators") or diagnosis.get("indicators") or {}
+
+    # ── 第一节：实测数据清单 ──────────────────────────────────────────────────
+    lines_sec1: list[str] = []
+    if isinstance(indicators, dict):
+        for key in (
+            "distance_cm",
+            "max_folding_angle",
+            "ankle_rigidity",
+            "impact_knee_angle",
+            "support_knee_angle",
+            "hip_torsion_angle",
+            "whipping_velocity",
+            "toe_angle",
+        ):
+            item = indicators.get(key)
+            if not isinstance(item, dict):
+                continue
+            label = _INDICATOR_LABEL_ZH.get(key, key)
+            provenance = str(item.get("provenance") or "").strip().lower() or "unknown"
+            measurable = is_aigc_measurable_provenance(provenance)
+            unit = _INDICATOR_UNIT.get(key, "")
+
+            if measurable:
+                raw = item.get("value")
+                if raw is None and key == "ankle_rigidity":
+                    raw = item.get("variance")
+                if raw is not None:
+                    try:
+                        val = round(float(raw), 2)
+                        # ankle_rigidity 是无量纲方差，与前端 MetricCardList 保持一致的 σ² 符号
+                        display = f"σ² {val}" if unit == "variance" else f"{val}{unit}"
+                    except (TypeError, ValueError):
+                        display = str(raw)
+                    lines_sec1.append(f"  · {label}：{display}")
+                else:
+                    lines_sec1.append(f"  · {label}：未提供实测值")
+            elif key in _FOCUS_INDICATOR_KEYS:
+                # 焦点指标非实测：明确标注，绝不引用 scoring_value
+                lines_sec1.append(f"  · {label}：未提供实测值")
+
+    sec1_body = "\n".join(lines_sec1) if lines_sec1 else "  · 本次未采集到实测数据"
+
+    # ── 第二节（原因说明）、第三节（行动指令）：按主要缺陷分别选话术 ──────────
+    # 【设计约束】二节 ≠ 三节：前者解释「为什么会这样」，后者告诉孩子「下次怎么做」。
+    defect = _pick_primary_red_defect(diagnosis)
+    if not defect:
+        if isinstance(indicators, dict):
+            for key in _RED_DEFECT_PRIORITY:
+                item = indicators.get(key) or {}
+                if isinstance(item, dict) and item.get("status") == "YELLOW_APPROACHING":
+                    defect = key
+                    break
+    if not defect:
+        defect = "max_folding_angle"
+
+    sec2_cause = _cause_fallback_for_defect(defect)
+    sec3_action = _action_fallback_for_defect(defect)
+
+    return (
+        f"【一、 客观实测面诊】\n{sec1_body}\n\n"
+        f"【二、 生物力学致错根因】\n{sec2_cause}\n\n"
+        f"【三、 临床纠正药方】\n{sec3_action}"
     )
-    indicators = _extract_indicator_payload(diagnosis)
-    measured_lines = []
-    for key, entry in indicators.items():
-        if entry.get("value") is None:
-            continue
-        unit = entry.get("unit") or ""
-        status = entry.get("status") or ""
-        measured_lines.append(
-            f"实测{entry.get('label_zh', key)} {entry['value']}{unit}（状态 {status}）"
-        )
-    if measured_lines:
-        section_one = "；".join(measured_lines[:4]) + "。"
-        template = re.sub(
-            r"【一、 客观实测面诊】\n.*?\n\n【二、",
-            f"【一、 客观实测面诊】\n{section_one}\n\n【二、",
-            template,
-            count=1,
-            flags=re.DOTALL,
-        )
-    return template
+
+
+def build_aigc_safe_payload(diagnosis: dict) -> dict:
+    """构造交给大模型的安全载荷（缺陷指标 + 状态，剥离评分计算字段）。"""
+    diagnosis = diagnosis if isinstance(diagnosis, dict) else {}
+    return {
+        "primary_error_code": diagnosis.get("primary_error_code"),
+        "t_impact": diagnosis.get("t_impact", diagnosis.get("t0_index")),
+        "red_defect_priority_hint": _pick_primary_red_defect(diagnosis),
+        "indicators": _extract_indicator_payload(diagnosis),
+    }
+
+
+def build_aigc_user_message(diagnosis: dict) -> str:
+    """与 generate_feedback 同源的 user message（供 E2E 断言，不发起网络请求）。"""
+    safe_payload = build_aigc_safe_payload(diagnosis)
+    return (
+        "下面是缺陷 JSON。请按系统命令输出【一句】鼓励孩子的童话或生活隐喻，"
+        "禁止专业术语，禁止列表或段落，60 字以内：\n"
+        f"{json.dumps(safe_payload, ensure_ascii=False)}"
+    )
 
 
 # --------------------------------------------------------------------------
@@ -323,16 +436,15 @@ def _build_clinical_fallback_markdown(diagnosis: dict) -> str:
 
 
 def generate_feedback(diagnosis_json, status=None):
-    """调用 DeepSeek：把 error_diagnoser 的 JSON 转译为三节制科研诊断 Markdown。
+    """调用 DeepSeek：把缺陷 JSON 翻译为鼓励孩子的一句隐喻。
 
-    【V3.0 权限解耦】
+    【权限解耦】
         - 本函数绝不计算、修改或返回任何数值评分。
         - 唯一合法输入是 error_diagnoser 输出的诊断 JSON（dict 或 JSON 字符串）。
-        - 兼容旧调用 generate_feedback(angle: float, status: str)：会包装成最小 JSON，
-          但不允许模型据此打分。
+        - 兼容旧调用 generate_feedback(angle: float, status: str)。
 
     返回：
-        str，纯 Markdown 三节制科研诊断文本（客观实测 / 致错根因 / 临床纠正）。
+        str，一句隐喻短语（≤60 字）。
     """
     # 旧签名兼容：generate_feedback(angle, status)
     if isinstance(diagnosis_json, (int, float)) and status is not None:
@@ -358,20 +470,7 @@ def generate_feedback(diagnosis_json, status=None):
     else:
         diagnosis = _normalize_diagnosis_json(diagnosis_json)
 
-    # 传入实测值供第一节复述；剥离 TotalScore / penalty，防止模型接触评分计算
-    safe_payload = {
-        "primary_error_code": diagnosis.get("primary_error_code"),
-        "t_impact": diagnosis.get("t_impact", diagnosis.get("t0_index")),
-        "red_defect_priority_hint": _pick_primary_red_defect(diagnosis),
-        "indicators": _extract_indicator_payload(diagnosis),
-    }
-
-    user_message = (
-        "下面是确定性诊断引擎输出的 JSON。你必须复述其中的实测数值，"
-        "用纯力学语言解释致错根因，并给出厘米级/角度级纠正指令。"
-        "禁止打分、禁止比喻、禁止寒暄。只输出规定的三节 Markdown：\n"
-        f"{json.dumps(safe_payload, ensure_ascii=False)}"
-    )
+    user_message = build_aigc_user_message(diagnosis)
 
     try:
         response = client.chat.completions.create(
@@ -382,7 +481,7 @@ def generate_feedback(diagnosis_json, status=None):
             ],
             temperature=LLM_TEMPERATURE,
         )
-        return _strip_code_fences(response.choices[0].message.content or "")
+        return _clamp_metaphor_phrase(response.choices[0].message.content or "")
 
     except Exception as exc:  # noqa: BLE001 - 网络/接口异常时需要兜底，不能让程序崩溃
         print(f"【llm_agent】调用 DeepSeek 接口失败，使用兜底提示语。错误信息：{exc}")
@@ -392,16 +491,6 @@ def generate_feedback(diagnosis_json, status=None):
 # --------------------------------------------------------------------------
 # 【v1.1 新增：前后端全栈联调】第三步半：整堂课/整次训练的综合诊断报告生成
 # --------------------------------------------------------------------------
-
-# 综合报告：与 SYSTEM_PROMPT 同一套科研禁令 + 三节制 Markdown（兼容层再拆 painPoint/prescription）
-REPORT_SYSTEM_PROMPT = (
-    "你是严谨的高校运动生物力学专家。绝对禁止使用任何修辞手法、比喻"
-    "（如木棍、弹簧、弹簧门、滑滑梯、扫把、弓弦、大树、铁板、冻住的小木棍等）、"
-    "拟人或情绪化词汇。违背此规则将被判定为严重错误！\n\n"
-    "你只能依据传入的诊断 JSON 撰写整次训练的科研诊断意见书；"
-    "优先级聚焦：脚踝锁紧 > 支撑脚 > 摆动腿折叠 > 膝夹角。\n\n"
-    + _CLINICAL_MARKDOWN_CONTRACT
-)
 
 
 def _deterministic_session_score_from_hits(hit_stats: dict) -> float:
@@ -419,30 +508,23 @@ def _deterministic_session_score_from_hits(hit_stats: dict) -> float:
 def _build_fallback_report(hit_stats, total_attempts, deterministic_score=None, diagnosis=None):
     """当 DeepSeek 接口调用失败或返回内容解析失败时的规则化兜底报告。
 
-    【V3.0】score 永远来自确定性数学；文案为无比喻的三节制科研 Markdown。
+    score 永远来自确定性数学；文案为一句鼓励隐喻。
     """
     if deterministic_score is not None:
         score = round(float(deterministic_score), 2)
     else:
         score = _deterministic_session_score_from_hits(hit_stats)
 
-    markdown = _build_clinical_fallback_markdown(diagnosis or {})
-    # 若无指标数据，在第一节补充会话红黄命中的客观陈述（仍禁止比喻）
+    metaphor = _build_clinical_fallback_markdown(diagnosis or {})
     if not (diagnosis or {}).get("score_detail") and not (diagnosis or {}).get("indicators"):
-        red = int(hit_stats.get("red", 0) or 0)
-        yellow = int(hit_stats.get("yellow", 0) or 0)
-        session_note = (
-            f"本次有效触球 {total_attempts} 次，其中 RED_DEVIATED {red} 次，"
-            f"YELLOW_APPROACHING {yellow} 次。"
-        )
-        markdown = re.sub(
-            r"【一、 客观实测面诊】\n",
-            f"【一、 客观实测面诊】\n{session_note}",
-            markdown,
-            count=1,
-        )
-    pain_point, prescription = _split_clinical_markdown(markdown)
-    return {"score": score, "painPoint": pain_point, "prescription": prescription}
+        if int(hit_stats.get("red", 0) or 0) > 0:
+            metaphor = _METAPHOR_FALLBACK_BY_DEFECT["distance_cm"]
+        elif int(hit_stats.get("yellow", 0) or 0) > 0:
+            metaphor = _METAPHOR_FALLBACK_BY_DEFECT["max_folding_angle"]
+        else:
+            metaphor = "像大树的根一样深深扎进泥土里，再像弓弦拉满嗖的一下射出。"
+        _ = total_attempts  # 保留参数语义，供调用方传入会话规模
+    return {"score": score, "painPoint": metaphor, "prescription": metaphor}
 
 
 def generate_session_report(
@@ -452,7 +534,7 @@ def generate_session_report(
     deterministic_score=None,
     diagnosis_json=None,
 ):
-    """把「一整次训练」的诊断 JSON / 红黄绿统计转译为科研诊断；评分绝不经 LLM。
+    """把「一整次训练」的缺陷 JSON / 红黄绿统计转译为一句鼓励隐喻；评分绝不经 LLM。
 
     参数：
         hit_stats：dict，形如 {"green": 12, "yellow": 3, "red": 2}
@@ -463,8 +545,7 @@ def generate_session_report(
         diagnosis_json：可选，error_diagnoser 输出的 JSON 诊断报告。
 
     返回：
-        dict，含 "score"（确定性数学）、"painPoint"（【一】+【二】）、
-        "prescription"（【三】）。LLM 原文为三节 Markdown，此处拆分以兼容既有 API。
+        dict，含 "score"（确定性数学）、"painPoint" / "prescription"（同一句隐喻）。
     """
     hit_stats = hit_stats or {}
     total_attempts = sum(hit_stats.get(k, 0) for k in ("green", "yellow", "red"))
@@ -475,18 +556,11 @@ def generate_session_report(
         score = _deterministic_session_score_from_hits(hit_stats)
 
     if total_attempts == 0 and not diagnosis_json:
+        empty_metaphor = "像大树的根一样深深扎进泥土里，再试一次你会更棒。"
         return {
             "score": 0.0,
-            "painPoint": (
-                "【一、 客观实测面诊】\n"
-                "本次训练未采集到有效触球数据，关键生物力学指标均未提供实测值。\n\n"
-                "【二、 生物力学致错根因】\n"
-                "数据不足，无法建立运动链致错因果推断。"
-            ),
-            "prescription": (
-                "【三、 临床纠正药方】\n"
-                "需重新完成至少一次完整踢球采样后再出具厘米级纠正指令。"
-            ),
+            "painPoint": empty_metaphor,
+            "prescription": empty_metaphor,
         }
 
     diagnosis = _normalize_diagnosis_json(diagnosis_json)
@@ -509,8 +583,8 @@ def generate_session_report(
             pass
 
     user_message = (
-        "下面是确定性诊断引擎输出的 JSON。必须复述 indicators 中的实测数值，"
-        "禁止打分，禁止比喻，禁止寒暄。只输出规定的三节 Markdown：\n"
+        "下面是缺陷 JSON。请按系统命令输出【一句】鼓励孩子的童话或生活隐喻，"
+        "禁止专业术语，禁止列表或段落，60 字以内：\n"
         f"{json.dumps(safe_payload, ensure_ascii=False)}"
     )
 
@@ -523,16 +597,12 @@ def generate_session_report(
             ],
             temperature=LLM_TEMPERATURE,
         )
-        raw_text = _strip_code_fences(response.choices[0].message.content or "")
-        if "【一、" not in raw_text or "【三、" not in raw_text:
-            raise ValueError("DeepSeek 返回内容未包含强制三节标题")
-
-        pain_point, prescription = _split_clinical_markdown(raw_text)
-        if not pain_point or not prescription:
-            raise ValueError("DeepSeek 返回的报告字段为空")
+        metaphor = _clamp_metaphor_phrase(response.choices[0].message.content or "")
+        if not metaphor:
+            raise ValueError("DeepSeek 返回的隐喻短语为空")
 
         # 【铁律】即便模型幻觉输出了 score，也一律丢弃，强制使用确定性分数
-        return {"score": score, "painPoint": pain_point, "prescription": prescription}
+        return {"score": score, "painPoint": metaphor, "prescription": metaphor}
 
     except Exception as exc:  # noqa: BLE001 - 网络异常/解析失败等都需要兜底
         print(f"【llm_agent】调用 DeepSeek 生成综合报告失败，使用规则化兜底报告。错误信息：{exc}")

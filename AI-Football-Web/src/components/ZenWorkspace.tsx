@@ -85,7 +85,18 @@ interface WsNoticeMessage {
   type: 'notice'
   message: string
 }
-type WsMessage = WsFrameMessage | WsStartedMessage | WsStoppedMessage | WsErrorMessage | WsNoticeMessage
+/** Sprint 5：摄像头连续空帧后后端自愈前推送的存活提示（不断开会话） */
+interface WsCameraLostMessage {
+  type: 'camera_lost'
+  message: string
+}
+type WsMessage =
+  | WsFrameMessage
+  | WsStartedMessage
+  | WsStoppedMessage
+  | WsErrorMessage
+  | WsNoticeMessage
+  | WsCameraLostMessage
 
 /** 当前采集状态：待机 / 正在录制单次尝试 / 正在为这一次尝试生成报告 */
 type CaptureStatus = 'idle' | 'recording' | 'archiving'
@@ -167,10 +178,17 @@ export default function ZenWorkspace({ globalSettings }: ZenWorkspaceProps) {
   /* ---------------------------- 后端连接与静默采集画面状态 ---------------------------- */
   const wsRef = useRef<WebSocket | null>(null)
   const sessionIdRef = useRef<string | null>(null)
+  /** 近 1 秒内到达的帧时间戳，用于 Ghost Monitor FPS 浮层 */
+  const fpsTimestampsRef = useRef<number[]>([])
   const [isConnected, setIsConnected] = useState(false)
   const [connectionError, setConnectionError] = useState<string | null>(null)
   const [frameImage, setFrameImage] = useState<string | null>(null)
   const [captureStatus, setCaptureStatus] = useState<CaptureStatus>('idle')
+  /** Sprint 5：画中画幽灵监控窗 —— 默认开启，教练可一键隐藏以免场上分心 */
+  const [ghostMonitorVisible, setGhostMonitorVisible] = useState(true)
+  const [streamFps, setStreamFps] = useState(0)
+  /** 摄像头丢信号自愈提示（非致命，不断开会话） */
+  const [cameraLostHint, setCameraLostHint] = useState<string | null>(null)
 
   /* ---------------------------- Apple 风格 Toast 提示条 ---------------------------- */
   const [toast, setToast] = useState<ToastState | null>(null)
@@ -258,6 +276,12 @@ export default function ZenWorkspace({ globalSettings }: ZenWorkspaceProps) {
           hitStats: report?.hitStats ?? null,
           kneeFlexionAngle: report?.avgKneeAngle ?? null,
           scoreDetail: report?.scoreDetail ?? null,
+          radar_scores: report?.scoreDetail?.radar_scores ?? null,
+          spatial_trajectory:
+            report?.spatial_trajectory ??
+            report?.spatialTrajectory ??
+            report?.scoreDetail?.spatial_trajectory ??
+            null,
         }),
       })
       const data = (await response.json()) as { success: boolean; message?: string; record?: GlobalTrainingRecord }
@@ -311,7 +335,22 @@ export default function ZenWorkspace({ globalSettings }: ZenWorkspaceProps) {
     if (message.type === 'frame') {
       if (typeof message.image === 'string' && message.image.startsWith('data:image')) {
         setFrameImage(message.image)
+        // 用近 1s 到达帧数估算实时 FPS，证明后台 MediaPipe 仍在流畅推流
+        const now = performance.now()
+        const recent = fpsTimestampsRef.current.filter((t) => now - t < 1000)
+        recent.push(now)
+        fpsTimestampsRef.current = recent
+        setStreamFps(recent.length)
+        // 收到有效帧说明自愈成功，清掉丢信号提示
+        setCameraLostHint(null)
       }
+      return
+    }
+
+    if (message.type === 'camera_lost') {
+      // 非致命：保持录制态与 WebSocket，仅提示教练系统正在自愈重连
+      setCameraLostHint(message.message || '摄像头信号丢失，尝试重连...')
+      setStreamFps(0)
       return
     }
 
@@ -324,6 +363,9 @@ export default function ZenWorkspace({ globalSettings }: ZenWorkspaceProps) {
       wsRef.current?.close()
       wsRef.current = null
       setIsConnected(false)
+      setCameraLostHint(null)
+      fpsTimestampsRef.current = []
+      setStreamFps(0)
       void finalizeCurrentAttempt(message.session_id)
       return
     }
@@ -331,6 +373,7 @@ export default function ZenWorkspace({ globalSettings }: ZenWorkspaceProps) {
     if (message.type === 'error') {
       setConnectionError(message.message)
       setCaptureStatus('idle')
+      setCameraLostHint(null)
       wsRef.current?.close()
       wsRef.current = null
       setIsConnected(false)
@@ -365,6 +408,9 @@ export default function ZenWorkspace({ globalSettings }: ZenWorkspaceProps) {
     if (!isLocked) return
     setConnectionError(null)
     setFrameImage(null)
+    setCameraLostHint(null)
+    fpsTimestampsRef.current = []
+    setStreamFps(0)
     sessionIdRef.current = null
 
     const socket = new WebSocket(WS_ANALYZE_URL)
@@ -846,7 +892,7 @@ export default function ZenWorkspace({ globalSettings }: ZenWorkspaceProps) {
               </div>
             )}
 
-            {/* ============================ 静默采集视口：低调呼吸荧光边框，绝无即时干预 ============================ */}
+            {/* ============================ 静默采集视口：黑屏结构性沉默 + 右下角幽灵监控画中画 ============================ */}
             <div className="relative">
               <motion.div
                 animate={{
@@ -859,40 +905,82 @@ export default function ZenWorkspace({ globalSettings }: ZenWorkspaceProps) {
                 transition={{ duration: 3.2, repeat: Infinity, ease: 'easeInOut' }}
                 className="relative min-h-[520px] overflow-hidden rounded-3xl border border-teal-400/30 bg-gradient-to-br from-zinc-900 via-black to-zinc-900"
               >
-                {frameImage ? (
-                  <img
-                    src={frameImage}
-                    alt="静默采集画面"
-                    className="absolute inset-0 h-full w-full bg-black object-contain"
-                    onError={() => setFrameImage(null)}
-                  />
-                ) : (
-                  <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 text-white/25">
-                    <span className="inline-flex flex-shrink-0">
-                      {videoSourceMode === 'file' ? <FileVideo className="h-16 w-16" /> : <Camera className="h-16 w-16" />}
-                    </span>
-                    <p className="max-w-sm text-center text-sm">
-                      {!isLocked
-                        ? '请先在上方输入学号并点击「锁定」，锁定后即可开始为该生连续记录 2~3 次尝试'
-                        : isRecording
-                          ? '数据采集中，请专注于动作发力本身……'
-                          : `学号已锁定，点击下方「记录本次尝试」开始 Attempt #${currentAttempts.length + 1}`}
-                    </p>
-                  </div>
-                )}
+                {/* 【B组科研红线】主视口永远黑屏静默：绝不把全尺寸实时画面暴露给场上小学生 */}
+                <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-black text-white/25">
+                  <span className="inline-flex flex-shrink-0">
+                    {videoSourceMode === 'file' ? <FileVideo className="h-16 w-16" /> : <Camera className="h-16 w-16" />}
+                  </span>
+                  <p className="max-w-sm text-center text-sm">
+                    {!isLocked
+                      ? '请先在上方输入学号并点击「锁定」，锁定后即可开始为该生连续记录 2~3 次尝试'
+                      : isRecording
+                        ? '静默采集中，请专心练习'
+                        : `学号已锁定，点击下方「记录本次尝试」开始 Attempt #${currentAttempts.length + 1}`}
+                  </p>
+                </div>
 
                 {/* 【B组科研红线】刻意不展示任何角度红/黄/绿即时警告卡，也不展示AI聊天气泡，
                     仅保留一个极简的低调状态徽标，提示"当前处于静默采集中" */}
-                <div className="absolute right-5 top-5 flex items-center gap-2 rounded-full border border-white/10 bg-black/40 px-3 py-1.5 text-xs text-teal-200 backdrop-blur-xl">
+                <div className="absolute right-5 top-5 z-10 flex items-center gap-2 rounded-full border border-white/10 bg-black/40 px-3 py-1.5 text-xs text-teal-200 backdrop-blur-xl">
                   <span className={`h-1.5 w-1.5 rounded-full ${isRecording ? 'animate-pulse bg-teal-400' : 'bg-white/30'}`} />
                   {isRecording ? '静默采集中' : isArchiving ? '正在静默生成本次尝试报告…' : isConnected ? '已连接' : '待机'}
                 </div>
 
                 {/* 学号锁定状态徽标：左上角显示当前正在为哪位同学连续记录 */}
                 {isLocked && (
-                  <div className="absolute left-5 top-5 flex items-center gap-2 rounded-full border border-teal-400/30 bg-black/40 px-3 py-1.5 text-xs text-white/80 backdrop-blur-xl">
+                  <div className="absolute left-5 top-5 z-10 flex items-center gap-2 rounded-full border border-teal-400/30 bg-black/40 px-3 py-1.5 text-xs text-white/80 backdrop-blur-xl">
                     <Lock className="h-3 w-3 text-teal-300" />
                     {studentId || '未填写编号'} · 已录入 {currentAttempts.length} 次尝试
+                  </div>
+                )}
+
+                {/* Sprint 5：摄像头丢信号自愈提示条（非致命，不中断采集） */}
+                {cameraLostHint && (
+                  <div className="absolute left-1/2 top-16 z-20 max-w-md -translate-x-1/2 rounded-xl border border-amber-400/35 bg-amber-500/15 px-4 py-2 text-center text-xs text-amber-100 backdrop-blur-xl">
+                    {cameraLostHint}
+                  </div>
+                )}
+
+                {/* ============================ Ghost Monitor PiP：教练存活确认窗 ============================ */}
+                {(isRecording || isConnected || frameImage) && (
+                  <div className="absolute bottom-4 right-4 z-20 flex max-w-[300px] flex-col items-end gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => setGhostMonitorVisible((v) => !v)}
+                      className="rounded border border-white/15 bg-black/55 px-2 py-0.5 text-[10px] tabular-nums text-white/55 transition hover:border-teal-400/40 hover:text-teal-200"
+                    >
+                      [{ghostMonitorVisible ? '隐藏监控' : '显示监控'}]
+                    </button>
+                    <AnimatePresence>
+                      {ghostMonitorVisible && (
+                        <motion.div
+                          initial={{ opacity: 0, scale: 0.92, y: 8 }}
+                          animate={{ opacity: 1, scale: 1, y: 0 }}
+                          exit={{ opacity: 0, scale: 0.92, y: 8 }}
+                          transition={{ duration: 0.18 }}
+                          className="relative w-[min(100%,280px)] overflow-hidden rounded-lg border border-teal-400/35 bg-black shadow-[0_0_18px_rgba(45,212,191,0.22)]"
+                        >
+                          {frameImage ? (
+                            <img
+                              src={frameImage}
+                              alt="幽灵监控推流"
+                              className="aspect-video w-full bg-black object-cover"
+                              onError={() => setFrameImage(null)}
+                            />
+                          ) : (
+                            <div className="flex aspect-video w-full items-center justify-center bg-zinc-950 text-[10px] text-white/35">
+                              等待 MediaPipe 推流…
+                            </div>
+                          )}
+                          <span className="absolute left-1.5 top-1.5 rounded bg-black/75 px-1.5 py-0.5 text-[9px] font-semibold tabular-nums text-teal-300">
+                            {streamFps > 0 ? `${streamFps} FPS` : '-- FPS'}
+                          </span>
+                          <span className="absolute bottom-1.5 right-1.5 rounded bg-black/70 px-1.5 py-0.5 text-[8px] text-white/45">
+                            Ghost Monitor
+                          </span>
+                        </motion.div>
+                      )}
+                    </AnimatePresence>
                   </div>
                 )}
               </motion.div>

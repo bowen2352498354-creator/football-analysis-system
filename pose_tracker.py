@@ -35,8 +35,9 @@ v0.4 差异化双界面开发阶段脚本（在 v0.3 AIGC 认知转译接入基�
        继承自 QThread 的后台线程类 InferenceWorker 里运行。主线程（GUI 线程）
        里绝对不会出现任何"死循环读摄像头"的代码，否则界面会卡死甚至崩溃。
     2. 后台线程处理好每一帧画面后，通过自定义的 pyqtSignal 信号
-       （frame_ready_signal / diagnostics_ready_signal）"发送"给主线程，
-       主线程收到信号后只刷新 QLabel / 图表，非常轻量，完全不会阻塞 GUI。
+       （frame_ready_signal / diagnostics_ready_signal / camera_lost_signal）
+       "发送"给主线程，主线程收到信号后只刷新 QLabel / 图表，非常轻量，
+       完全不会阻塞 GUI；连续空帧时 Worker 自愈重开摄像头而不崩溃。
     3. 【v0.3 遗留设计延续】即便是在后台线程 InferenceWorker 内部，调用 DeepSeek
        大模型这种"耗时的网络请求"依然会被丢进一个更内层的 threading.Thread
        子线程去执行，避免网络请求的等待时间拖慢 InferenceWorker 本身的摄像头
@@ -71,6 +72,7 @@ v0.4 差异化双界面开发阶段脚本（在 v0.3 AIGC 认知转译接入基�
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 import threading
@@ -275,8 +277,12 @@ RIGHT_HEEL_IDX = 30
 LEFT_FOOT_INDEX_IDX = 31
 RIGHT_FOOT_INDEX_IDX = 32
 
+# MediaPipe 面部参考点（身高像素 fallback_PCR）
+NOSE_IDX = 0
+
 # 热力图 / 诊断帧序列：关节名 → MediaPipe 下标
 HEATMAP_JOINT_INDICES: dict[str, int] = {
+    "nose": NOSE_IDX,
     "left_shoulder": LEFT_SHOULDER_IDX,
     "right_shoulder": RIGHT_SHOULDER_IDX,
     "left_hip": LEFT_HIP_IDX,
@@ -331,40 +337,26 @@ FEEDBACK_FONT = _load_chinese_font(font_size=36)      # A组：大模型反馈�
 BLACKSCREEN_FONT = _load_chinese_font(font_size=42)   # B组：黑屏提示语字号
 
 
-def calculate_angle(a, b, c):
-    """通用的空间夹角计算函数：给定三个空间坐标点 a、b、c，计算出以 b 为顶点、
-    由 a→b 和 c→b 两条向量夹出的角度（单位：度）。
+# --------------------------------------------------------------------------
+# 【V3.1 / Phase2】核心生物力学实测原语 —— 委托 biomech_primitives（唯一权威）
+# --------------------------------------------------------------------------
+from biomech_primitives import (  # noqa: E402
+    ANKLE_STIFFNESS_LOCKED,
+    ANKLE_STIFFNESS_LOCKED_MAX_VAR,
+    ANKLE_STIFFNESS_SLIGHT_DEFORMATION,
+    ANKLE_STIFFNESS_SLIGHT_MAX_VAR,
+    ANKLE_STIFFNESS_YIELDING,
+    DEFAULT_EMPIRICAL_PCR,
+    STANDARD_BALL_DIAMETER_CM,
+    calculate_3d_joint_angle,
+    calculate_ankle_stiffness_variance,
+    calculate_support_foot_offset_cm,
+)
 
-    这是一个纯数学函数，不依赖 MediaPipe 或 OpenCV，可以用来计算人体任意
-    三个关键点组成的关节角度（例如膝关节角度：a=髋，b=膝，c=踝）。
 
-    参数：
-        a, b, c：三个坐标点，可以是 (x, y) 二维坐标，也可以是 (x, y, z) 三维坐标，
-                 类型可以是列表、元组或 numpy 数组。
-
-    返回：
-        角度值（0~180 之间的浮点数，单位：度）。
-    """
-    a = np.array(a, dtype=np.float64)
-    b = np.array(b, dtype=np.float64)
-    c = np.array(c, dtype=np.float64)
-
-    vector_ba = a - b
-    vector_bc = c - b
-
-    dot_product = np.dot(vector_ba, vector_bc)
-    norm_product = np.linalg.norm(vector_ba) * np.linalg.norm(vector_bc)
-
-    if norm_product == 0:
-        return 0.0
-
-    cos_angle = dot_product / norm_product
-    cos_angle = np.clip(cos_angle, -1.0, 1.0)
-
-    angle_rad = np.arccos(cos_angle)
-    angle_deg = np.degrees(angle_rad)
-
-    return angle_deg
+def calculate_angle(a, b, c, *, is_knee_extension: bool = False):
+    """通用空间夹角（度）。V3.1 起委托 ``calculate_3d_joint_angle``。"""
+    return calculate_3d_joint_angle(a, b, c, is_knee_extension=is_knee_extension)
 
 
 def judge_knee_status(angle):
@@ -402,19 +394,30 @@ def compute_right_knee_diagnosis(frame, single_person_landmarks):
     返回：
         (angle, status_text, status_color, hip_px, knee_px, ankle_px)
     """
+    return compute_knee_diagnosis_for_side(frame, single_person_landmarks, side="right")
+
+
+def _side_landmark_indices(side: str) -> tuple[int, int, int]:
+    if str(side).lower().startswith("l"):
+        return LEFT_HIP_IDX, LEFT_KNEE_IDX, LEFT_ANKLE_IDX
+    return RIGHT_HIP_IDX, RIGHT_KNEE_IDX, RIGHT_ANKLE_IDX
+
+
+def compute_knee_diagnosis_for_side(frame, single_person_landmarks, side: str = "right"):
+    """按摆动腿侧提取髋-膝-踝，计算膝关节内角（大小腿夹角的互补内角）。"""
     height, width = frame.shape[:2]
+    hip_i, knee_i, ankle_i = _side_landmark_indices(side)
+    hip = single_person_landmarks[hip_i]
+    knee = single_person_landmarks[knee_i]
+    ankle = single_person_landmarks[ankle_i]
 
-    hip = single_person_landmarks[RIGHT_HIP_IDX]
-    knee = single_person_landmarks[RIGHT_KNEE_IDX]
-    ankle = single_person_landmarks[RIGHT_ANKLE_IDX]
-
-    # 用 (x, y, z) 三维归一化坐标计算角度，z 轴（深度信息）能让角度计算
-    # 在身体侧对镜头等场景下更加准确，不会因为只看二维投影而失真
     hip_point = (hip.x, hip.y, hip.z)
     knee_point = (knee.x, knee.y, knee.z)
     ankle_point = (ankle.x, ankle.y, ankle.z)
 
-    knee_angle = calculate_angle(hip_point, knee_point, ankle_point)
+    knee_angle = calculate_angle(
+        hip_point, knee_point, ankle_point, is_knee_extension=True
+    )
     status_text, status_color = judge_knee_status(knee_angle)
 
     hip_px = (int(hip.x * width), int(hip.y * height))
@@ -422,6 +425,148 @@ def compute_right_knee_diagnosis(frame, single_person_landmarks):
     ankle_px = (int(ankle.x * width), int(ankle.y * height))
 
     return knee_angle, status_text, status_color, hip_px, knee_px, ankle_px
+
+
+def evaluate_leg_overlay_geometry(
+    hip_px,
+    knee_px,
+    ankle_px,
+    *,
+    knee_visibility: float = 1.0,
+    ankle_visibility: float = 1.0,
+    min_visibility: float = 0.45,
+    min_segment_px: float = 14.0,
+) -> dict:
+    """评估大小腿标注三点是否可信，防止自遮挡时把角画在躯干/大腿上。
+
+    不合格典型表现：膝/踝 visibility 低，或小腿段在图像上塌缩到大腿附近。
+    """
+    result = {
+        "ok": False,
+        "reason": "unknown",
+        "thigh_len_px": 0.0,
+        "shank_len_px": 0.0,
+        "shank_thigh_ratio": 0.0,
+        "knee_visibility": float(knee_visibility),
+        "ankle_visibility": float(ankle_visibility),
+    }
+    try:
+        hx, hy = float(hip_px[0]), float(hip_px[1])
+        kx, ky = float(knee_px[0]), float(knee_px[1])
+        ax, ay = float(ankle_px[0]), float(ankle_px[1])
+    except (TypeError, ValueError, IndexError):
+        result["reason"] = "invalid_points"
+        return result
+
+    if float(knee_visibility) < float(min_visibility):
+        result["reason"] = "knee_low_visibility"
+        return result
+    if float(ankle_visibility) < float(min_visibility):
+        result["reason"] = "ankle_low_visibility"
+        return result
+
+    thigh = float(np.hypot(kx - hx, ky - hy))
+    shank = float(np.hypot(ax - kx, ay - ky))
+    result["thigh_len_px"] = round(thigh, 2)
+    result["shank_len_px"] = round(shank, 2)
+    if thigh < float(min_segment_px):
+        result["reason"] = "thigh_too_short"
+        return result
+    if shank < float(min_segment_px):
+        result["reason"] = "shank_collapsed"
+        return result
+    ratio = shank / thigh if thigh > 1e-6 else 0.0
+    result["shank_thigh_ratio"] = round(ratio, 3)
+    # 自遮挡塌缩：踝贴在大腿上 → 小腿段相对大腿过短
+    if ratio < 0.35:
+        result["reason"] = "shank_collapsed_onto_thigh"
+        return result
+    if ratio > 2.8:
+        result["reason"] = "implausible_shank_thigh_ratio"
+        return result
+    result["ok"] = True
+    result["reason"] = "ok"
+    return result
+
+
+def build_annotation_metrics_from_pose_record(
+    pose_record: dict,
+    *,
+    side: str = "right",
+    label: str = "大小腿夹角",
+) -> Optional[dict]:
+    """从逐帧姿态字典重建报告标注用的髋/膝/踝像素与夹角。
+
+    角度优先用 ``world`` 三维点；像素用图像平面坐标。几何不合格时仍返回
+    metrics，但 ``overlay_ok=False``，绘制层应降级提示而非假装可信。
+    """
+    if not isinstance(pose_record, dict):
+        return None
+    from biomech_primitives import swing_leg_joint_keys
+
+    hip_k, knee_k, ankle_k, _foot_k = swing_leg_joint_keys(side)
+    hip = pose_record.get(hip_k)
+    knee = pose_record.get(knee_k)
+    ankle = pose_record.get(ankle_k)
+    if hip is None or knee is None or ankle is None:
+        return None
+
+    def _xy(pt) -> tuple[int, int]:
+        return (int(round(float(pt[0]))), int(round(float(pt[1]))))
+
+    hip_px = _xy(hip)
+    knee_px = _xy(knee)
+    ankle_px = _xy(ankle)
+
+    lh = pose_record.get("left_hip")
+    rh = pose_record.get("right_hip")
+    if lh is not None and rh is not None:
+        mid_hip_px = (
+            int(round((float(lh[0]) + float(rh[0])) / 2.0)),
+            int(round((float(lh[1]) + float(rh[1])) / 2.0)),
+        )
+    else:
+        mid_hip_px = hip_px
+
+    world = pose_record.get("world") if isinstance(pose_record.get("world"), dict) else {}
+    if (
+        world.get(hip_k) is not None
+        and world.get(knee_k) is not None
+        and world.get(ankle_k) is not None
+    ):
+        angle = float(
+            calculate_3d_joint_angle(
+                world[hip_k], world[knee_k], world[ankle_k], is_knee_extension=True
+            )
+        )
+    else:
+        angle = float(
+            calculate_3d_joint_angle(hip, knee, ankle, is_knee_extension=True)
+        )
+
+    vis = pose_record.get("visibility") or {}
+    qa = evaluate_leg_overlay_geometry(
+        hip_px,
+        knee_px,
+        ankle_px,
+        knee_visibility=float(vis.get(knee_k, 1.0) or 0.0),
+        ankle_visibility=float(vis.get(ankle_k, 1.0) or 0.0),
+    )
+    status_text, _color = judge_knee_status(angle)
+    fold_depth = float(max(0.0, 180.0 - float(angle)))
+    return {
+        "hip_px": hip_px,
+        "knee_px": knee_px,
+        "ankle_px": ankle_px,
+        "mid_hip_px": mid_hip_px,
+        "angle": round(float(angle), 1),
+        "fold_depth_deg": round(fold_depth, 1),
+        "status": status_text,
+        "swing_side": "left" if str(side).lower().startswith("l") else "right",
+        "label": label,
+        "overlay_ok": bool(qa.get("ok")),
+        "overlay_qa": qa,
+    }
 
 
 def serialize_pose_frame_record(
@@ -701,6 +846,39 @@ def _nearest_omega_zero_crossing(
     return best_cross
 
 
+# ---------------------------------------------------------------------------
+# 【T0 精度等级】抛物线亚帧插值是否真正生效的确定性标记
+# ---------------------------------------------------------------------------
+# subframe_interp  : 距离极小值的左右邻帧都存在，三点抛物线拟合成功，
+#                    t_impact 具备亚帧级精度（角度极值可信）。
+# fallback_midframe: 极小值落在搜索窗边界 / 邻帧缺失（遮挡、反光、序列过短），
+#                    只能取离散最近帧。此时 t_impact 可能偏差 ±1 帧，
+#                    触球瞬间膝角有帧率相关的系统误差，下游打分需放宽阈值，
+#                    避免把采样精度问题误判成动作红灯。
+T0_QUALITY_SUBFRAME = "subframe_interp"
+T0_QUALITY_FALLBACK = "fallback_midframe"
+
+
+def locate_impact_frame_with_quality(
+    smoothed_knee_angular_velocities: List[float],
+    ankle_coordinates: List[Tuple],
+    ball_coordinates: List[Tuple],
+) -> Tuple[int, str]:
+    """与 ``locate_impact_frame`` 完全同源的锁帧，额外返回 T0 精度等级。
+
+    返回 ``(t_impact, t0_quality)``；``t0_quality`` 取
+    :data:`T0_QUALITY_SUBFRAME` 或 :data:`T0_QUALITY_FALLBACK`。
+
+    ``locate_impact_frame`` 是本函数的薄封装，两者的 ``t_impact``
+    在任何输入下都必须逐位相同（确定性零漂移契约）。
+    """
+    return _locate_impact_frame_impl(
+        smoothed_knee_angular_velocities,
+        ankle_coordinates,
+        ball_coordinates,
+    )
+
+
 def locate_impact_frame(
     smoothed_knee_angular_velocities: List[float],
     ankle_coordinates: List[Tuple],
@@ -726,7 +904,24 @@ def locate_impact_frame(
 
     返回:
         触球帧的全局整数索引 ``t_impact``。输入异常时尽量回退到安全索引，不抛异常。
+
+    需要同时获知锁帧精度等级时请调用
+    :func:`locate_impact_frame_with_quality`（同源实现，结果逐位一致）。
     """
+    t_impact, _quality = _locate_impact_frame_impl(
+        smoothed_knee_angular_velocities,
+        ankle_coordinates,
+        ball_coordinates,
+    )
+    return t_impact
+
+
+def _locate_impact_frame_impl(
+    smoothed_knee_angular_velocities: List[float],
+    ankle_coordinates: List[Tuple],
+    ball_coordinates: List[Tuple],
+) -> Tuple[int, str]:
+    """锁帧唯一实现体：返回 ``(t_impact, t0_quality)``。"""
     # ---------- 输入归一化（float64） ----------
     try:
         omega = np.asarray(
@@ -744,9 +939,10 @@ def locate_impact_frame(
     n: int = int(min(n_omega, n_ankle, n_ball)) if (n_omega > 0 and n_ankle > 0 and n_ball > 0) else 0
 
     if n <= 0:
+        # 序列缺失 / 三路长度对不齐：只能退化到 ω 峰值帧或第 0 帧，无亚帧精度
         if n_omega > 0:
-            return int(np.argmax(np.abs(omega)))
-        return 0
+            return int(np.argmax(np.abs(omega))), T0_QUALITY_FALLBACK
+        return 0, T0_QUALITY_FALLBACK
 
     omega_valid: np.ndarray = omega[:n]
 
@@ -777,7 +973,10 @@ def locate_impact_frame(
 
     # ---------- 第三步：抛物线插值细化，杜绝邻帧 ±1 翻转 ----------
     idx_min: int = int(best_idx)
+    # 三点齐备才算亚帧插值成功；否则 t_impact 只有离散帧精度（见 T0_QUALITY_* 说明）
+    t0_quality: str = T0_QUALITY_FALLBACK
     if (idx_min - 1) in distances and (idx_min + 1) in distances:
+        t0_quality = T0_QUALITY_SUBFRAME
         d_prev = distances[idx_min - 1]
         d_mid = distances[idx_min]
         d_next = distances[idx_min + 1]
@@ -810,7 +1009,7 @@ def locate_impact_frame(
 
     # ---------- 第四步：全局唯一触球时间戳 t_impact ----------
     t_impact: int = int(np.clip(idx_min, 0, n - 1))
-    return t_impact
+    return t_impact, t0_quality
 
 
 class ImpactFrameLocator:
@@ -969,14 +1168,12 @@ def try_locate_impact_or_discard(
         return None, meta
 
     try:
-        t_impact = int(
-            locate_impact_frame(
-                list(omega_valid),
-                list(ankle_coordinates[:n]),
-                list(ball_coordinates[:n]),
-            )
+        t_impact_raw, t0_quality = locate_impact_frame_with_quality(
+            list(omega_valid),
+            list(ankle_coordinates[:n]),
+            list(ball_coordinates[:n]),
         )
-        t_impact = int(max(0, min(n - 1, t_impact)))
+        t_impact = int(max(0, min(n - 1, int(t_impact_raw))))
     except Exception as exc:  # noqa: BLE001 - 锁帧引擎任何异常均 Discard
         meta.update({"discarded": True, "discard_reason": f"parabolic_lock_exception:{exc}"})
         return None, meta
@@ -989,6 +1186,8 @@ def try_locate_impact_or_discard(
             "shank_omega_peak_value": abs_peak,
             "distance_rel_range": rel_range,
             "t0_method": "try_locate_impact_or_discard_v1",
+            # 【T0 精度等级】fallback_midframe 时下游打分需放宽膝角阈值
+            "t0_quality": t0_quality,
         }
     )
     return t_impact, meta
@@ -1265,7 +1464,9 @@ def detect_contact_frame(
             omega_raw.append((knee_angles[i] - knee_angles[i - 1]) / dt)
     omega_smooth = KinematicSignalProcessor.smooth_joint_trajectories(omega_raw)
 
-    t_impact = locate_impact_frame(omega_smooth, ankle_coords, ball_coords)
+    t_impact, t0_quality = locate_impact_frame_with_quality(
+        omega_smooth, ankle_coords, ball_coords
+    )
     t_impact = int(max(0, min(n - 1, t_impact)))
 
     toe = frames[t_impact].get("right_foot_index") or frames[t_impact].get("right_ankle")
@@ -1276,6 +1477,8 @@ def detect_contact_frame(
 
     meta: dict[str, Any] = {
         "t0_method": "locate_impact_frame_parabolic_v25",
+        # 【T0 精度等级】下游 DeterministicScorer 依据本字段放宽膝角阈值
+        "t0_quality": t0_quality,
         "ball_estimate": "t0_right_foot_index_anchor",
         "shank_omega_peak_index": int(np.argmax(np.abs(np.asarray(omega_smooth, dtype=np.float64)))),
         "shank_omega_peak_value": float(np.max(np.abs(np.asarray(omega_smooth, dtype=np.float64))))
@@ -1316,6 +1519,168 @@ def draw_pose_landmarks(image, pose_landmarks_list):
         for landmark in single_person_landmarks:
             center = (int(landmark.x * width), int(landmark.y * height))
             cv2.circle(image, center, 4, LANDMARK_COLOR, -1)
+
+
+def resolve_leg_annotation_target(
+    score_detail: Optional[dict],
+    *,
+    t_impact: Optional[int] = None,
+) -> tuple[int, str, str]:
+    """选择大小腿夹角标注的目标帧与摆动腿侧。
+
+    优先折叠极值帧（真正的后摆大小腿夹角语义），否则回退触球帧。
+    返回 ``(frame_index, swing_side, label)``。
+    """
+    side = "right"
+    label = "大小腿夹角"
+    frame_idx = int(t_impact) if t_impact is not None else 0
+    if not isinstance(score_detail, dict):
+        return frame_idx, side, label
+
+    if score_detail.get("swing_leg") in ("left", "right"):
+        side = str(score_detail["swing_leg"])
+
+    indicators = score_detail.get("indicators") or {}
+    fold = indicators.get("max_folding_angle") if isinstance(indicators, dict) else None
+    if isinstance(fold, dict):
+        if fold.get("swing_leg") in ("left", "right"):
+            side = str(fold["swing_leg"])
+        ext = fold.get("extreme_frame_index")
+        if ext is not None and str(fold.get("provenance") or "").lower() in (
+            "measured",
+            "calibrated",
+        ):
+            frame_idx = int(ext)
+        method = str(fold.get("method") or "")
+        if "left" in method:
+            side = "left"
+        elif "right" in method:
+            side = "right"
+
+    return int(max(0, frame_idx)), side, label
+
+
+def draw_biomechanics_annotation(frame, metrics: dict):
+    """在击球/折叠关键帧上叠加髋-膝-踝矢量标注（大小腿夹角）。
+
+    当 ``overlay_ok is False``（关键点塌缩/低可见度）时：仍画参考重心线与降级横幅，
+    不画误导性膝角弧，避免把躯干-大腿角当成大小腿夹角。
+    """
+    annotated = frame.copy()
+
+    hip_px = tuple(metrics["hip_px"])
+    knee_px = tuple(metrics["knee_px"])
+    ankle_px = tuple(metrics["ankle_px"])
+    mid_hip_px = tuple(metrics.get("mid_hip_px") or hip_px)
+    angle = float(metrics.get("angle") or 0.0)
+    status = str(metrics.get("status") or "Red")
+    overlay_ok = metrics.get("overlay_ok")
+    if overlay_ok is None:
+        qa = evaluate_leg_overlay_geometry(hip_px, knee_px, ankle_px)
+        overlay_ok = bool(qa.get("ok"))
+    swing_side = str(metrics.get("swing_side") or "right")
+    fold_depth = metrics.get("fold_depth_deg")
+
+    vector_color = (60, 235, 60) if status in ("Green", "Yellow") else (40, 40, 245)
+    line_thickness = 4
+
+    frame_height = annotated.shape[0]
+    dash_length, gap_length = 10, 8
+    y_cursor = int(mid_hip_px[1])
+    while y_cursor < frame_height:
+        y_end = min(frame_height, y_cursor + dash_length)
+        cv2.line(
+            annotated,
+            (int(mid_hip_px[0]), y_cursor),
+            (int(mid_hip_px[0]), y_end),
+            (0, 200, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        y_cursor += dash_length + gap_length
+
+    if not overlay_ok:
+        banner = "Low landmark confidence: thigh-shank overlay skipped"
+        cv2.rectangle(annotated, (8, 8), (min(annotated.shape[1] - 8, 640), 48), (20, 20, 20), -1)
+        cv2.putText(
+            annotated,
+            banner,
+            (16, 36),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (80, 200, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        return annotated
+
+    cv2.arrowedLine(
+        annotated, hip_px, knee_px, vector_color, line_thickness, cv2.LINE_AA, tipLength=0.14
+    )
+    cv2.arrowedLine(
+        annotated, knee_px, ankle_px, vector_color, line_thickness, cv2.LINE_AA, tipLength=0.14
+    )
+
+    for point in (hip_px, knee_px, ankle_px):
+        cv2.circle(annotated, point, 7, (255, 255, 255), -1, cv2.LINE_AA)
+        cv2.circle(annotated, point, 7, vector_color, 2, cv2.LINE_AA)
+
+    vector_knee_to_hip = (hip_px[0] - knee_px[0], hip_px[1] - knee_px[1])
+    vector_knee_to_ankle = (ankle_px[0] - knee_px[0], ankle_px[1] - knee_px[1])
+    angle_towards_hip_deg = math.degrees(math.atan2(vector_knee_to_hip[1], vector_knee_to_hip[0]))
+    angle_towards_ankle_deg = math.degrees(
+        math.atan2(vector_knee_to_ankle[1], vector_knee_to_ankle[0])
+    )
+
+    arc_radius = 46
+    cv2.ellipse(
+        annotated,
+        knee_px,
+        (arc_radius, arc_radius),
+        0,
+        angle_towards_hip_deg,
+        angle_towards_ankle_deg,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+
+    side_tag = "L-swing" if swing_side.startswith("l") else "R-swing"
+    angle_label = f"Thigh-Shank {angle:.1f} deg"
+    if fold_depth is not None:
+        try:
+            angle_label = f"Thigh-Shank {angle:.1f} deg (fold {float(fold_depth):.0f})"
+        except (TypeError, ValueError):
+            pass
+    label_pos = (knee_px[0] + arc_radius + 10, knee_px[1] + 6)
+    cv2.putText(
+        annotated, angle_label, label_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.7, (15, 15, 15), 5, cv2.LINE_AA
+    )
+    cv2.putText(
+        annotated, angle_label, label_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA
+    )
+    cv2.putText(
+        annotated,
+        side_tag,
+        (knee_px[0] + arc_radius + 10, knee_px[1] + 28),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (15, 15, 15),
+        4,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        annotated,
+        side_tag,
+        (knee_px[0] + arc_radius + 10, knee_px[1] + 28),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (200, 255, 200),
+        1,
+        cv2.LINE_AA,
+    )
+
+    return annotated
 
 
 def draw_right_knee_overlay(image, hip_px, knee_px, ankle_px, status_color, angle, status_text):

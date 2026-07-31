@@ -191,6 +191,9 @@ class ResearchDashboardService:
         for raw in records:
             if not isinstance(raw, dict):
                 continue
+            # Sprint 5：软删除废记录不进入科研看板聚合
+            if raw.get("is_deleted") is True or raw.get("isDeleted") is True:
+                continue
             anonymous_id = str(
                 raw.get("anonymous_id") or raw.get("studentId") or raw.get("student_id") or ""
             ).strip()

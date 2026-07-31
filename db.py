@@ -46,12 +46,36 @@ engine = create_db_engine()
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
 
+def _ensure_soft_delete_column(bind: Engine) -> None:
+    """存量 SQLite 库补齐 ``shot_attempt_logs.is_deleted``（create_all 不会 ALTER）。"""
+    if bind.dialect.name != "sqlite":
+        return
+    from sqlalchemy import text
+
+    with bind.connect() as conn:
+        rows = conn.execute(text("PRAGMA table_info(shot_attempt_logs)")).fetchall()
+        if not rows:
+            return
+        colnames = {row[1] for row in rows}
+        if "is_deleted" in colnames:
+            return
+        conn.execute(
+            text(
+                "ALTER TABLE shot_attempt_logs "
+                "ADD COLUMN is_deleted BOOLEAN NOT NULL DEFAULT 0"
+            )
+        )
+        conn.commit()
+
+
 def init_db(bind: Engine | None = None) -> None:
     """创建全部科研表（含伦理映射表）。"""
     # 确保模型注册进 metadata
     import models  # noqa: F401
 
-    Base.metadata.create_all(bind or engine)
+    target = bind or engine
+    Base.metadata.create_all(target)
+    _ensure_soft_delete_column(target)
 
 
 @contextmanager

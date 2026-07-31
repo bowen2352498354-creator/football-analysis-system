@@ -48,6 +48,7 @@ import SynchronizedVideoWorkspace, {
   type SyncVelocityPoint,
 } from './SynchronizedVideoWorkspace'
 import AIAssistantPanel from './AIAssistantPanel'
+import { deriveErrorCodesFromIndicators } from './ProStudioPanels'
 import { TRAFFIC_LIGHT } from '../theme/trafficLight'
 
 interface RealtimeWorkspaceProps {
@@ -97,7 +98,17 @@ interface WsNoticeMessage {
   type: 'notice'
   message: string
 }
-type WsMessage = WsFrameMessage | WsStartedMessage | WsStoppedMessage | WsErrorMessage | WsNoticeMessage
+interface WsCameraLostMessage {
+  type: 'camera_lost'
+  message: string
+}
+type WsMessage =
+  | WsFrameMessage
+  | WsStartedMessage
+  | WsStoppedMessage
+  | WsErrorMessage
+  | WsNoticeMessage
+  | WsCameraLostMessage
 
 /** 「自动归档并生成 Word 报告」按钮的当前状态 */
 type WordSaveStatus = 'idle' | 'saving' | 'success' | 'error'
@@ -186,12 +197,24 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
   const [isGeneratingReport, setIsGeneratingReport] = useState(false)
   /** 最近一次分析会话 ID，供手绘批注归档关联 */
   const [lastSessionId, setLastSessionId] = useState<string | null>(null)
+  /** 报告完成后把波形/视频 Seek 到触球瞬间（token 递增保证可重复触发） */
+  const [impactSeek, setImpactSeek] = useState<{
+    frameIndex: number
+    token: number
+    label?: string
+  } | null>(null)
 
   /* ---------------------------- 本地归档 + Word 报告生成状态 ---------------------------- */
   const [wordSaveStatus, setWordSaveStatus] = useState<WordSaveStatus>('idle')
   const [wordSaveToast, setWordSaveToast] = useState<WordSaveToastState | null>(null)
 
   const isAnalyzing = analysisStatus === 'analyzing'
+  /** 测试完成且已有击球关键帧：主视口切到射门瞬间分析画面 */
+  const impactAnalysisImage = finalReport?.impactFrameImage ?? null
+  const showImpactAnalysisStage =
+    Boolean(impactAnalysisImage) &&
+    (analysisStatus === 'finished' || (!isAnalyzing && analysisStatus !== 'stopping' && Boolean(finalReport)))
+  const stageImage = showImpactAnalysisStage ? impactAnalysisImage : frameImage
   const level = useMemo(() => statusToLevel(backendStatus), [backendStatus])
   const smoothBackground = useMemo(
     () => getSmoothAngleBackground(kneeAngle ?? 150),
@@ -207,13 +230,24 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
     return typeof idx === 'number' && Number.isFinite(idx) ? idx : null
   }, [finalReport])
 
-  /** 窗口序列第 0 帧对应的绝对视频帧 = t_impact - impact_index_in_window */
+  /** 窗口序列第 0 帧对应的绝对视频帧 = action_roi.start（优先） */
   const seriesFrameOffset = useMemo(() => {
+    const roiStart = finalReport?.scoreDetail?.action_roi?.start
+    if (typeof roiStart === 'number' && Number.isFinite(roiStart)) {
+      return Math.max(0, Math.round(roiStart))
+    }
     if (impactIndexInWindow === null) return 0
     const tAbs = finalReport?.t_impact ?? finalReport?.tImpact
     if (typeof tAbs !== 'number' || !Number.isFinite(tAbs)) return 0
     return Math.max(0, Math.round(tAbs) - Math.round(impactIndexInWindow))
   }, [finalReport, impactIndexInWindow])
+
+  /** 右栏扣分证据链：优先后端 error_codes，否则从 8 项 RED/YELLOW 指标回填 */
+  const resolvedErrorCodes = useMemo(() => {
+    const detail = finalReport?.scoreDetail
+    const fromIndicators = deriveErrorCodesFromIndicators(detail?.indicators)
+    return fromIndicators
+  }, [finalReport])
 
   /**
    * 统一的 WebSocket 消息处理：每一条推理帧都会实时更新角度/状态/画面，
@@ -235,6 +269,8 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
       // src 把画面"闪"成黑屏——这正是之前排查"点击开始分析后黑屏"问题的关键点。
       if (typeof message.image === 'string' && message.image.startsWith('data:image')) {
         setFrameImage(message.image)
+        // 自愈成功后清掉丢信号提示
+        setDiagnosticNotice(null)
       }
 
       if (message.angle !== null && message.status !== null) {
@@ -285,6 +321,12 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
     if (message.type === 'notice') {
       // 非致命提醒：只展示提示条，绝不中断当前分析会话、绝不关闭 WebSocket 连接
       setDiagnosticNotice(message.message)
+      return
+    }
+
+    if (message.type === 'camera_lost') {
+      // Sprint 5：摄像头自愈中——保持会话，仅提示教练
+      setDiagnosticNotice(message.message || '摄像头信号丢失，尝试重连...')
     }
   }
 
@@ -303,6 +345,11 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
       setFinalReport(report)
       setHitStats(report.hitStats)
 
+      // 主视口定格到射门瞬间矢量标注帧（后端 impactFrameImage）
+      if (report.impactFrameImage) {
+        setFrameImage(report.impactFrameImage)
+      }
+
       // Sprint 1：用 Action ROI 鞭打发力窗口替换实时累积的全程序列
       const windowSeries = report.time_series_velocity ?? report.timeSeriesVelocity
       if (Array.isArray(windowSeries) && windowSeries.length > 0) {
@@ -312,6 +359,23 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
             omega: typeof omega === 'number' && Number.isFinite(omega) ? omega : 0,
           })),
         )
+      }
+
+      // 波形游标 / 本地视频同步到触球帧
+      const tAbs = report.t_impact ?? report.tImpact
+      const winIdx = report.impact_index_in_window ?? report.impactIndexInWindow
+      const seekAbs =
+        typeof tAbs === 'number' && Number.isFinite(tAbs)
+          ? Math.round(tAbs)
+          : typeof winIdx === 'number' && Number.isFinite(winIdx)
+            ? Math.round(winIdx)
+            : null
+      if (seekAbs !== null) {
+        setImpactSeek((prev) => ({
+          frameIndex: seekAbs,
+          token: (prev?.token ?? 0) + 1,
+          label: '射门瞬间',
+        }))
       }
     } catch (error) {
       setConnectionError(error instanceof Error ? error.message : '生成诊断报告失败，请检查后端服务是否已启动。')
@@ -388,6 +452,7 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
     setKneeAngle(null)
     setBackendStatus(null)
     setFrameImage(null)
+    setImpactSeek(null)
     setOmegaSeries([])
     omegaFrameRef.current = 0
     setStabilityIndex(null)
@@ -490,6 +555,13 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
           hitStats: finalReport.hitStats ?? hitStats,
           kneeFlexionAngle: finalReport.avgKneeAngle ?? null,
           scoreDetail: finalReport.scoreDetail ?? null,
+          // V3.1 顶层可选字段（后端已 Optional，防止漏传/类型不一致 422）
+          radar_scores: finalReport.scoreDetail?.radar_scores ?? null,
+          spatial_trajectory:
+            finalReport.spatial_trajectory ??
+            finalReport.spatialTrajectory ??
+            finalReport.scoreDetail?.spatial_trajectory ??
+            null,
         }),
       })
       const data = (await response.json()) as {
@@ -662,7 +734,7 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
           renderMode="GROUP_B"
           scoreDetail={finalReport?.scoreDetail ?? MOCK_SCORE_DETAIL_V31}
           metrics={null}
-          errorCodes={null}
+          errorCodes={resolvedErrorCodes}
           radarScores={finalReport?.scoreDetail?.radar_scores ?? MOCK_RADAR_SCORES}
           compareRadarScores={MOCK_RADAR_SCORES_COMPARE}
           tImpact={finalReport?.tImpact ?? finalReport?.t_impact ?? null}
@@ -681,28 +753,47 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
           impactIndexInWindow={impactIndexInWindow}
           seriesFrameOffset={seriesFrameOffset}
           fps={30}
-          preferLiveOverlay={isAnalyzing || analysisStatus === 'stopping'}
+          /* 分析结束后切回本地视频，保证波形 scrub 能同步可见画面（不再被分析帧永久盖住） */
+          preferLiveOverlay={
+            isAnalyzing ||
+            analysisStatus === 'stopping' ||
+            (showImpactAnalysisStage && videoSourceMode !== 'file')
+          }
+          externalSeek={impactSeek}
           title="Video Workspace"
-          subtitle="鞭打发力角速度时序 · 触球窗口 t_impact±30 · 教练手绘电烙铁"
+          subtitle={
+            showImpactAnalysisStage
+              ? '射门瞬间分析帧 · 髋-膝-踝矢量标注 · 触球窗口定格'
+              : '鞭打发力角速度时序 · 触球窗口 t_impact±30 · 教练手绘电烙铁'
+          }
           studentNumber={studentNumber}
           attemptId={lastSessionId}
           overlay={
             <>
-              <motion.div
-                animate={{ backgroundColor: smoothBackground }}
-                transition={{ duration: 0.8, ease: 'easeInOut' }}
-                className={`pointer-events-auto absolute top-3 left-3 rounded-xl border border-white/10 px-3 py-2.5 shadow-lg backdrop-blur-xl ${
-                  level ? LEVEL_COLOR_MAP[level].glow : ''
-                }`}
-              >
-                <p className="text-[10px] font-medium text-white/70">右膝角度</p>
-                <p className="text-2xl font-bold tabular-nums text-white">
-                  {kneeAngle !== null ? `${kneeAngle}°` : '--'}
-                </p>
-                <span className="mt-0.5 inline-block rounded-full bg-black/30 px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-white/85">
-                  {level ? LEVEL_LABEL_MAP[level] : '等待人体'}
-                </span>
-              </motion.div>
+              {!showImpactAnalysisStage && (
+                <motion.div
+                  animate={{ backgroundColor: smoothBackground }}
+                  transition={{ duration: 0.8, ease: 'easeInOut' }}
+                  className={`pointer-events-auto absolute top-3 left-3 rounded-xl border border-white/10 px-3 py-2.5 shadow-lg backdrop-blur-xl ${
+                    level ? LEVEL_COLOR_MAP[level].glow : ''
+                  }`}
+                >
+                  <p className="text-[10px] font-medium text-white/70">右膝角度</p>
+                  <p className="text-2xl font-bold tabular-nums text-white">
+                    {kneeAngle !== null ? `${kneeAngle}°` : '--'}
+                  </p>
+                  <span className="mt-0.5 inline-block rounded-full bg-black/30 px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-white/85">
+                    {level ? LEVEL_LABEL_MAP[level] : '等待人体'}
+                  </span>
+                </motion.div>
+              )}
+
+              {showImpactAnalysisStage && (
+                <div className="pointer-events-none absolute top-3 left-3 flex items-center gap-1.5 rounded-full border border-[color-mix(in_srgb,var(--GREEN_OPTIMAL)_40%,transparent)] bg-black/70 px-2.5 py-1 text-[10px] font-semibold text-[var(--GREEN_OPTIMAL)] backdrop-blur-xl">
+                  <Crosshair className="h-3 w-3" />
+                  射门瞬间 · 分析帧定格
+                </div>
+              )}
 
               <div className="absolute top-3 right-3 flex flex-col items-end gap-1.5">
                 <span className="flex items-center gap-1.5 rounded-full border border-white/10 bg-[color-mix(in_srgb,var(--GREEN_OPTIMAL)_18%,transparent)] px-2.5 py-1 text-[10px] text-[var(--GREEN_OPTIMAL)] backdrop-blur-xl">
@@ -731,20 +822,6 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
                 )}
               </div>
 
-              {finalReport?.impactFrameImage && (
-                <div className="absolute bottom-3 left-3 w-28 overflow-hidden rounded-lg border border-slate-600/60 bg-black/70 shadow-lg">
-                  <img
-                    src={finalReport.impactFrameImage}
-                    alt="击球关键帧"
-                    className="aspect-video w-full object-cover"
-                  />
-                  <span className="absolute left-1 top-1 flex items-center gap-1 rounded bg-black/70 px-1.5 py-0.5 text-[8px] text-[var(--GREEN_OPTIMAL)]">
-                    <Crosshair className="h-2.5 w-2.5" />
-                    Impact
-                  </span>
-                </div>
-              )}
-
               <AnimatePresence>
                 {isGeneratingReport && (
                   <motion.div
@@ -763,12 +840,14 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
           }
         >
           <div className="relative h-full min-h-0 w-full overflow-hidden bg-gradient-to-br from-slate-900 via-black to-slate-950">
-            {frameImage ? (
+            {stageImage ? (
               <img
-                src={frameImage}
-                alt="实时推理画面"
+                src={stageImage}
+                alt={showImpactAnalysisStage ? '射门瞬间分析画面' : '实时推理画面'}
                 className="absolute inset-0 h-full w-full bg-black object-contain"
-                onError={() => setFrameImage(null)}
+                onError={() => {
+                  if (!showImpactAnalysisStage) setFrameImage(null)
+                }}
               />
             ) : (
               <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 text-slate-500">
@@ -783,7 +862,7 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
                   {videoSourceMode === 'file'
                     ? uploadedVideoPath
                       ? localVideoObjectUrl && analysisStatus === 'finished'
-                        ? '分析结束：可在下方波形图拖拽/点击，同步跳转视频帧'
+                        ? '分析结束：等待射门瞬间分析帧；也可在下方波形图拖拽同步跳转'
                         : '视频已就绪，点击「开始分析」后显示后端实时推理画面'
                       : '请先选择本地 MP4 并等待上传完成'
                     : '点击「开始分析」后，后端将推送实时推理画面'}
@@ -795,8 +874,14 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
 
         <AIAssistantPanel
           report={finalReport}
+          scoreDetail={finalReport?.scoreDetail ?? null}
+          overallStatus={
+            finalReport?.scoreDetail?.overall_status ??
+            finalReport?.scoreDetail?.overallStatus ??
+            null
+          }
           hitStats={hitStats}
-          errorCodes={null}
+          errorCodes={resolvedErrorCodes}
           displayText={
             finalReport
               ? reportDisplayText

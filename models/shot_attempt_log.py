@@ -7,6 +7,7 @@ from datetime import date, datetime, timezone
 from typing import Any, Mapping, Optional
 
 from sqlalchemy import (
+    Boolean,
     Date,
     DateTime,
     Float,
@@ -93,6 +94,15 @@ class ShotAttemptLog(Base):
 
     total_score: Mapped[Optional[float]] = mapped_column(
         Float, nullable=True, doc="DeterministicScorer 总分 (0-100)"
+    )
+    # Sprint 5 数据治理：软删除标记；True 表示误测/脏数据，不参与科研统计导出
+    is_deleted: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default="0",
+        index=True,
+        doc="软删除：True 时跳过学术宽表与教练端默认列表",
     )
     recorded_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

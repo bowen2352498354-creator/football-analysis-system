@@ -1,14 +1,29 @@
 import { useMemo, useState, type ReactNode } from 'react'
 import { Filter, Sparkles } from 'lucide-react'
-import { DeductionList, ERROR_CODE_LABELS, GOLDEN_METRIC_DEFS } from './ProStudioPanels'
+import {
+  DeductionList,
+  ERROR_CODE_LABELS,
+  GOLDEN_METRIC_DEFS,
+  deriveErrorCodesFromIndicators,
+  isOverallPerfectCompliance,
+} from './ProStudioPanels'
 import { TRAFFIC_CLASS, type TrafficLightLevel } from '../theme/trafficLight'
-import type { FinalDiagnosisReport, ThresholdHitStats } from '../types'
+import type {
+  FinalDiagnosisReport,
+  OverallComplianceStatus,
+  ScoreDetailPayload,
+  ThresholdHitStats,
+} from '../types'
 
 export type DefectFilterId = 'all' | TrafficLightLevel
 
 export interface AIAssistantPanelProps {
   /** DeepSeek 最终诊断；待机时展示引导文案 */
   report?: FinalDiagnosisReport | null
+  /** DeterministicScorer 明细；驱动合规判定与扣分回填 */
+  scoreDetail?: ScoreDetailPayload | null
+  /** 后端 overall_status；仅 PERFECT 可亮绿色合规框 */
+  overallStatus?: OverallComplianceStatus | null
   /** 实时三级命中统计（用于缺陷筛选器计数） */
   hitStats?: ThresholdHitStats
   /** 命中的错误代码，驱动扣分清单 */
@@ -35,6 +50,8 @@ const FILTER_OPTIONS: { id: DefectFilterId; label: string }[] = [
  */
 export default function AIAssistantPanel({
   report = null,
+  scoreDetail = null,
+  overallStatus = null,
   hitStats = { green: 0, yellow: 0, red: 0 },
   errorCodes = null,
   displayText,
@@ -44,8 +61,31 @@ export default function AIAssistantPanel({
 }: AIAssistantPanelProps) {
   const [filter, setFilter] = useState<DefectFilterId>('all')
 
+  const effectiveScoreDetail = scoreDetail ?? report?.scoreDetail ?? null
+  const effectiveOverall =
+    overallStatus ??
+    effectiveScoreDetail?.overall_status ??
+    effectiveScoreDetail?.overallStatus ??
+    null
+
+  const resolvedErrorCodes = useMemo(() => {
+    if (errorCodes && errorCodes.length > 0) return errorCodes
+    return deriveErrorCodesFromIndicators(effectiveScoreDetail?.indicators)
+  }, [errorCodes, effectiveScoreDetail])
+
+  const isPerfect = useMemo(
+    () =>
+      Boolean(report || effectiveScoreDetail) &&
+      isOverallPerfectCompliance({
+        overallStatus: effectiveOverall,
+        scoreDetail: effectiveScoreDetail,
+      }) &&
+      resolvedErrorCodes.length === 0,
+    [report, effectiveScoreDetail, effectiveOverall, resolvedErrorCodes],
+  )
+
   const filteredCodes = useMemo(() => {
-    const codes = errorCodes ?? []
+    const codes = resolvedErrorCodes
     if (filter === 'all' || filter === 'green') {
       // 绿档：展示「无扣分」空态；有扣分时 all 展示全部，green 清空扣分列表
       if (filter === 'green') return []
@@ -58,7 +98,7 @@ export default function AIAssistantPanel({
       if (filter === 'red') return penalty >= 10
       return penalty < 10
     })
-  }, [errorCodes, filter])
+  }, [resolvedErrorCodes, filter])
 
   const bodyText = displayText ?? report?.fullText ?? ''
   const metaphorLead = report?.painPoint || report?.prescription || ''
@@ -155,16 +195,29 @@ export default function AIAssistantPanel({
             )}
           </section>
 
-          {/* 扣分 / 缺陷清单（受筛选器驱动） */}
+          {/* 扣分 / 缺陷清单（受筛选器驱动；绿色合规框条件极严） */}
           <section>
             <h3 className="mb-2 text-[11px] font-semibold text-slate-400">量化扣分证据链</h3>
-            {filter === 'green' && (errorCodes?.length ?? 0) > 0 ? (
+            {filter === 'green' && !isPerfect && resolvedErrorCodes.length > 0 ? (
               <div className="rounded-xl border border-[color-mix(in_srgb,var(--GREEN_OPTIMAL)_30%,transparent)] bg-[color-mix(in_srgb,var(--GREEN_OPTIMAL)_10%,transparent)] px-3 py-2.5 text-xs text-[var(--GREEN_OPTIMAL)]">
                 当前筛选「达标」：已隐藏全部扣分项。切换至「全部 / 接近 / 偏离」查看证据链。
               </div>
             ) : (
-              <DeductionList errorCodes={filteredCodes} />
+              <DeductionList
+                errorCodes={filteredCodes}
+                overallStatus={effectiveOverall}
+                scoreDetail={effectiveScoreDetail}
+                hasAnalysisResult={Boolean(report || effectiveScoreDetail)}
+              />
             )}
+            {filter === 'all' &&
+              Boolean(report || effectiveScoreDetail) &&
+              !isPerfect &&
+              resolvedErrorCodes.length === 0 && (
+                <div className="rounded-2xl border border-rose-400/25 bg-rose-500/10 px-3.5 py-3 text-xs text-rose-200">
+                  ⚠ 未达到全部合规（存在黄/红档偏离或 overall_status 非 PERFECT），请核对左侧 8 大量纲灯色。
+                </div>
+              )}
             {filter !== 'all' && filter !== 'green' && filteredCodes.length === 0 && (
               <p className="mt-2 text-[10px] text-slate-500">
                 当前筛选下无匹配项

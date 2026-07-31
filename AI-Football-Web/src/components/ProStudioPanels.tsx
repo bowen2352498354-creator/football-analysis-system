@@ -1,7 +1,88 @@
 import { motion } from 'framer-motion'
 import { Gauge, Pause, Play, Rewind, FastForward, StepBack, StepForward } from 'lucide-react'
-import type { PlaybackRate } from '../types'
+import type {
+  BiomechIndicatorKey,
+  BiomechIndicatorValue,
+  OverallComplianceStatus,
+  PlaybackRate,
+  ScoreDetailPayload,
+} from '../types'
 import { TRAFFIC_CLASS, type TrafficLightLevel } from '../theme/trafficLight'
+
+/** 8 大量纲 → 扣分错误码（右栏证据链回填） */
+const INDICATOR_ERROR_CODE: Partial<Record<BiomechIndicatorKey, string>> = {
+  distance_cm: 'ERR_A2_SUPPORT_WIDE',
+  toe_angle: 'ERR_C2_TOE_POKE',
+  max_folding_angle: 'ERR_B1_STRAIGHT_LEG',
+  whipping_velocity: 'ERR_FOLLOW_THROUGH',
+  impact_knee_angle: 'ERR_KNEE_STIFF',
+  ankle_rigidity: 'ERR_C1_LOOSE_ANKLE',
+  support_knee_angle: 'ERR_KNEE_STIFF',
+  hip_torsion_angle: 'ERR_TORSO_TILT',
+}
+
+function indicatorTrafficLevel(status: string | null | undefined): TrafficLightLevel {
+  if (!status) return 'pending'
+  const s = status.toUpperCase()
+  if (s.includes('GREEN')) return 'green'
+  if (s.includes('YELLOW')) return 'yellow'
+  if (s.includes('RED')) return 'red'
+  return 'pending'
+}
+
+/**
+ * 从 scoreDetail / overall_status / 8 项指标严格判定是否「全部合规」。
+ * 仅当 overall_status===PERFECT，或已有细分指标且无一为 RED/YELLOW 时返回 true。
+ * 空数据 / 待机态一律视为未合规（禁止误亮绿色框）。
+ */
+export function isOverallPerfectCompliance(options: {
+  overallStatus?: OverallComplianceStatus | null
+  scoreDetail?: ScoreDetailPayload | null
+  indicators?: Partial<Record<BiomechIndicatorKey, BiomechIndicatorValue>> | null
+}): boolean {
+  const explicit =
+    options.overallStatus ??
+    options.scoreDetail?.overall_status ??
+    options.scoreDetail?.overallStatus ??
+    null
+  if (typeof explicit === 'string' && explicit.toUpperCase() === 'PERFECT') {
+    return true
+  }
+  if (typeof explicit === 'string' && explicit.trim() !== '') {
+    return false
+  }
+
+  const indicators = options.indicators ?? options.scoreDetail?.indicators ?? null
+  if (!indicators || Object.keys(indicators).length === 0) return false
+
+  for (const entry of Object.values(indicators)) {
+    if (!entry) continue
+    const level = indicatorTrafficLevel(entry.status)
+    if (level === 'red' || level === 'yellow') return false
+  }
+  return true
+}
+
+/** 从 8 项 RED/YELLOW 指标推导扣分错误码（补全后端未下发 error_codes 的断层） */
+export function deriveErrorCodesFromIndicators(
+  indicators: Partial<Record<BiomechIndicatorKey, BiomechIndicatorValue>> | null | undefined,
+): string[] {
+  if (!indicators) return []
+  const codes: string[] = []
+  const seen = new Set<string>()
+  for (const [key, entry] of Object.entries(indicators) as Array<
+    [BiomechIndicatorKey, BiomechIndicatorValue | undefined]
+  >) {
+    if (!entry) continue
+    const level = indicatorTrafficLevel(entry.status)
+    if (level !== 'red' && level !== 'yellow') continue
+    const code = INDICATOR_ERROR_CODE[key]
+    if (!code || seen.has(code)) continue
+    seen.add(code)
+    codes.push(code)
+  }
+  return codes
+}
 
 /* ============================================================================
  * 【第二部分：Pro-Studio 职业视频工作台】共享子组件
@@ -286,16 +367,51 @@ export function PlaybackControlBar({
   )
 }
 
-/** 右栏「扣分项清单」：根据 error_codes 命中列表渲染逐条量化扣分依据 */
-export function DeductionList({ errorCodes }: { errorCodes: string[] | null | undefined }) {
-  const codes = errorCodes ?? []
-  if (codes.length === 0) {
+export interface DeductionListProps {
+  errorCodes?: string[] | null
+  /** 后端 overall_status；仅 PERFECT 可亮绿色合规框 */
+  overallStatus?: OverallComplianceStatus | null
+  /** DeterministicScorer 明细；用于二次校验 8 项是否含 RED/YELLOW */
+  scoreDetail?: ScoreDetailPayload | null
+  /** 是否已有分析结论（无结论时不亮绿色合规框） */
+  hasAnalysisResult?: boolean
+}
+
+/** 右栏「扣分项清单」：根据 error_codes / 指标灯色严格渲染，禁止空码误亮合规 */
+export function DeductionList({
+  errorCodes,
+  overallStatus = null,
+  scoreDetail = null,
+  hasAnalysisResult = false,
+}: DeductionListProps) {
+  const derived = deriveErrorCodesFromIndicators(scoreDetail?.indicators)
+  // 显式传入数组（含空数组）时尊重调用方筛选结果，不再回填 derived
+  const codes = Array.isArray(errorCodes) ? errorCodes : derived
+  const isPerfect =
+    hasAnalysisResult &&
+    isOverallPerfectCompliance({ overallStatus, scoreDetail }) &&
+    (Array.isArray(errorCodes) ? errorCodes.length === 0 && derived.length === 0 : derived.length === 0)
+
+  if (isPerfect) {
     return (
       <div className="rounded-2xl border border-emerald-400/20 bg-emerald-500/10 px-3.5 py-3 text-xs text-emerald-200">
         ✅ 本次分析未命中任何量化扣分项，8 大黄金指标全部合规！
       </div>
     )
   }
+
+  if (codes.length === 0) {
+    if (!hasAnalysisResult) {
+      return (
+        <div className="rounded-2xl border border-slate-600/40 bg-slate-900/40 px-3.5 py-3 text-xs text-slate-400">
+          等待分析完成后展示量化扣分证据链。
+        </div>
+      )
+    }
+    // 筛选器清空了列表，或合规未达标但当前视图无码可展示
+    return null
+  }
+
   return (
     <div className="flex flex-col gap-1.5">
       {codes.map((code) => {
