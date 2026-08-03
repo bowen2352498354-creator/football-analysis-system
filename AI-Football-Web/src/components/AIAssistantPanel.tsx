@@ -100,8 +100,17 @@ export default function AIAssistantPanel({
     })
   }, [resolvedErrorCodes, filter])
 
-  const bodyText = displayText ?? report?.fullText ?? ''
-  const metaphorLead = report?.painPoint || report?.prescription || ''
+  const correctionText = (
+    report?.correction_metaphor ||
+    report?.painPoint ||
+    ''
+  ).trim()
+  const praiseText = (
+    report?.praise_encouragement ||
+    report?.prescription ||
+    ''
+  ).trim()
+  const liveStatusText = !report ? (displayText || '').trim() : ''
 
   const filterCount = (id: DefectFilterId): number => {
     if (id === 'all') return hitStats.green + hitStats.yellow + hitStats.red
@@ -121,7 +130,7 @@ export default function AIAssistantPanel({
           </span>
           <div className="min-w-0">
             <h2 className="truncate text-sm font-semibold text-slate-100">AI Assistant</h2>
-            <p className="truncate text-[10px] text-slate-400">具身隐喻处方 · 缺陷筛选</p>
+            <p className="truncate text-[10px] text-slate-400">魔法咒语 · 高光时刻</p>
           </div>
         </header>
 
@@ -165,33 +174,52 @@ export default function AIAssistantPanel({
         </div>
 
         <div className="min-h-0 flex-1 space-y-3 overflow-y-auto overflow-x-hidden px-3 py-3">
-          {/* 具身隐喻建议 */}
-          <section className="rounded-xl border border-slate-700/70 bg-slate-900/35 p-3">
-            <h3 className="mb-2 text-[11px] font-semibold text-slate-400">AIGC 具身隐喻建议</h3>
+          {/* OPTIMAL 双段式：魔法咒语 + 高光时刻 */}
+          <section className="space-y-3" aria-label="OPTIMAL 双段式教练反馈">
             {!report ? (
-              <p className="text-xs leading-relaxed text-slate-500">
-                结束分析后，DeepSeek 将在此生成具身隐喻化痛点与教练处方（例如「像拉满的弓弦再多蓄一点力」）。
-              </p>
+              <div className="rounded-xl border border-slate-700/70 bg-slate-900/35 p-3">
+                <p className="text-xs leading-relaxed text-slate-500">
+                  结束分析后，这里会亮起两张卡片：上面是「魔法咒语」纠错，下面是「高光时刻」表扬。
+                </p>
+                {liveStatusText && (
+                  <p className="mt-2 text-xs leading-relaxed text-slate-400">
+                    {liveStatusText}
+                    {isTyping && <span className="typewriter-caret">|</span>}
+                  </p>
+                )}
+              </div>
             ) : (
-              <div className="space-y-2">
+              <>
                 {typeof report.score === 'number' && (
-                  <div className="flex items-baseline gap-2">
+                  <div className="flex items-baseline gap-2 px-0.5">
                     <span className="text-2xl font-bold tabular-nums text-[var(--GREEN_OPTIMAL)]">
                       {report.score}
                     </span>
                     <span className="text-[10px] text-slate-500">发力稳定性评分</span>
                   </div>
                 )}
-                {metaphorLead && (
-                  <p className="text-xs leading-relaxed text-slate-200">{metaphorLead}</p>
-                )}
-                {bodyText && (
-                  <p className="whitespace-pre-line text-xs leading-relaxed text-slate-300">
-                    {bodyText}
-                    {isTyping && <span className="typewriter-caret">|</span>}
+
+                <div className="rounded-xl border border-sky-400/45 bg-gradient-to-br from-amber-500/15 via-sky-500/12 to-sky-900/20 p-3.5 shadow-[0_0_24px_rgba(56,189,248,0.12)]">
+                  <h3 className="mb-2 flex items-center gap-1.5 text-sm font-bold tracking-wide text-sky-200">
+                    <span aria-hidden>💡</span>
+                    教练的魔法咒语
+                  </h3>
+                  <p className="text-[13px] font-medium leading-relaxed text-amber-50">
+                    {correctionText ||
+                      '你刚才踢球时膝盖太直了，就像一根冻住的冰棍一样！下次试试像弹簧一样把小腿弯一弯再弹出去。'}
                   </p>
-                )}
-              </div>
+                </div>
+
+                <div className="rounded-xl border border-emerald-400/50 bg-gradient-to-br from-emerald-500/18 to-teal-900/25 p-3.5 shadow-[0_0_24px_rgba(16,185,129,0.14)]">
+                  <h3 className="mb-2 flex items-center gap-1.5 text-sm font-bold tracking-wide text-emerald-200">
+                    <span aria-hidden>🌟</span>
+                    高光时刻
+                  </h3>
+                  <p className="text-[13px] font-medium leading-relaxed text-emerald-50">
+                    {praiseText || '这次尝试非常勇敢，继续保持！'}
+                  </p>
+                </div>
+              </>
             )}
           </section>
 

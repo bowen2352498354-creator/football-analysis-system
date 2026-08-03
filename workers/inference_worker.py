@@ -18,13 +18,16 @@ workers/inference_worker.py
 
 from __future__ import annotations
 
+import copy
 import csv
+import gc
 import json
 import os
 import random
 import threading
 import time
 from collections import deque
+from queue import Empty, Full, Queue
 from typing import Any, Deque, List, Optional, Tuple
 
 import cv2
@@ -62,6 +65,11 @@ _TRAJECTORY_MAXLEN: int = 300
 # 【Sprint 5】连续空帧 / 读取失败阈值：达到后发 camera_lost_signal 并自愈重开，绝不裸崩溃
 _CAMERA_READ_FAIL_LIMIT: int = 50
 _CAMERA_REOPEN_SLEEP_SEC: float = 0.45
+# 推理结果有界队列：满则丢弃过期帧，优先保障最新帧送达主线程
+_FRAME_EMIT_QUEUE_MAXSIZE: int = 2
+_DIAGNOSTICS_EMIT_QUEUE_MAXSIZE: int = 1
+# 每隔 N 帧显式触发一次轻量 GC，缓解长时间推理的帧缓冲滞留
+_GC_EVERY_N_FRAMES: int = 90
 
 
 def _is_empty_or_failed_frame(ret: bool, frame: Any) -> bool:
@@ -185,6 +193,11 @@ class InferenceWorker(QThread):
         self._awaiting_post_peak = False
         self._last_impact_emit_time = 0.0
         self._impact_emitted_for_segment = False
+
+        # 有界发射队列：主线程消费慢时丢弃过期帧 / 旧诊断，避免内存蓄积卡死 GUI
+        self._frame_emit_queue: Queue = Queue(maxsize=_FRAME_EMIT_QUEUE_MAXSIZE)
+        self._diagnostics_emit_queue: Queue = Queue(maxsize=_DIAGNOSTICS_EMIT_QUEUE_MAXSIZE)
+        self._frames_since_gc = 0
 
         self._scorer = DeterministicScorer()
 
@@ -484,15 +497,63 @@ class InferenceWorker(QThread):
         self._trajectory_ankle_px.append((float(ankle_px[0]), float(ankle_px[1])))
         return omega
 
+    @staticmethod
+    def _enqueue_drop_oldest(q: Queue, item: Any) -> None:
+        """有界队列：满则丢弃最旧项再放入最新项，优先保障实时性。"""
+        try:
+            q.put_nowait(item)
+            return
+        except Full:
+            pass
+        try:
+            q.get_nowait()
+        except Empty:
+            pass
+        try:
+            q.put_nowait(item)
+        except Full:
+            pass
+
+    def _drain_emit_queues(self) -> None:
+        """把有界队列中的最新帧/诊断经信号发给主线程（仅深拷贝后的独立对象）。"""
+        latest_frame = None
+        while True:
+            try:
+                latest_frame = self._frame_emit_queue.get_nowait()
+            except Empty:
+                break
+        if latest_frame is not None and isinstance(latest_frame, np.ndarray):
+            # ndarray 已在入队前 .copy()；再 copy 一次切断与队列残留的共享
+            self.frame_ready_signal.emit(latest_frame.copy())
+
+        latest_diag = None
+        while True:
+            try:
+                latest_diag = self._diagnostics_emit_queue.get_nowait()
+            except Empty:
+                break
+        if isinstance(latest_diag, dict):
+            self.diagnostics_ready_signal.emit(copy.deepcopy(latest_diag))
+
     def _emit_frame_ready(self, frame_bgr: np.ndarray) -> None:
         """向主线程投递一帧脱敏画面；仅传 copy，原矩阵可被本环覆盖/回收。
 
         前置条件：调用方必须已通过 ``apply_facial_anonymization`` 覆盖原图；
         本方法本身不再接触未脱敏帧。
+        经有界队列中转：主线程慢时主动丢弃过期帧。
         """
         if frame_bgr is None or not isinstance(frame_bgr, np.ndarray):
             return
-        self.frame_ready_signal.emit(frame_bgr.copy())
+        self._enqueue_drop_oldest(self._frame_emit_queue, frame_bgr.copy())
+        self._drain_emit_queues()
+
+    def _emit_diagnostics_ready(self, payload: dict) -> None:
+        """跨线程诊断结果：深拷贝后入有界队列再发射，禁止主子线程共享可变对象。"""
+        if not isinstance(payload, dict):
+            return
+        safe = copy.deepcopy(payload)
+        self._enqueue_drop_oldest(self._diagnostics_emit_queue, safe)
+        self._drain_emit_queues()
 
     def _try_reopen_camera(self, cap: Any) -> Tuple[Any, bool]:
         """Sprint 5 自愈：释放后重新 open 摄像头。返回 (新 cap, 是否成功)。"""
@@ -596,7 +657,7 @@ class InferenceWorker(QThread):
                     f"【疲劳预警】{warning.get('reason')}: {warning.get('message')}"
                 )
                 payload["fatigue_warning"] = warning
-                self.fatigue_warning_signal.emit(dict(warning))
+                self.fatigue_warning_signal.emit(copy.deepcopy(dict(warning)))
         except Exception as exc:  # noqa: BLE001 — 监控失败不得中断教学
             self.log_message.emit(f"疲劳监控跳过：{exc}")
 
@@ -621,7 +682,7 @@ class InferenceWorker(QThread):
 
     def _on_auto_clip_saved(self, info: dict) -> None:
         try:
-            self.clip_saved_signal.emit(dict(info))
+            self.clip_saved_signal.emit(copy.deepcopy(dict(info)))
         except Exception:  # noqa: BLE001
             pass
         # 【灾难恢复】IMPACT_LOCKED 完成 + 切片落盘 → 立刻原子写快照
@@ -725,7 +786,8 @@ class InferenceWorker(QThread):
                 if self._policy.pause_camera_for_capsule:
                     self.pause_for_capsule()
                 # 【Sprint 4】diagnostics_ready_signal → 主线程图表 / 时空胶囊
-                self.diagnostics_ready_signal.emit(payload)
+                # 深拷贝 + 有界队列，避免主子线程共享 replay_frames 等可变对象
+                self._emit_diagnostics_ready(payload)
                 self.log_message.emit(
                     f"GROUP_A：触球锁定 t_impact={payload.get('t_impact')}，"
                     f"时空胶囊 {duration:.1f}s 半速回放已触发。"
@@ -1006,6 +1068,17 @@ class InferenceWorker(QThread):
                     del frame
                 except Exception:  # noqa: BLE001
                     pass
+                try:
+                    del rgb_frame
+                    del mp_image
+                    del results
+                except Exception:  # noqa: BLE001
+                    pass
+
+                self._frames_since_gc += 1
+                if self._frames_since_gc >= _GC_EVERY_N_FRAMES:
+                    self._frames_since_gc = 0
+                    gc.collect()
 
                 if is_video_file_mode and frame_delay_seconds > 0:
                     elapsed = time.time() - loop_start_time
@@ -1033,6 +1106,11 @@ class InferenceWorker(QThread):
                     pt.destroy_pose_landmarker(landmarker)
                 except Exception:  # noqa: BLE001
                     pass
+            # 释放可能残留的 OpenCV 高窗句柄（摄像头预览调试路径）
+            try:
+                cv2.destroyAllWindows()
+            except Exception:  # noqa: BLE001
+                pass
             if self.group == "B":
                 self._flush_b_group_data_to_disk()
             try:
@@ -1045,6 +1123,13 @@ class InferenceWorker(QThread):
             self._trajectory_angles.clear()
             self._trajectory_omega.clear()
             self._trajectory_ankle_px.clear()
+            # 排空有界队列，切断残留 ndarray
+            for q in (self._frame_emit_queue, self._diagnostics_emit_queue):
+                while True:
+                    try:
+                        q.get_nowait()
+                    except Empty:
+                        break
             try:
                 self._auto_capture.reset()
             except Exception:  # noqa: BLE001
@@ -1053,6 +1138,7 @@ class InferenceWorker(QThread):
                 self._finalize_checkpoint()
             except Exception:  # noqa: BLE001
                 pass
+            gc.collect()
             self.log_message.emit(
                 f"后台处理线程已安全退出，训练结束（本次同步帧数={sync_frame_count}，"
                 f"Active_Group={self.experimental_group}，"

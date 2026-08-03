@@ -38,10 +38,37 @@ v1.0 完整科研量产版 —— B组离线报告生成器（教练看板数据
 
 import json
 import os
+import traceback
 
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
+
+
+def _safe_knee_angle(record) -> float:
+    """空值保护：缺失 / None / 非数值膝角 → 0.0，避免折线图因 None 崩溃。"""
+    if not isinstance(record, dict):
+        return 0.0
+    raw = record.get("knee_angle", record.get("kneeAngle"))
+    if raw is None or raw == "":
+        return 0.0
+    try:
+        value = float(raw)
+        if value != value:  # NaN
+            return 0.0
+        return value
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _safe_status(record) -> str:
+    """空值保护：缺失 status → 空串（不计入三色柱）。"""
+    if not isinstance(record, dict):
+        return ""
+    status = record.get("status")
+    if status is None:
+        return ""
+    return str(status).strip()
 
 # --------------------------------------------------------------------------
 # 第〇步：路径常量（与 pose_tracker.py 保持一致，方便两个脚本配套使用）
@@ -119,7 +146,13 @@ def load_b_group_records():
         )
 
     with open(B_GROUP_LOG_PATH, "r", encoding="utf-8") as f:
-        records = json.load(f)
+        raw = json.load(f)
+
+    # 兼容 {"records": [...]} / 纯 list；过滤非 dict 脏行
+    if isinstance(raw, dict):
+        records = raw.get("records") or raw.get("data") or raw.get("sessions") or []
+    else:
+        records = raw
 
     if not isinstance(records, list) or len(records) == 0:
         raise ValueError(
@@ -127,7 +160,12 @@ def load_b_group_records():
             f"请检查该文件是否被意外清空或损坏。"
         )
 
-    return records
+    cleaned = [row for row in records if isinstance(row, dict)]
+    if not cleaned:
+        raise ValueError(
+            f"B 组数据文件无有效采样记录（字段缺失或格式损坏）：{B_GROUP_LOG_PATH}"
+        )
+    return cleaned
 
 
 # --------------------------------------------------------------------------
@@ -138,20 +176,20 @@ def draw_status_distribution_subplot(ax, records):
     """在给定的 Axes 上画出 Green/Yellow/Red 三种判定状态的次数柱状图，
     每根柱子上方额外标注"次数 + 绝对百分比"，方便教练快速掌握整体合规情况。
     """
-    total_count = len(records)
+    total_count = max(len(records), 1)
 
     # 统计三种状态各自出现的次数（哪怕某一种状态本次训练一次都没出现，
     # 也要在图表里显示成 0，而不是直接从图上消失，保持柱状图结构稳定）
     status_counts = {status: 0 for status in STATUS_ORDER}
-    for record in records:
-        status = record.get("status")
+    for record in records or []:
+        status = _safe_status(record)
         if status in status_counts:
             status_counts[status] += 1
 
-    counts = [status_counts[status] for status in STATUS_ORDER]
+    counts = [status_counts.get(status, 0) for status in STATUS_ORDER]
     percentages = [count / total_count * 100 for count in counts]
-    bar_colors = [STATUS_COLORS[status] for status in STATUS_ORDER]
-    bar_labels = [STATUS_LABELS_CN[status] for status in STATUS_ORDER]
+    bar_colors = [STATUS_COLORS.get(status, "#888888") for status in STATUS_ORDER]
+    bar_labels = [STATUS_LABELS_CN.get(status, status or "暂无数据") for status in STATUS_ORDER]
 
     bars = ax.bar(bar_labels, counts, color=bar_colors, width=0.5, edgecolor="white")
 
@@ -187,8 +225,23 @@ def draw_angle_timeseries_subplot(ax, records):
     """
     # X 轴用"数据采样帧序号"（即记录在列表里的顺序，从 1 开始编号），
     # 比直接用 Unix 时间戳更直观，教练看图表时不需要换算成分钟秒数。
-    frame_indices = np.arange(1, len(records) + 1)
-    knee_angles = [record.get("knee_angle", 0.0) for record in records]
+    safe_records = list(records or [])
+    if not safe_records:
+        ax.text(
+            0.5,
+            0.5,
+            "暂无数据",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+            fontsize=14,
+            color="#888888",
+        )
+        ax.set_title("子图二：右膝关节角度纵向波动趋势与合规标准带对照（暂无数据）")
+        return
+
+    frame_indices = np.arange(1, len(safe_records) + 1)
+    knee_angles = [_safe_knee_angle(record) for record in safe_records]
 
     # 核心设计要求：用 ax.axhspan 在 Y 轴 140°~160° 区间画出醒目的
     # 浅绿色半透明阴影，代表"儿童动作发展合规标准带"，必须画在折线的下面
@@ -217,19 +270,23 @@ def draw_angle_timeseries_subplot(ax, records):
     # 让教练除了看折线走势，也能一眼定位到具体哪几个点是 Red/Yellow。
     for status in STATUS_ORDER:
         status_frame_indices = [
-            idx for idx, record in zip(frame_indices, records) if record.get("status") == status
+            idx
+            for idx, record in zip(frame_indices, safe_records)
+            if _safe_status(record) == status
         ]
         status_angles = [
-            record.get("knee_angle", 0.0) for record in records if record.get("status") == status
+            _safe_knee_angle(record)
+            for record in safe_records
+            if _safe_status(record) == status
         ]
         if status_frame_indices:
             ax.scatter(
                 status_frame_indices,
                 status_angles,
-                color=STATUS_COLORS[status],
+                color=STATUS_COLORS.get(status, "#888888"),
                 s=18,
                 zorder=3,
-                label=f"判定为 {STATUS_LABELS_CN[status]} 的采样点",
+                label=f"判定为 {STATUS_LABELS_CN.get(status, status)} 的采样点",
             )
 
     ax.set_title("子图二：右膝关节角度纵向波动趋势与合规标准带对照", fontsize=13, fontweight="bold")
@@ -246,33 +303,61 @@ def draw_angle_timeseries_subplot(ax, records):
 def generate_report():
     """完整的报告生成主流程：配置中文字体 -> 读取数据 -> 绘制上下两个子图 ->
     保存为 300 DPI 高清 PNG 文件。
+
+    外层 try/except：键缺失 / 类型异常 / 其它错误一律打印详细日志并返回
+    ``{"success": False, ...}``，绝不让调用方（含桌面端 main_window）闪退。
     """
-    configure_chinese_font()
+    try:
+        configure_chinese_font()
 
-    print(f"正在读取 B 组历史数据：{B_GROUP_LOG_PATH}")
-    records = load_b_group_records()
-    print(f"读取成功，共 {len(records)} 条有效采样记录，开始生成图表……")
+        print(f"正在读取 B 组历史数据：{B_GROUP_LOG_PATH}")
+        records = load_b_group_records()
+        print(f"读取成功，共 {len(records)} 条有效采样记录，开始生成图表……")
 
-    # 上下两个子图布局：figsize 按 A4 纵向比例适当放大，保证 300 DPI 导出后
-    # 依然有充足的像素细节，不会因为放大打印而糊掉。
-    fig, (ax_top, ax_bottom) = plt.subplots(
-        nrows=2, ncols=1, figsize=(11, 12), gridspec_kw={"height_ratios": [1, 1.3]}
-    )
+        # 上下两个子图布局：figsize 按 A4 纵向比例适当放大，保证 300 DPI 导出后
+        # 依然有充足的像素细节，不会因为放大打印而糊掉。
+        fig, (ax_top, ax_bottom) = plt.subplots(
+            nrows=2, ncols=1, figsize=(11, 12), gridspec_kw={"height_ratios": [1, 1.3]}
+        )
 
-    fig.suptitle(
-        "B组（延时反馈）训练综合分析报告 —— 教练看板", fontsize=16, fontweight="bold"
-    )
+        fig.suptitle(
+            "B组（延时反馈）训练综合分析报告 —— 教练看板", fontsize=16, fontweight="bold"
+        )
 
-    draw_status_distribution_subplot(ax_top, records)
-    draw_angle_timeseries_subplot(ax_bottom, records)
+        draw_status_distribution_subplot(ax_top, records)
+        draw_angle_timeseries_subplot(ax_bottom, records)
 
-    fig.tight_layout(rect=(0, 0, 1, 0.96))  # 给顶部大标题留出空间，避免与子图标题重叠
+        fig.tight_layout(rect=(0, 0, 1, 0.96))  # 给顶部大标题留出空间，避免与子图标题重叠
 
-    fig.savefig(REPORT_OUTPUT_PATH, dpi=REPORT_DPI, bbox_inches="tight")
-    plt.close(fig)
+        fig.savefig(REPORT_OUTPUT_PATH, dpi=REPORT_DPI, bbox_inches="tight")
+        plt.close(fig)
 
-    print(f"图表生成完成！已保存至：{REPORT_OUTPUT_PATH}")
+        print(f"图表生成完成！已保存至：{REPORT_OUTPUT_PATH}")
+        return {
+            "success": True,
+            "status": "ok",
+            "path": REPORT_OUTPUT_PATH,
+            "message": f"图表生成完成：{REPORT_OUTPUT_PATH}",
+        }
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        print(f"[report_generator] 报告生成失败，部分数据缺失: {exc}")
+        print(traceback.format_exc())
+        return {
+            "success": False,
+            "status": "error",
+            "message": f"报告生成失败，部分数据缺失: {exc}",
+        }
+    except Exception as exc:  # noqa: BLE001 - 绝不向上抛出未捕获异常
+        print(f"[report_generator] 报告生成未预料异常: {exc}")
+        print(traceback.format_exc())
+        return {
+            "success": False,
+            "status": "error",
+            "message": f"报告生成失败: {exc}",
+        }
 
 
 if __name__ == "__main__":
-    generate_report()
+    result = generate_report()
+    if isinstance(result, dict) and not result.get("success", True):
+        raise SystemExit(1)

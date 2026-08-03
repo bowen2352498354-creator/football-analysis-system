@@ -1,15 +1,15 @@
 import { useEffect, useRef, useState } from 'react'
-import type { KeyboardEvent } from 'react'
+import type { KeyboardEvent, MouseEvent as ReactMouseEvent } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
-import { Download, Wifi, Activity, Settings2, ChevronDown, School as SchoolIcon, Plus, Check, HardDrive } from 'lucide-react'
+import { Download, Wifi, Activity, Settings2, ChevronDown, School as SchoolIcon, Plus, Check, HardDrive, X } from 'lucide-react'
 import type { ApiStatus, GlobalSettings, ViewMode } from '../types'
 import {
   getClassGroupDisplayName,
   getSchoolDisplayName,
-  loadCustomClassGroupNames,
-  loadCustomSchoolNames,
-  PRESET_CLASS_GROUP_NAMES,
-  PRESET_SCHOOL_NAMES,
+  loadClassGroupOptions,
+  loadSchoolOptions,
+  removeClassGroupOption,
+  removeSchoolOption,
   saveCustomClassGroupName,
   saveCustomSchoolName,
 } from '../mockData'
@@ -56,14 +56,13 @@ export default function Navbar({
   const settingsRef = useRef<HTMLDivElement>(null)
   const statusStyle = API_STATUS_STYLE[apiStatus]
 
-  // 自定义学校 / 班级分组列表：首次挂载时从 localStorage 读取教师此前保存过的记录，
-  // 新增时同步写回 localStorage，实现"一次录入，长期复用"的持久化体验。
-  const [customSchoolNames, setCustomSchoolNames] = useState<string[]>([])
-  const [customClassGroupNames, setCustomClassGroupNames] = useState<string[]>([])
+  // 学校 / 班级完整可选项：预设（含已隐藏过滤）+ 自定义，首次挂载从 localStorage 恢复
+  const [schoolList, setSchoolList] = useState<string[]>([])
+  const [classList, setClassList] = useState<string[]>([])
 
   useEffect(() => {
-    setCustomSchoolNames(loadCustomSchoolNames())
-    setCustomClassGroupNames(loadCustomClassGroupNames())
+    setSchoolList(loadSchoolOptions())
+    setClassList(loadClassGroupOptions())
   }, [])
 
   // 点击面板外部区域时自动收起下拉设置面板
@@ -79,6 +78,34 @@ export default function Navbar({
   }, [isSettingsOpen])
 
   const summaryText = `${getSchoolDisplayName(globalSettings)} · ${getClassGroupDisplayName(globalSettings)}`
+
+  /**
+   * 删除学校/机构（预设与自定义均可）：拦截冒泡防止误选中，同步 localStorage，
+   * 若删的是当前选中项则回退到剩余列表首项（或空串），避免幽灵选中态。
+   */
+  function handleDeleteSchool(schoolName: string, e: ReactMouseEvent) {
+    e.stopPropagation()
+    e.preventDefault()
+    const nextList = removeSchoolOption(schoolName)
+    setSchoolList(nextList)
+    if (globalSettings.schoolName === schoolName) {
+      onChangeGlobalSettings({ ...globalSettings, schoolName: nextList[0] ?? '' })
+    }
+  }
+
+  /**
+   * 删除班级/组别（预设与自定义均可）：拦截冒泡防止误选中，同步 localStorage，
+   * 若删的是当前选中项则回退到剩余列表首项（或空串），避免幽灵选中态。
+   */
+  function handleDeleteClass(className: string, e: ReactMouseEvent) {
+    e.stopPropagation()
+    e.preventDefault()
+    const nextList = removeClassGroupOption(className)
+    setClassList(nextList)
+    if (globalSettings.classGroupName === className) {
+      onChangeGlobalSettings({ ...globalSettings, classGroupName: nextList[0] ?? '' })
+    }
+  }
 
   return (
     <header className="sticky top-0 z-50 w-full flex-shrink-0 border-b border-slate-700/80 bg-slate-900/90 backdrop-blur-md">
@@ -168,31 +195,29 @@ export default function Navbar({
                   {/* 学校 / 机构：预设 + 100% 自定义录入并持久化保存 */}
                   <EnvOptionPicker
                     label="学校 / 机构"
-                    presetOptions={PRESET_SCHOOL_NAMES}
-                    customOptions={customSchoolNames}
+                    options={schoolList}
                     value={globalSettings.schoolName}
                     placeholder="请输入学校 / 机构全称"
                     addButtonLabel="+ 新增自定义学校/机构"
                     onSelectValue={(val) => onChangeGlobalSettings({ ...globalSettings, schoolName: val })}
                     onAddCustomValue={(val) => {
-                      const nextList = saveCustomSchoolName(val)
-                      setCustomSchoolNames(nextList)
+                      setSchoolList(saveCustomSchoolName(val))
                     }}
+                    onDeleteOption={handleDeleteSchool}
                   />
 
                   {/* 班级 / 实验组别：预设 + 100% 自定义录入并持久化保存 */}
                   <EnvOptionPicker
                     label="班级 / 组别"
-                    presetOptions={PRESET_CLASS_GROUP_NAMES}
-                    customOptions={customClassGroupNames}
+                    options={classList}
                     value={globalSettings.classGroupName}
                     placeholder="请输入班级 / 分组名称，如「五年三班-实验A组」"
                     addButtonLabel="+ 新增自定义分组/班级"
                     onSelectValue={(val) => onChangeGlobalSettings({ ...globalSettings, classGroupName: val })}
                     onAddCustomValue={(val) => {
-                      const nextList = saveCustomClassGroupName(val)
-                      setCustomClassGroupNames(nextList)
+                      setClassList(saveCustomClassGroupName(val))
                     }}
+                    onDeleteOption={handleDeleteClass}
                   />
 
                   {/* 【核心新增】全局归档总闸：极其显眼的 Apple 风格切换开关，
@@ -298,11 +323,9 @@ export default function Navbar({
 interface EnvOptionPickerProps {
   /** 字段标签，例如「学校 / 机构」 */
   label: string
-  /** 内置常用预设选项 */
-  presetOptions: string[]
-  /** 教师此前保存过的自定义选项（来自 localStorage） */
-  customOptions: string[]
-  /** 当前生效值（可能是预设值、历史自定义值，或尚未同步进列表的最新自定义值） */
+  /** 当前完整可选项（预设 + 自定义，已过滤被删除项） */
+  options: string[]
+  /** 当前生效值（可能是列表中的值，或尚未同步进列表的最新自定义值） */
   value: string
   /** 新增自定义输入框的占位提示文案 */
   placeholder: string
@@ -310,30 +333,43 @@ interface EnvOptionPickerProps {
   addButtonLabel: string
   onSelectValue: (value: string) => void
   onAddCustomValue: (value: string) => void
+  /** 删除选项；调用方须在开头执行 e.stopPropagation / e.preventDefault */
+  onDeleteOption: (name: string, e: ReactMouseEvent) => void
 }
 
 /**
- * 全局教学环境「学校 / 班级组别」100% 自定义选择器：
- * 下拉框汇总「内置常用预设 + 教师历史自定义记录」供快速复用，
- * 同时保留一个随时可展开的文本输入框，允许教师输入任意名称并一键持久化保存，
- * 保存后立即成为当前生效值，且会永久出现在下拉列表中供下次直接选用。
+ * 全局教学环境「学校 / 班级组别」选择器：
+ * 每一项右侧常驻淡灰删除图标；点击删除不会触发选中（由调用方 stopPropagation）。
  */
 function EnvOptionPicker({
   label,
-  presetOptions,
-  customOptions,
+  options,
   value,
   placeholder,
   addButtonLabel,
   onSelectValue,
   onAddCustomValue,
+  onDeleteOption,
 }: EnvOptionPickerProps) {
   const [isAdding, setIsAdding] = useState(false)
+  const [isDropdownOpen, setIsDropdownOpen] = useState(false)
   const [draftValue, setDraftValue] = useState('')
+  const pickerRef = useRef<HTMLDivElement>(null)
 
-  // 合并预设与自定义选项，去重后统一展示在下拉列表里
-  const mergedOptions = [...presetOptions, ...customOptions.filter((item) => !presetOptions.includes(item))]
-  const isValueKnown = mergedOptions.includes(value)
+  const isValueKnown = options.includes(value)
+  const displayLabel = value ? (isValueKnown ? value : `${value}（自定义）`) : '请选择或新增'
+
+  // 点击选择器外部时收起下拉，避免与全局设置面板的外层点击逻辑冲突
+  useEffect(() => {
+    if (!isDropdownOpen) return
+    function handleClickOutside(event: MouseEvent) {
+      if (pickerRef.current && !pickerRef.current.contains(event.target as Node)) {
+        setIsDropdownOpen(false)
+      }
+    }
+    document.addEventListener('mousedown', handleClickOutside)
+    return () => document.removeEventListener('mousedown', handleClickOutside)
+  }, [isDropdownOpen])
 
   function handleConfirmAdd() {
     const trimmed = draftValue.trim()
@@ -342,6 +378,7 @@ function EnvOptionPicker({
     onSelectValue(trimmed)
     setDraftValue('')
     setIsAdding(false)
+    setIsDropdownOpen(false)
   }
 
   function handleInputKeyDown(event: KeyboardEvent<HTMLInputElement>) {
@@ -354,28 +391,88 @@ function EnvOptionPicker({
     }
   }
 
+  function handleSelectOption(option: string) {
+    onSelectValue(option)
+    setIsDropdownOpen(false)
+  }
+
   return (
     <div className="mb-3 last:mb-0">
       <label className="mb-1.5 block text-xs font-medium text-white/50">{label}</label>
-      <div className="relative">
-        <select
-          value={isValueKnown ? value : '__unsynced_custom__'}
-          onChange={(e) => onSelectValue(e.target.value)}
-          className="w-full appearance-none rounded-2xl border border-white/10 bg-white/5 px-3.5 py-2.5 text-sm text-white outline-none transition focus:border-emerald-400/50 [&>option]:bg-zinc-900"
+      <div ref={pickerRef} className="relative">
+        <button
+          type="button"
+          onClick={() => setIsDropdownOpen((prev) => !prev)}
+          className="flex w-full items-center justify-between rounded-2xl border border-white/10 bg-white/5 px-3.5 py-2.5 text-left text-sm text-white outline-none transition hover:bg-white/[0.08] focus:border-emerald-400/50"
         >
-          {/* 极端情况兜底：当前生效值尚未出现在合并列表中（例如数据刚迁移），也要能正常显示 */}
-          {!isValueKnown && (
-            <option value="__unsynced_custom__">{value ? `${value}（自定义）` : '请选择或新增'}</option>
+          <span className={`truncate ${value ? 'text-white' : 'text-white/40'}`}>{displayLabel}</span>
+          <ChevronDown
+            className={`h-3.5 w-3.5 flex-shrink-0 text-white/40 transition-transform ${isDropdownOpen ? 'rotate-180' : ''}`}
+          />
+        </button>
+
+        <AnimatePresence>
+          {isDropdownOpen && (
+            <motion.ul
+              initial={{ opacity: 0, y: -6, scale: 0.98 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: -6, scale: 0.98 }}
+              transition={{ type: 'spring', stiffness: 420, damping: 32 }}
+              className="absolute left-0 right-0 top-[calc(100%+6px)] z-20 max-h-48 overflow-y-auto rounded-2xl border border-white/10 bg-zinc-900/95 py-1 shadow-xl backdrop-blur-xl"
+              role="listbox"
+            >
+              {/* 极端情况兜底：当前生效值尚未出现在列表中时，也先展示出来便于确认/删除 */}
+              {!isValueKnown && value && (
+                <li
+                  role="option"
+                  aria-selected
+                  className="group flex cursor-pointer items-center justify-between gap-2 px-3 py-2 text-sm text-emerald-300 transition hover:bg-white/10"
+                  onClick={() => handleSelectOption(value)}
+                >
+                  <span className="min-w-0 truncate">{value}（自定义）</span>
+                  <button
+                    type="button"
+                    title="删除此项"
+                    aria-label={`删除 ${value}`}
+                    onClick={(e) => onDeleteOption(value, e)}
+                    className="inline-flex h-6 w-6 flex-shrink-0 items-center justify-center rounded-md text-white/35 transition hover:bg-rose-500/20 hover:text-rose-300"
+                  >
+                    <X className="h-3.5 w-3.5" strokeWidth={2.25} />
+                  </button>
+                </li>
+              )}
+              {options.map((option) => {
+                const isSelected = option === value
+                return (
+                  <li
+                    key={option}
+                    role="option"
+                    aria-selected={isSelected}
+                    className={`group flex cursor-pointer items-center justify-between gap-2 px-3 py-2 text-sm transition hover:bg-white/10 ${
+                      isSelected ? 'text-emerald-300' : 'text-white/85'
+                    }`}
+                    onClick={() => handleSelectOption(option)}
+                  >
+                    <span className="min-w-0 truncate">{option}</span>
+                    {/* 每一项右侧常驻淡灰 ✖；悬浮时略微高亮，不抢选中主交互 */}
+                    <button
+                      type="button"
+                      title="删除此项"
+                      aria-label={`删除 ${option}`}
+                      onClick={(e) => onDeleteOption(option, e)}
+                      className="inline-flex h-6 w-6 flex-shrink-0 items-center justify-center rounded-md text-white/35 transition hover:bg-rose-500/20 hover:text-rose-300"
+                    >
+                      <X className="h-3.5 w-3.5" strokeWidth={2.25} />
+                    </button>
+                  </li>
+                )
+              })}
+              {options.length === 0 && !value && (
+                <li className="px-3 py-2 text-xs text-white/35">暂无可选项，请先新增</li>
+              )}
+            </motion.ul>
           )}
-          {mergedOptions.map((option) => (
-            <option key={option} value={option}>
-              {option}
-            </option>
-          ))}
-        </select>
-        <span className="pointer-events-none absolute right-3.5 top-1/2 inline-flex -translate-y-1/2">
-          <ChevronDown className="h-3.5 w-3.5 text-white/40" />
-        </span>
+        </AnimatePresence>
       </div>
 
       <AnimatePresence initial={false} mode="wait">

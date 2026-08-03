@@ -3,9 +3,6 @@ import * as echarts from 'echarts/core'
 import { LineChart } from 'echarts/charts'
 import {
   GridComponent,
-  LegendComponent,
-  MarkAreaComponent,
-  MarkPointComponent,
   TooltipComponent,
 } from 'echarts/components'
 import { CanvasRenderer } from 'echarts/renderers'
@@ -17,21 +14,7 @@ import type {
   ProgressHistoryPoint,
 } from '../types'
 
-echarts.use([
-  LineChart,
-  GridComponent,
-  TooltipComponent,
-  LegendComponent,
-  MarkAreaComponent,
-  MarkPointComponent,
-  CanvasRenderer,
-])
-
-/** 触球瞬间膝关节夹角 · 儿童动作发展黄金区间（与 pose_tracker / report_generator 对齐） */
-const GOLDEN_KNEE_MIN = 140
-const GOLDEN_KNEE_MAX = 160
-const KNEE_AXIS_MIN = 90
-const KNEE_AXIS_MAX = 180
+echarts.use([LineChart, GridComponent, TooltipComponent, CanvasRenderer])
 
 const MOTOR_WINDOW_N = 5
 const MOTOR_VAR_AUTOMATED = 12
@@ -39,6 +22,8 @@ const MOTOR_VAR_EXPLORATORY = 35
 const FATIGUE_DROP = 5
 const KNEE_STIFF = 160
 const ANKLE_RIGID_MIN = 10
+const GOLDEN_KNEE_MIN = 140
+const GOLDEN_KNEE_MAX = 160
 
 const API_BASE_URL = 'http://localhost:8000'
 const FATIGUE_POLL_MS = 2500
@@ -49,8 +34,7 @@ export const FATIGUE_CIRCUIT_BREAKER_LABEL =
   '⚠️【动作衰减熔断】检测到下肢发力变形，请停止该被试当前轮次练习，防止负向肌肉记忆固化！'
 
 /**
- * 前端轻量纵向 enrichment：当后端未注入模块四字段（离线缓存回退）时本地补算，
- * 算法与历史 LongitudinalProgressChart 对齐。
+ * 前端轻量纵向 enrichment：当后端未注入模块四字段（离线缓存回退）时本地补算。
  */
 export function enrichLongitudinalClient(records: GlobalTrainingRecord[]): GlobalTrainingRecord[] {
   if (!records.length) return []
@@ -132,22 +116,6 @@ export function enrichLongitudinalClient(records: GlobalTrainingRecord[]): Globa
     const fatigue = reasons.length > 0
     if (fatigue) hasFatigue = true
 
-    const rolling = rollingVars[i]
-    let bandUpper: number | null = null
-    let bandLower: number | null = null
-    if (rolling != null) {
-      const valid = kneeAngles
-        .slice(0, i + 1)
-        .filter((a): a is number => typeof a === 'number')
-      const window = valid.length >= MOTOR_WINDOW_N ? valid.slice(-MOTOR_WINDOW_N) : valid
-      if (window.length >= 2) {
-        const mean = window.reduce((s, v) => s + v, 0) / window.length
-        const half = Math.sqrt(rolling)
-        bandUpper = Math.round((mean + half) * 10) / 10
-        bandLower = Math.round((mean - half) * 10) / 10
-      }
-    }
-
     return {
       ...record,
       support_knee_angle_resolved: knee,
@@ -157,9 +125,7 @@ export function enrichLongitudinalClient(records: GlobalTrainingRecord[]): Globa
         : null,
       fatigue_reasons: reasons,
       score_delta: delta,
-      motor_stability_index: rolling != null ? Math.round(rolling * 100) / 100 : null,
-      band_upper: bandUpper,
-      band_lower: bandLower,
+      motor_stability_index: rollingVars[i] != null ? Math.round((rollingVars[i] as number) * 100) / 100 : null,
       automation_status: automationStatus,
       motor_stability_phase: phase,
     }
@@ -193,11 +159,9 @@ interface ChartPoint {
   phase: string
   timestamp: string
   score: number | null
-  kneeAngle: number | null
   attemptCount: number
   positiveHighlight: string | null
   negativeHighlight: string | null
-  /** 对应 records 中代表性 Attempt 下标，供点击联动 */
   recordIndex: number
   fatigue: boolean
   fatigueMessage: string | null
@@ -309,32 +273,6 @@ export function aggregateProgressFromRecords(records: GlobalTrainingRecord[]): P
   })
 }
 
-function linearTrendline(values: (number | null)[]): (number | null)[] {
-  const pts: { x: number; y: number }[] = []
-  values.forEach((y, x) => {
-    if (typeof y === 'number' && Number.isFinite(y)) pts.push({ x, y })
-  })
-  if (pts.length < 2) return values.map(() => null)
-
-  const n = pts.length
-  let sumX = 0
-  let sumY = 0
-  let sumXY = 0
-  let sumXX = 0
-  for (const p of pts) {
-    sumX += p.x
-    sumY += p.y
-    sumXY += p.x * p.y
-    sumXX += p.x * p.x
-  }
-  const denom = n * sumXX - sumX * sumX
-  if (Math.abs(denom) < 1e-9) return values.map(() => null)
-  const slope = (n * sumXY - sumX * sumY) / denom
-  const intercept = (sumY - slope * sumX) / n
-
-  return values.map((_, x) => Math.round((intercept + slope * x) * 10) / 10)
-}
-
 function resolveRecordIndex(
   records: GlobalTrainingRecord[],
   point: ProgressHistoryPoint,
@@ -363,19 +301,15 @@ function buildChartPoints(
   return history.map((point, index) => {
     const recordIndex = resolveRecordIndex(records, point)
     const linked = recordIndex >= 0 ? records[recordIndex] : null
+    const score =
+      typeof point.score === 'number' && Number.isFinite(point.score) ? point.score : null
     return {
       index,
       label: point.label || formatAxisLabel(point.date, point.phase),
       date: point.date,
       phase: point.phase,
       timestamp: point.timestamp,
-      score: typeof point.score === 'number' && Number.isFinite(point.score) ? point.score : null,
-      kneeAngle:
-        typeof point.kneeAngle === 'number' && Number.isFinite(point.kneeAngle)
-          ? point.kneeAngle
-          : linked
-            ? pickKneeAngle(linked)
-            : null,
+      score,
       attemptCount: point.attemptCount ?? 1,
       positiveHighlight: point.positiveHighlight ?? null,
       negativeHighlight: point.negativeHighlight ?? point.aiFeedbackSnippet ?? null,
@@ -408,10 +342,8 @@ function isActiveFatigueAlert(alert: FatigueAlertPayload | null | undefined): bo
 }
 
 /**
- * 【纵向进步趋势图 · Catapult 风格】
- * X 轴：真实日期 + 科研节点（如 07/21 (T1)）
- * 主曲线：会话日均五维总分 + 面积渐变 + 线性回归趋势线
- * 辅曲线：触球瞬间膝角（右轴）+ 黄金区间 markArea
+ * 个人进步趋势图（极简）：
+ * X 轴日期/时间戳 · Y 轴综合总分 0–100 · 单折线 + areaStyle
  */
 export default function LongitudinalProgressChart({
   records,
@@ -428,9 +360,9 @@ export default function LongitudinalProgressChart({
   const onSelectRef = useRef(onSelectIndex)
   onSelectRef.current = onSelectIndex
 
-  const enriched = enrichLongitudinalClient(records)
+  const enriched = enrichLongitudinalClient(Array.isArray(records) ? records : [])
   const history =
-    historyPoints && historyPoints.length > 0
+    historyPoints && Array.isArray(historyPoints) && historyPoints.length > 0
       ? historyPoints
       : aggregateProgressFromRecords(enriched)
   const chartData = buildChartPoints(enriched, history)
@@ -459,7 +391,7 @@ export default function LongitudinalProgressChart({
           setPolledFatigue(null)
         }
       } catch {
-        /* 后端离线时静默：仍可用归档 fatigue_alert_flag */
+        /* 后端离线时静默 */
       }
     }
     void poll()
@@ -483,230 +415,136 @@ export default function LongitudinalProgressChart({
 
   const showCircuitBreaker = isActiveFatigueAlert(activeFatigue)
   const dataKey = JSON.stringify(
-    chartData.map((p) => [
-      p.label,
-      p.score,
-      p.kneeAngle,
-      p.positiveHighlight,
-      p.negativeHighlight,
-      p.index === activeSession,
-    ]),
+    chartData.map((p) => [p.label, p.score, p.index === activeSession]),
   )
 
   useEffect(() => {
     const el = chartRef.current
     if (!el || chartData.length === 0) return
 
-    const chart = instanceRef.current ?? echarts.init(el, undefined, { renderer: 'canvas' })
-    instanceRef.current = chart
+    let chart = instanceRef.current
+    try {
+      if (!chart || chart.isDisposed?.()) {
+        chart = echarts.init(el, undefined, { renderer: 'canvas' })
+        instanceRef.current = chart
+      }
+    } catch {
+      return
+    }
 
-    const categories = chartData.map((p) => p.label)
-    const scoreSeries = chartData.map((p) => p.score)
-    const kneeSeries = chartData.map((p) => p.kneeAngle)
-    const trendSeries = linearTrendline(scoreSeries)
-    const hasTrend = trendSeries.some((v) => v != null)
+    const categories = chartData.map((p) => p.label || p.timestamp || p.date || `#${p.index + 1}`)
+    const scoreSeries = chartData.map((p) =>
+      typeof p.score === 'number' && Number.isFinite(p.score) ? p.score : null,
+    )
 
-    const fatigueMarkPoints = chartData
-      .filter((p) => p.fatigue && typeof p.kneeAngle === 'number')
-      .map((p) => ({
-        name: '疲劳拐点',
-        coord: [p.label, p.kneeAngle as number],
-        value: p.kneeAngle,
-        itemStyle: { color: '#fbbf24' },
-        label: { show: true, formatter: '⚠️', color: '#fbbf24', fontSize: 12, fontWeight: 700 },
-      }))
-
-    const legendData = ['会话日均总分', ...(hasTrend ? ['线性趋势'] : []), '触球瞬间膝关节夹角']
-
-    chart.setOption(
-      {
-        backgroundColor: 'transparent',
-        animation: true,
-        animationDuration: 700,
-        animationEasing: 'cubicOut',
-        legend: {
-          top: 4,
-          right: showCircuitBreaker ? 220 : 12,
-          textStyle: { color: 'rgba(255,255,255,0.55)', fontSize: 11 },
-          data: legendData,
-        },
-        tooltip: {
-          trigger: 'axis',
-          backgroundColor: 'rgba(10,14,12,0.94)',
-          borderColor: 'rgba(56,189,248,0.25)',
-          textStyle: { color: '#e2e8f0', fontSize: 12 },
-          formatter: (params: unknown) => {
-            const list = Array.isArray(params) ? params : []
-            if (!list.length) return ''
-            const idx = (list[0] as { dataIndex?: number }).dataIndex ?? 0
-            const point = chartData[idx]
-            if (!point) return ''
-            const scoreText = point.score != null ? `${point.score} 分` : '暂无'
-            const kneeText = point.kneeAngle != null ? `${point.kneeAngle}°` : '暂无'
-            const inBand =
-              point.kneeAngle != null &&
-              point.kneeAngle >= GOLDEN_KNEE_MIN &&
-              point.kneeAngle <= GOLDEN_KNEE_MAX
-            const bandHint = inBand ? ' · 落入黄金区间' : ' · 偏离黄金区间'
-            let html = `<div style="font-weight:700;margin-bottom:6px;color:#7dd3fc">${point.label}</div>`
-            html += `<div style="color:rgba(255,255,255,0.45);margin-bottom:6px">${point.date} · ${point.phase} · ${point.attemptCount} 次尝试</div>`
-            html += `<div>日均总分：<span style="color:#60a5fa;font-weight:600">${scoreText}</span></div>`
-            html += `<div>膝关节夹角：<span style="color:#fb923c">${kneeText}</span><span style="color:rgba(255,255,255,0.35)">${point.kneeAngle != null ? bandHint : ''}</span></div>`
-            if (point.positiveHighlight) {
-              html += `<div style="margin-top:8px;color:#34d399;font-weight:600">↑ ${point.positiveHighlight}</div>`
-            }
-            if (point.negativeHighlight) {
-              html += `<div style="margin-top:4px;color:#fbbf24;font-weight:500">↓ ${point.negativeHighlight}</div>`
-            }
-            if (point.fatigue) {
-              html += `<div style="margin-top:6px;color:#f87171;font-weight:600">${point.fatigueMessage || '⚠️ 下肢疲劳动作衰减'}</div>`
-            }
-            return html
+    try {
+      chart.setOption(
+        {
+          backgroundColor: 'transparent',
+          animation: true,
+          animationDuration: 600,
+          animationEasing: 'cubicOut',
+          tooltip: {
+            trigger: 'axis',
+            backgroundColor: 'rgba(10,14,12,0.94)',
+            borderColor: 'rgba(56,189,248,0.25)',
+            textStyle: { color: '#e2e8f0', fontSize: 12 },
+            formatter: (params: unknown) => {
+              const list = Array.isArray(params) ? params : []
+              if (!list.length) return ''
+              const idx = (list[0] as { dataIndex?: number }).dataIndex ?? 0
+              const point = chartData[idx]
+              if (!point) return ''
+              const scoreText = point.score != null ? `${point.score} 分` : '暂无'
+              let html = `<div style="font-weight:700;margin-bottom:6px;color:#7dd3fc">${point.label}</div>`
+              html += `<div style="color:rgba(255,255,255,0.45);margin-bottom:6px">${point.date} · ${point.phase} · ${point.attemptCount} 次尝试</div>`
+              html += `<div>综合总分：<span style="color:#60a5fa;font-weight:600">${scoreText}</span></div>`
+              if (point.positiveHighlight) {
+                html += `<div style="margin-top:8px;color:#34d399;font-weight:600">↑ ${point.positiveHighlight}</div>`
+              }
+              if (point.negativeHighlight) {
+                html += `<div style="margin-top:4px;color:#fbbf24;font-weight:500">↓ ${point.negativeHighlight}</div>`
+              }
+              if (point.fatigue) {
+                html += `<div style="margin-top:6px;color:#f87171;font-weight:600">${point.fatigueMessage || '⚠️ 下肢疲劳动作衰减'}</div>`
+              }
+              return html
+            },
           },
-        },
-        grid: {
-          left: 56,
-          right: 64,
-          top: 48,
-          bottom: 64,
-          containLabel: false,
-        },
-        xAxis: {
-          type: 'category',
-          data: categories,
-          boundaryGap: false,
-          axisLine: { lineStyle: { color: 'rgba(255,255,255,0.12)' } },
-          axisTick: { show: false },
-          axisLabel: {
-            color: 'rgba(255,255,255,0.55)',
-            fontSize: 11,
-            fontWeight: 600,
-            rotate: 28,
-            interval: 0,
-            margin: 14,
+          grid: {
+            left: 48,
+            right: 24,
+            top: 28,
+            bottom: 56,
+            containLabel: false,
           },
-          splitLine: { show: false },
-        },
-        yAxis: [
-          {
+          xAxis: {
+            type: 'category',
+            data: categories,
+            boundaryGap: false,
+            axisLine: { lineStyle: { color: 'rgba(255,255,255,0.12)' } },
+            axisTick: { show: false },
+            axisLabel: {
+              color: 'rgba(255,255,255,0.55)',
+              fontSize: 11,
+              fontWeight: 600,
+              rotate: categories.length > 6 ? 28 : 0,
+              interval: 0,
+              margin: 12,
+            },
+            splitLine: { show: false },
+          },
+          yAxis: {
             type: 'value',
-            name: '日均总分',
+            name: '综合总分',
             nameTextStyle: { color: 'rgba(96,165,250,0.7)', fontSize: 10, padding: [0, 0, 0, 8] },
             min: 0,
             max: 100,
-            position: 'left',
             axisLine: { show: true, lineStyle: { color: 'rgba(59,130,246,0.45)' } },
             axisLabel: { color: '#60a5fa', fontSize: 11 },
             splitLine: { lineStyle: { color: 'rgba(255,255,255,0.06)' } },
           },
-          {
-            type: 'value',
-            name: '膝关节夹角 °',
-            nameTextStyle: { color: 'rgba(251,146,60,0.75)', fontSize: 10, padding: [0, 8, 0, 0] },
-            min: KNEE_AXIS_MIN,
-            max: KNEE_AXIS_MAX,
-            position: 'right',
-            axisLine: { show: true, lineStyle: { color: 'rgba(249,115,22,0.45)' } },
-            axisLabel: { color: '#fb923c', fontSize: 11, formatter: '{value}°' },
-            splitLine: { show: false },
-          },
-        ],
-        series: [
-          {
-            name: '会话日均总分',
-            type: 'line',
-            yAxisIndex: 0,
-            data: scoreSeries,
-            connectNulls: true,
-            smooth: 0.2,
-            symbol: 'circle',
-            symbolSize: (_val: unknown, params: { dataIndex?: number }) =>
-              params.dataIndex === activeSession ? 12 : 8,
-            itemStyle: {
-              color: '#38bdf8',
-              borderColor: '#fff',
-              borderWidth: 1.5,
-            },
-            lineStyle: { color: '#38bdf8', width: 2.8, type: 'solid' },
-            areaStyle: {
-              color: {
-                type: 'linear',
-                x: 0,
-                y: 0,
-                x2: 0,
-                y2: 1,
-                colorStops: [
-                  { offset: 0, color: 'rgba(56,189,248,0.42)' },
-                  { offset: 0.55, color: 'rgba(56,189,248,0.12)' },
-                  { offset: 1, color: 'rgba(56,189,248,0.01)' },
-                ],
-              },
-            },
-            emphasis: { focus: 'series', scale: 1.15 },
-            z: 3,
-          },
-          ...(hasTrend
-            ? [
-                {
-                  name: '线性趋势',
-                  type: 'line' as const,
-                  yAxisIndex: 0,
-                  data: trendSeries,
-                  connectNulls: true,
-                  smooth: false,
-                  symbol: 'none',
-                  lineStyle: {
-                    color: 'rgba(52,211,153,0.85)',
-                    width: 2,
-                    type: 'dashed' as const,
-                  },
-                  tooltip: { show: false },
-                  z: 2,
-                },
-              ]
-            : []),
-          {
-            name: '触球瞬间膝关节夹角',
-            type: 'line',
-            yAxisIndex: 1,
-            data: kneeSeries,
-            connectNulls: true,
-            smooth: 0.15,
-            symbol: 'circle',
-            symbolSize: (_val: unknown, params: { dataIndex?: number }) =>
-              params.dataIndex === activeSession ? 9 : 5,
-            itemStyle: { color: '#f97316' },
-            lineStyle: { color: '#f97316', width: 2.2, type: 'dashed' },
-            emphasis: { focus: 'series' },
-            markArea: {
-              silent: true,
+          series: [
+            {
+              name: '综合总分',
+              type: 'line',
+              data: scoreSeries,
+              connectNulls: true,
+              smooth: 0.25,
+              symbol: 'circle',
+              symbolSize: (_val: unknown, params: { dataIndex?: number }) =>
+                params.dataIndex === activeSession ? 11 : 7,
               itemStyle: {
-                color: 'rgba(52, 211, 153, 0.18)',
+                color: '#38bdf8',
+                borderColor: '#fff',
+                borderWidth: 1.5,
               },
-              label: {
-                show: true,
-                position: 'insideTopRight',
-                formatter: `黄金区间 ${GOLDEN_KNEE_MIN}°–${GOLDEN_KNEE_MAX}°`,
-                color: '#6ee7b7',
-                fontSize: 10,
-                fontWeight: 600,
+              lineStyle: { color: '#38bdf8', width: 2.6, type: 'solid' },
+              areaStyle: {
+                color: {
+                  type: 'linear',
+                  x: 0,
+                  y: 0,
+                  x2: 0,
+                  y2: 1,
+                  colorStops: [
+                    { offset: 0, color: 'rgba(56,189,248,0.42)' },
+                    { offset: 0.55, color: 'rgba(56,189,248,0.12)' },
+                    { offset: 1, color: 'rgba(56,189,248,0.01)' },
+                  ],
+                },
               },
-              data: [[{ yAxis: GOLDEN_KNEE_MIN, name: '黄金区间' }, { yAxis: GOLDEN_KNEE_MAX }]],
+              emphasis: { focus: 'series', scale: 1.1 },
+              z: 3,
             },
-            markPoint:
-              fatigueMarkPoints.length > 0
-                ? {
-                    symbol: 'circle',
-                    symbolSize: 10,
-                    data: fatigueMarkPoints,
-                  }
-                : undefined,
-            z: 4,
-          },
-        ],
-      },
-      { notMerge: true },
-    )
+          ],
+        },
+        { notMerge: true },
+      )
+    } catch {
+      /* 避免异常 option 拖垮 React 渲染 */
+      return
+    }
 
     const onClick = (params: { dataIndex?: number }) => {
       if (typeof params.dataIndex !== 'number') return
@@ -718,17 +556,31 @@ export default function LongitudinalProgressChart({
     chart.off('click')
     chart.on('click', onClick)
 
-    const onResize = () => chart.resize()
+    const onResize = () => {
+      try {
+        instanceRef.current?.resize()
+      } catch {
+        /* ignore */
+      }
+    }
     window.addEventListener('resize', onResize)
     return () => {
       window.removeEventListener('resize', onResize)
-      chart.off('click', onClick)
+      try {
+        chart?.off('click', onClick)
+      } catch {
+        /* ignore */
+      }
     }
-  }, [dataKey, chartData, activeSession, showCircuitBreaker])
+  }, [dataKey, chartData, activeSession])
 
   useEffect(() => {
     return () => {
-      instanceRef.current?.dispose()
+      try {
+        instanceRef.current?.dispose()
+      } catch {
+        /* ignore */
+      }
       instanceRef.current = null
     }
   }, [])
@@ -740,7 +592,7 @@ export default function LongitudinalProgressChart({
       >
         <TrendingUp className="h-8 w-8 text-white/15" />
         <p className="text-sm text-white/35">暂无历史尝试，完成首次射门测验后即可生成纵向进步图谱</p>
-        <p className="text-[11px] text-white/20">横轴将按真实日期 + 科研节点（如 07/21 (T1)）展开</p>
+        <p className="text-[11px] text-white/20">横轴按日期 / 时间戳展开，纵轴为 0–100 综合总分</p>
       </div>
     )
   }
@@ -761,7 +613,7 @@ export default function LongitudinalProgressChart({
             </span>
           )}
           <span className="rounded-full border border-white/10 bg-black/30 px-2.5 py-1 text-[10px] text-white/40">
-            Catapult 风格 · 日期×节点 · 线性趋势
+            综合总分折线 · areaStyle
           </span>
         </div>
 
@@ -790,27 +642,13 @@ export default function LongitudinalProgressChart({
       <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[10px] text-white/30">
         <span className="inline-flex items-center gap-1.5">
           <span className="h-0.5 w-4 rounded bg-sky-400" />
-          会话日均总分（面积渐变）
+          综合总分（0–100）
         </span>
         <span className="inline-flex items-center gap-1.5">
-          <span className="h-0.5 w-4 rounded border-t border-dashed border-emerald-400" />
-          线性回归趋势线
-        </span>
-        <span className="inline-flex items-center gap-1.5">
-          <span className="h-0.5 w-4 rounded border-t border-dashed border-orange-400" />
-          膝角（右轴）
-        </span>
-        <span className="inline-flex items-center gap-1.5">
-          <span className="h-2.5 w-4 rounded-sm bg-emerald-400/30" />
-          黄金区间 {GOLDEN_KNEE_MIN}°–{GOLDEN_KNEE_MAX}°
+          <span className="h-2.5 w-4 rounded-sm bg-sky-400/30" />
+          面积填充
         </span>
       </div>
-
-      {chartData.length === 1 && (
-        <p className="text-[11px] text-white/25">
-          当前仅 1 个测试日节点。累计 ≥2 个科研节点后可观察线性趋势与跨阶段进步斜率。
-        </p>
-      )}
     </div>
   )
 }

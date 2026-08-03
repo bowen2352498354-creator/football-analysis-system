@@ -51,6 +51,12 @@ v1.1 前后端全栈联调阶段：后台服务网关（FastAPI + Uvicorn）
     GET  /api/progress/history ：个人纵向进步图谱（按测试日聚合：date / phase /
                                 score / 正负向诊断高亮），供教练端 Catapult 风格
                                 ECharts 趋势图消费。
+    GET  /api/coach/records    ：学员成绩列表 + radar_average（所选日期内五维均值）。
+    GET  /api/analytics/compare_cohorts ：班级/实验组三维对比（日趋势均分+方差、
+                                五维雷达均值、ERR_* 错误分布率），供教练看板科研模块。
+    GET  /api/review/student_summary ：B 组课后复盘聚合（极值双关键帧
+                                comparison_frames：best vs improve）。
+    DELETE|POST /api/records/batch ：批量软删除归档记录（is_deleted=True，禁止物理删除）。
 
 【科技伦理与隐私保护红线】（与 pose_tracker.py 完全一致）：
     所有视频帧的姿态推理、骨骼绘制、面部高斯模糊打码全部在服务端内存中实时完成，
@@ -107,7 +113,9 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import Any, Optional
 
@@ -167,10 +175,11 @@ def safe_print(*args, **kwargs) -> None:
 import cv2
 import mediapipe as mp
 import numpy as np
-from fastapi import FastAPI, UploadFile, File, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, UploadFile, File, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
-from pydantic import BaseModel, ConfigDict
+from fastapi.responses import JSONResponse, Response
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 # 【核心复用】直接把 pose_tracker.py 当作一个模块导入，复用里面已经写好的
 # 骨骼绘制 / 角度计算 / 三级容错判定 / 面部打码函数，绝不重复实现算法逻辑。
@@ -523,9 +532,9 @@ class AnalysisSession:
 
     def build_time_series_velocity_window(
         self, t_impact: Optional[int] = None
-    ) -> tuple[list, int, int]:
+    ) -> tuple[list, int, int, list]:
         if self.pipeline is None:
-            return [], 0, 0
+            return [], 0, 0, []
         return self.pipeline.build_time_series_velocity_window(t_impact=t_impact)
 
     def rebuild_leg_annotation(self, score_detail=None, t_impact=None):
@@ -543,7 +552,28 @@ class AnalysisSession:
 # 第二步：FastAPI 应用初始化 + CORS 跨域配置
 # --------------------------------------------------------------------------
 
-app = FastAPI(title="小学足球AI可视化反馈系统 - 后台服务网关", version="1.1.0")
+@asynccontextmanager
+async def _app_lifespan(_app: FastAPI):
+    """启动时初始化软删除列，并拉起 12 小时自动备份守护线程。"""
+    try:
+        from db import init_db, start_auto_backup_daemon
+
+        init_db()
+        started = start_auto_backup_daemon()
+        safe_print(
+            "【api_server】数据安全守护已就绪"
+            + ("（已启动自动备份线程）" if started else "（自动备份线程已在运行）")
+        )
+    except Exception as exc:  # noqa: BLE001 - 备份守护失败不得阻断主服务
+        safe_print(f"【api_server】启动数据安全守护失败（主服务继续运行）：{exc}")
+    yield
+
+
+app = FastAPI(
+    title="小学足球AI可视化反馈系统 - 后台服务网关",
+    version="1.1.0",
+    lifespan=_app_lifespan,
+)
 
 # 开启 CORS：允许本地 Vite 开发服务器（5173/5183 等常见端口）跨域访问。
 # 开发阶段直接放开所有来源，避免因为 Vite 随机切换端口而反复改配置；
@@ -555,6 +585,19 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(RequestValidationError)
+async def _pydantic_request_validation_handler(request, exc: RequestValidationError):
+    """非法 Payload → 标准 HTTP 422（Pydantic 强类型校验失败）。"""
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": exc.errors(),
+            "body": getattr(exc, "body", None),
+            "message": "请求体字段类型或约束不合法",
+        },
+    )
 
 
 @app.get("/")
@@ -569,21 +612,59 @@ def read_root():
 
 @app.post("/api/upload_video")
 async def upload_video(file: UploadFile = File(...)):
-    """接收前端上传的本地 MP4 文件（例如 test_video.mp4），保存到项目根目录
-    uploads/ 临时目录下，返回后端可以直接用 cv2.VideoCapture 打开的绝对路径。
+    """接收前端上传的本地视频文件（推荐 MP4），保存到项目根目录 uploads/ 临时目录，
+    并用 OpenCV 读取第一帧做解码可用性校验，再返回可直接用于分析的绝对路径。
 
     前端拿到 video_path 后，在下一步通过 WebSocket 发送
     {"action": "start", "source": "file", "video_path": video_path} 即可启动分析。
+
+    解码失败（如部分 .MOV 编码不被本机 OpenCV 支持）时返回标准 JSON HTTP 500，
+    避免进程异常退出导致前端只看到含糊的 Failed to fetch。
     """
-    file_extension = os.path.splitext(file.filename or "")[1] or ".mp4"
-    saved_filename = f"{uuid.uuid4().hex}{file_extension}"
-    saved_path = os.path.join(UPLOAD_DIR, saved_filename)
+    saved_path: Optional[str] = None
+    try:
+        file_extension = os.path.splitext(file.filename or "")[1] or ".mp4"
+        saved_filename = f"{uuid.uuid4().hex}{file_extension}"
+        saved_path = os.path.join(UPLOAD_DIR, saved_filename)
 
-    with open(saved_path, "wb") as f:
-        content = await file.read()
-        f.write(content)
+        with open(saved_path, "wb") as f:
+            content = await file.read()
+            f.write(content)
 
-    return {"video_path": saved_path, "original_filename": file.filename}
+        # 第一帧验证：尽早暴露不受支持的容器/编码（常见于 iPhone .MOV）
+        cap = cv2.VideoCapture(saved_path)
+        try:
+            if not cap.isOpened():
+                raise RuntimeError(
+                    f"无法打开视频文件（格式可能不受支持）：{file.filename or saved_filename}"
+                )
+            ret, _frame = cap.read()
+            if not ret:
+                raise RuntimeError(
+                    f"视频第一帧读取失败（ret == False），本机 OpenCV 可能不支持该编码"
+                    f"（如 .MOV）。请改用标准 H.264 .mp4。文件：{file.filename or saved_filename}"
+                )
+        finally:
+            cap.release()
+
+        return {"video_path": saved_path, "original_filename": file.filename}
+    except Exception as e:
+        # 最外层兜底：绝不让未捕获异常把服务进程打挂；统一回传可读 JSON 500
+        if saved_path and os.path.exists(saved_path):
+            try:
+                os.remove(saved_path)
+            except OSError:
+                pass
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "message": (
+                    "视频解码失败或程序异常，请尽量使用标准的 .mp4 格式。"
+                    f"详细错误: {e}"
+                ),
+            },
+        )
 
 
 @app.get("/api/default_test_video")
@@ -689,8 +770,20 @@ async def websocket_analyze(websocket: WebSocket):
 
 
 class GenerateReportRequest(BaseModel):
-    session_id: str
-    student_number: str = ""
+    """生成诊断报告入参：非法类型由 FastAPI/Pydantic 自动返回 HTTP 422。"""
+
+    model_config = ConfigDict(extra="ignore", str_strip_whitespace=True)
+
+    session_id: str = Field(..., min_length=1, max_length=128)
+    student_number: str = Field(default="", max_length=64)
+
+    @field_validator("session_id")
+    @classmethod
+    def _session_id_non_blank(cls, value: str) -> str:
+        text = str(value or "").strip()
+        if not text:
+            raise ValueError("session_id 不可为空")
+        return text
 
 
 @app.post("/api/generate_report")
@@ -860,15 +953,27 @@ def generate_report(payload: GenerateReportRequest):
     frame_count_out = len(sample_angles)
     time_series_velocity: Optional[list] = None
     impact_index_in_window: Optional[int] = None
+    absolute_timestamps: Optional[list] = None
     if session is not None:
         angular_velocities_out = [float(v) for v in session._trajectory_omega]
         frame_count_out = int(
             getattr(session, "sync_frame_count", None) or len(session._trajectory_omega) or len(sample_angles)
         )
         if len(session._trajectory_omega) > 0:
-            time_series_velocity, impact_index_in_window, _roi_start = (
-                session.build_time_series_velocity_window(t_impact=t_impact_locked)
-            )
+            (
+                time_series_velocity,
+                impact_index_in_window,
+                _roi_start,
+                absolute_timestamps,
+            ) = session.build_time_series_velocity_window(t_impact=t_impact_locked)
+            # 将绝对时间戳一并写入 scoreDetail.action_roi，供前端 scrub 直连视频秒
+            if isinstance(score_detail, dict) and absolute_timestamps is not None:
+                roi = score_detail.get("action_roi")
+                if not isinstance(roi, dict):
+                    roi = {}
+                    score_detail["action_roi"] = roi
+                roi["absolute_timestamps"] = list(absolute_timestamps)
+                roi["start"] = int(_roi_start)
 
     # 报告已生成完毕，主动清理这份会话（连同内存中持有的击球关键帧画面），
     # 严格遵守"不长期持久化保存任何视频帧"的科技伦理红线，同时避免内存持续累积。
@@ -890,6 +995,12 @@ def generate_report(payload: GenerateReportRequest):
         "totalAttempts": total_attempts,
         "painPoint": ai_result["painPoint"],
         "prescription": ai_result["prescription"],
+        "correction_metaphor": ai_result.get(
+            "correction_metaphor", ai_result["painPoint"]
+        ),
+        "praise_encouragement": ai_result.get(
+            "praise_encouragement", ai_result["prescription"]
+        ),
         "fullText": full_text,
         "generatedAt": generated_at,
         "hitStats": hit_stats,
@@ -902,8 +1013,11 @@ def generate_report(payload: GenerateReportRequest):
         "angular_velocities": angular_velocities_out,
         "angularVelocities": angular_velocities_out,
         # Sprint 1：鞭打发力窗口 [t_impact±30] 角速度时序 + 触球点窗口内索引
+        # absolute_timestamps：切片内每帧在原视频中的绝对秒，消除波形-视频时空脱节
         "time_series_velocity": time_series_velocity,
         "timeSeriesVelocity": time_series_velocity,
+        "absolute_timestamps": absolute_timestamps,
+        "absoluteTimestamps": absolute_timestamps,
         "impact_index_in_window": impact_index_in_window,
         "impactIndexInWindow": impact_index_in_window,
         "task_status": TASK_STATUS_COMPLETED,
@@ -931,9 +1045,21 @@ def generate_report(payload: GenerateReportRequest):
 
 
 class SaveSessionRequest(BaseModel):
-    # 直接接收前端 sessionQueue 的原始 JSON 结构（每一项是一位学生的归档实体），
-    # 不在后端做强类型校验——前端已经用 TypeScript 类型约束过结构，这里只管落盘。
-    sessions: list[dict]
+    """归档池落盘：sessions 必须为对象列表，非法类型 → HTTP 422。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    sessions: list[dict] = Field(default_factory=list)
+
+    @field_validator("sessions")
+    @classmethod
+    def _sessions_are_dicts(cls, value: list) -> list:
+        if not isinstance(value, list):
+            raise ValueError("sessions 必须为数组")
+        for i, item in enumerate(value):
+            if not isinstance(item, dict):
+                raise ValueError(f"sessions[{i}] 必须为对象")
+        return value
 
 
 @app.post("/api/save_session")
@@ -977,6 +1103,64 @@ def load_sessions():
 
 
 # --------------------------------------------------------------------------
+# B 组课后复盘：学生摘要 + 最佳 vs 待改进 双关键帧
+# --------------------------------------------------------------------------
+
+
+@app.get("/api/review/student_summary")
+def review_student_summary(
+    student_id: str = "",
+    session_date: Optional[str] = None,
+    session_id: Optional[str] = None,
+):
+    """B 组课后复盘聚合：按 total_score 极值筛选 best / improve 触球关键帧。
+
+    Query：
+        student_id —— 学号（必填）
+        session_date —— YYYY-MM-DD，限定本节课日期（可选）
+        session_id —— 归档池中的课时实体 id（可选，优先于日期）
+
+    有效尝试数 < 2 时 ``comparison_frames`` 为 null，``comparison_available=False``。
+    """
+    sid = (student_id or "").strip()
+    if not sid:
+        return {
+            "success": False,
+            "student_id": "",
+            "session_date": (session_date or "").strip()[:10] or None,
+            "session_id": (session_id or "").strip() or None,
+            "attempt_count": 0,
+            "attempts": [],
+            "comparison_frames": None,
+            "comparison_available": False,
+            "message": "缺少 student_id",
+        }
+    try:
+        from db import student_review_summary
+
+        return student_review_summary(
+            sid,
+            session_date=session_date,
+            session_id=session_id,
+            web_session_path=WEB_SESSION_LOG_PATH,
+            global_db_path=GLOBAL_DB_PATH,
+        )
+    except Exception as exc:  # noqa: BLE001
+        safe_print(f"【api_server】review/student_summary 失败：{exc}")
+        return {
+            "success": False,
+            "student_id": sid,
+            "session_date": (session_date or "").strip()[:10] or None,
+            "session_id": (session_id or "").strip() or None,
+            "attempt_count": 0,
+            "attempts": [],
+            "comparison_frames": None,
+            "comparison_available": False,
+            "message": f"复盘聚合失败：{exc}",
+        }
+
+
+# --------------------------------------------------------------------------
 # 第五步再半：核心接口四 —— 调用 DeepSeek 生成「跨次尝试聚合诊断报告」
 #
 #         课后集中复盘看板里，教练查看某位同学 2~3 次尝试的整体趋势时，
@@ -986,48 +1170,281 @@ def load_sessions():
 # --------------------------------------------------------------------------
 
 
+def _coerce_json_float(value, *, field_name: str = "value", allow_none: bool = True):
+    """将 JSON 数值（含 numpy 标量 / 数字字符串）统一转为 Python float。
+
+    Pydantic v2 对 int 字段拒绝带小数部分的 number（int_from_float → HTTP 422）；
+    业务指标一律走 float，避免嵌套模型叶子节点再踩坑。
+    """
+    if value is None or value == "":
+        if allow_none:
+            return None
+        return 0.0
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} 不能为布尔值")
+    try:
+        # numpy.float64 等：优先 item()/float()，避免 isinstance(x, float) 漏判
+        if hasattr(value, "item") and not isinstance(value, (str, bytes, dict, list)):
+            value = value.item()
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} 必须为数值") from exc
+
+
+def _coerce_float_dict(value, *, field_name: str = "metrics") -> Optional[dict]:
+    """Dict[str, int] 风格载荷 → Dict[str, float]；非 dict 视为非法。"""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError(f"{field_name} 必须为对象")
+    out: dict = {}
+    for key, raw in value.items():
+        if raw is None or raw == "":
+            continue
+        out[str(key)] = _coerce_json_float(raw, field_name=f"{field_name}.{key}", allow_none=False)
+    return out
+
+
+def _coerce_float_dict_soft(value, *, default_empty: bool = False) -> Optional[dict]:
+    """宽松 dict[str, float]：非法整体/叶子一律跳过，绝不抛错触发 422。"""
+    if value is None or value == "":
+        return {} if default_empty else None
+    if not isinstance(value, dict):
+        return {} if default_empty else None
+    out: dict = {}
+    for key, raw in value.items():
+        if raw is None or raw == "" or isinstance(raw, bool):
+            continue
+        try:
+            if hasattr(raw, "item") and not isinstance(raw, (str, bytes, dict, list)):
+                raw = raw.item()
+            out[str(key)] = float(raw)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _coerce_float_list_soft(value) -> Optional[list]:
+    """宽松 float 列表：非数组或坏叶子 → None / 跳过，避免可选字段 422。"""
+    if value is None or value == "":
+        return None
+    if not isinstance(value, list):
+        return None
+    out: list = []
+    for item in value:
+        if item is None or item == "" or isinstance(item, bool):
+            continue
+        try:
+            if hasattr(item, "item") and not isinstance(item, (str, bytes, dict, list)):
+                item = item.item()
+            out.append(float(item))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _coerce_optional_float_soft(value) -> Optional[float]:
+    """可选 float：无法解析时回落 None，不抛 ValidationError。"""
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return None
+    try:
+        if hasattr(value, "item") and not isinstance(value, (str, bytes, dict, list)):
+            value = value.item()
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+class AggregateHitStats(BaseModel):
+    """三级命中统计：全部 float，兼容均值/百分比等小数，杜绝 int_from_float。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    green: float = 0.0
+    yellow: float = 0.0
+    red: float = 0.0
+
+    @field_validator("green", "yellow", "red", mode="before")
+    @classmethod
+    def _coerce_hit_counts(cls, value):
+        coerced = _coerce_optional_float_soft(value)
+        return 0.0 if coerced is None else coerced
+
+
 class AggregateAttemptSummary(BaseModel):
-    attemptNumber: int
-    score: Optional[int] = None
-    hitStats: Optional[dict] = None
+    """单次尝试摘要。所有业务数值均为 float；禁止任何指标字段声明为 int。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    # 序号也用 float：JS/聚合链路可能传 2.0；下游 dump 时再 round 成展示序号
+    attemptNumber: float = 0.0
+    score: Optional[float] = None
+    hitStats: Optional[AggregateHitStats] = None
+    # 前端若误带完整报告字段，按 float 接收后忽略用途，避免再引入 int 子模型
+    totalAttempts: Optional[float] = None
+    avgKneeAngle: Optional[float] = None
+    kneeFlexionAngle: Optional[float] = None
+    stabilityScore: Optional[float] = None
+    radar_scores: Optional[dict[str, float]] = Field(default_factory=dict)
+    radarScores: Optional[dict[str, float]] = Field(default_factory=dict)
+    scores: Optional[dict[str, float]] = Field(default_factory=dict)
+    comment: Optional[str] = ""
+    task_status: Optional[str] = None
+
+    @field_validator(
+        "attemptNumber",
+        "score",
+        "totalAttempts",
+        "avgKneeAngle",
+        "kneeFlexionAngle",
+        "stabilityScore",
+        mode="before",
+    )
+    @classmethod
+    def _coerce_metric_floats(cls, value, info):
+        coerced = _coerce_optional_float_soft(value)
+        if info.field_name == "attemptNumber":
+            return 0.0 if coerced is None else max(0.0, coerced)
+        return coerced
+
+    @field_validator("radar_scores", "radarScores", "scores", mode="before")
+    @classmethod
+    def _coerce_radar_maps(cls, value):
+        return _coerce_float_dict_soft(value, default_empty=True)
+
+    @field_validator("hitStats", mode="before")
+    @classmethod
+    def _coerce_hit_stats(cls, value):
+        if value is None or value == "":
+            return None
+        if isinstance(value, AggregateHitStats):
+            return value
+        if not isinstance(value, dict):
+            return None
+        return _coerce_float_dict_soft(value, default_empty=True)
 
 
 class GenerateAggregateReportRequest(BaseModel):
-    student_number: str = ""
-    attempts: list[AggregateAttemptSummary]
+    model_config = ConfigDict(extra="ignore", str_strip_whitespace=True)
+
+    student_number: str = Field(default="", max_length=64)
+    attempts: list[AggregateAttemptSummary] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_attempts_tree(cls, data):
+        """深度清洗 attempts 树：叶子数值全部 float 化，杜绝嵌套 int 校验。"""
+        if not isinstance(data, dict):
+            return data
+        attempts = data.get("attempts")
+        if not isinstance(attempts, list):
+            return data
+
+        def _walk(node):
+            if isinstance(node, dict):
+                out = {}
+                for key, raw in node.items():
+                    if isinstance(raw, (dict, list)):
+                        out[key] = _walk(raw)
+                    elif isinstance(raw, bool) or raw is None or isinstance(raw, str):
+                        out[key] = raw
+                    else:
+                        try:
+                            out[key] = _coerce_json_float(raw, field_name=str(key), allow_none=True)
+                        except ValueError:
+                            out[key] = raw
+                return out
+            if isinstance(node, list):
+                return [_walk(item) for item in node]
+            return node
+
+        return {**data, "attempts": [_walk(item) if isinstance(item, dict) else item for item in attempts]}
 
 
 @app.post("/api/generate_aggregate_report")
 def generate_aggregate_report(payload: GenerateAggregateReportRequest):
-    """基于同一位学生本节课 2~3 次尝试的评分/三级命中统计，生成跨次趋势诊断。"""
-    attempts_summary = [item.model_dump() for item in payload.attempts]
+    """基于同一位学生历史有效尝试（≥2 次，可跨课时/跨天）生成跨次趋势诊断。"""
+    attempts_summary = []
+    for item in payload.attempts:
+        row = item.model_dump()
+        # LLM prompt 使用整数序号；校验层已改为 float 以防 422
+        try:
+            row["attemptNumber"] = int(round(float(row.get("attemptNumber") or 0)))
+        except (TypeError, ValueError):
+            row["attemptNumber"] = 0
+        attempts_summary.append(row)
+    scores = [item.score for item in payload.attempts if isinstance(item.score, (int, float))]
 
-    ai_result = llm_agent.generate_aggregate_diagnosis(
-        student_number=payload.student_number, attempts_summary=attempts_summary
-    )
+    # 阈值放宽：只要历史有效评分 ≥ 2（不论是否同一天）即可请求聚合诊断
+    if len(scores) < 2:
+        raise HTTPException(
+            status_code=400,
+            detail="历史有效数据不足 2 次，暂无法生成聚合诊断（可不在同一天累计）",
+        )
+
+    try:
+        ai_result = llm_agent.generate_aggregate_diagnosis(
+            student_number=payload.student_number, attempts_summary=attempts_summary
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"【api_server】聚合诊断接口异常：{exc}")
+        raise HTTPException(
+            status_code=504,
+            detail="大模型生成超时，请重试",
+        ) from exc
 
     generated_at = time.strftime("%Y-%m-%d %H:%M:%S")
 
     # 【聚合稳定性得分计算】以各次尝试评分的离散程度（标准差）换算稳定性得分：
     # 各趟评分越接近，说明动作表现越稳定，得分越高；忽高忽低则相应扣分。
-    scores = [item.score for item in payload.attempts if isinstance(item.score, (int, float))]
-    if len(scores) >= 2:
-        mean_score = sum(scores) / len(scores)
-        variance = sum((s - mean_score) ** 2 for s in scores) / len(scores)
-        std_dev = variance ** 0.5
-        stability_score = int(max(0, min(100, round(100 - std_dev * 1.5))))
-    elif len(scores) == 1:
-        # 只有一次尝试时，没有"趋势"可言，直接沿用这一次的评分作为稳定性参考
-        stability_score = int(scores[0])
-    else:
-        stability_score = 0
+    mean_score = sum(scores) / len(scores)
+    variance = sum((s - mean_score) ** 2 for s in scores) / len(scores)
+    std_dev = variance ** 0.5
+    stability_score = int(max(0, min(100, round(100 - std_dev * 1.5))))
 
+    llm_error = ai_result.get("error")
     full_text = (
-        f"学号 {payload.student_number or '未填写'} 本节课多趟聚合诊断报告"
-        f"（共 {len(attempts_summary)} 次尝试，动作表现稳定性得分 {stability_score} 分）\n\n"
+        f"学号 {payload.student_number or '未填写'} 跨课时聚合诊断报告"
+        f"（共 {len(attempts_summary)} 次历史尝试，动作表现稳定性得分 {stability_score} 分）\n\n"
         f"{ai_result['trendDescription']}\n"
         f"{ai_result['prescription']}"
     )
+    if llm_error:
+        full_text = f"⚠️ {llm_error}\n\n{full_text}"
+
+    # 极值双关键帧：复用同一批 attempts（≥2）拼装 best vs improve
+    comparison_frames = None
+    try:
+        from db import build_comparison_frames
+
+        comparison_frames = build_comparison_frames(
+            [
+                {
+                    "attemptNumber": row.get("attemptNumber"),
+                    "attempt_id": row.get("attemptNumber"),
+                    "score": row.get("score"),
+                    "total_score": row.get("score"),
+                    "impactFrameBase64": row.get("impactFrameImage")
+                    or row.get("impactFrameBase64"),
+                    "biomechanicalErrors": row.get("biomechanicalErrors") or [],
+                    "scoreDetail": row.get("scoreDetail"),
+                    "reportData": {
+                        "score": row.get("score"),
+                        "impactFrameImage": row.get("impactFrameImage")
+                        or row.get("impactFrameBase64"),
+                        "scoreDetail": row.get("scoreDetail"),
+                        "hitStats": row.get("hitStats"),
+                        "painPoint": row.get("painPoint"),
+                    },
+                }
+                for row in attempts_summary
+            ]
+        )
+    except Exception as cmp_exc:  # noqa: BLE001
+        safe_print(f"【api_server】聚合报告 comparison_frames 组装失败：{cmp_exc}")
+        comparison_frames = None
 
     return {
         "stabilityScore": stability_score,
@@ -1035,6 +1452,9 @@ def generate_aggregate_report(payload: GenerateAggregateReportRequest):
         "prescription": ai_result["prescription"],
         "fullText": full_text,
         "generatedAt": generated_at,
+        "llmError": llm_error,
+        "comparison_frames": comparison_frames,
+        "comparison_available": comparison_frames is not None,
     }
 
 
@@ -1068,6 +1488,7 @@ class SaveWordReportRequest(BaseModel):
     totalAttempts: Optional[float] = None
     painPoint: str = ""
     prescription: str = ""
+    comment: Optional[str] = ""
     # 报告生成时间戳（前端已格式化好的字符串），缺省时后端自动补当前时间
     generatedAt: Optional[str] = None
     # 后端 OpenCV 矢量标注过的击球关键帧截图，Base64/data URI 字符串，可为空
@@ -1079,7 +1500,7 @@ class SaveWordReportRequest(BaseModel):
     # （Green/Yellow/Red），前端 finalReport.hitStats / attempt.reportData.hitStats
     # 原样转发过来，后端据此推导出本条记录归属的生物力学错误分类标签，
     # 供教练端看板的「集体错误热力图」统计全班高频失误分布使用。
-    hitStats: Optional[dict] = None
+    hitStats: Optional[AggregateHitStats] = None
     # 【v4.0 新增：科研级数据矩阵】本次分析全程真实测得的膝关节屈曲角度均值
     # （来自 /api/generate_report 返回的 avgKneeAngle，是 pose_tracker.py 逐帧
     # 真实计算出的物理测量值）。缺失时（例如历史联调数据、前端尚未回填）后端
@@ -1087,30 +1508,105 @@ class SaveWordReportRequest(BaseModel):
     kneeFlexionAngle: Optional[float] = None
     # 【SDT 成就印章】前端原样转发 generate_report 的 scoreDetail，供落盘时
     # 抽出脚踝刚性方差 / 支撑脚横纵偏差 / 五维雷达，供周成就引擎消费。
-    scoreDetail: Optional[dict] = None
-    score_detail: Optional[dict] = None
-    # 【V3.1】前端可能把 generate_report 顶层字段原样带回；一律 Optional 防 422
-    radar_scores: Optional[dict] = None
-    radarScores: Optional[dict] = None
-    spatial_trajectory: Optional[dict] = None
-    spatialTrajectory: Optional[dict] = None
+    # 保持宽松 dict，避免嵌套叶子 int 校验；写入前不做 int 强约束。
+    scoreDetail: Optional[dict[str, Any]] = Field(default_factory=dict)
+    score_detail: Optional[dict[str, Any]] = Field(default_factory=dict)
+    # 【V3.1】雷达小分 / 临时分数字典：缺失或脏值一律软降级，绝不 422
+    radar_scores: Optional[dict[str, float]] = Field(default_factory=dict)
+    radarScores: Optional[dict[str, float]] = Field(default_factory=dict)
+    scores: Optional[dict[str, float]] = Field(default_factory=dict)
+    quantified5dScores: Optional[dict[str, float]] = Field(default_factory=dict)
+    quantified_5d_scores: Optional[dict[str, float]] = Field(default_factory=dict)
+    spatial_trajectory: Optional[dict[str, Any]] = Field(default_factory=dict)
+    spatialTrajectory: Optional[dict[str, Any]] = Field(default_factory=dict)
     avgKneeAngle: Optional[float] = None
     t_impact: Optional[float] = None
     tImpact: Optional[float] = None
-    time_series_velocity: Optional[list] = None
-    timeSeriesVelocity: Optional[list] = None
+    time_series_velocity: Optional[list[float]] = Field(default_factory=list)
+    timeSeriesVelocity: Optional[list[float]] = Field(default_factory=list)
+    # 切片内每帧在原视频中的绝对秒：[ (roi_start+i)/fps, ... ]
+    absolute_timestamps: Optional[list[float]] = Field(default_factory=list)
+    absoluteTimestamps: Optional[list[float]] = Field(default_factory=list)
     impact_index_in_window: Optional[float] = None
     impactIndexInWindow: Optional[float] = None
     frame_count: Optional[float] = None
     frameCount: Optional[float] = None
-    angular_velocities: Optional[list] = None
-    angularVelocities: Optional[list] = None
-    action_roi: Optional[dict] = None
-    fullText: Optional[str] = None
-    scoringEngine: Optional[str] = None
+    angular_velocities: Optional[list[float]] = Field(default_factory=list)
+    angularVelocities: Optional[list[float]] = Field(default_factory=list)
+    action_roi: Optional[dict[str, Any]] = Field(default_factory=dict)
+    fullText: Optional[str] = ""
+    scoringEngine: Optional[str] = ""
     task_status: Optional[str] = None
     fatigue_warning: Optional[Any] = None
     fatigueWarning: Optional[Any] = None
+
+    @field_validator(
+        "score",
+        "totalAttempts",
+        "kneeFlexionAngle",
+        "avgKneeAngle",
+        "t_impact",
+        "tImpact",
+        "impact_index_in_window",
+        "impactIndexInWindow",
+        "frame_count",
+        "frameCount",
+        mode="before",
+    )
+    @classmethod
+    def _coerce_word_report_floats(cls, value):
+        return _coerce_optional_float_soft(value)
+
+    @field_validator(
+        "radar_scores",
+        "radarScores",
+        "scores",
+        "quantified5dScores",
+        "quantified_5d_scores",
+        mode="before",
+    )
+    @classmethod
+    def _coerce_word_radar(cls, value):
+        return _coerce_float_dict_soft(value, default_empty=True)
+
+    @field_validator(
+        "scoreDetail",
+        "score_detail",
+        "spatial_trajectory",
+        "spatialTrajectory",
+        "action_roi",
+        mode="before",
+    )
+    @classmethod
+    def _coerce_optional_dicts(cls, value):
+        if value is None or value == "":
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    @field_validator("hitStats", mode="before")
+    @classmethod
+    def _coerce_word_hit_stats(cls, value):
+        if value is None or value == "":
+            return None
+        if isinstance(value, AggregateHitStats):
+            return value
+        if not isinstance(value, dict):
+            return None
+        return _coerce_float_dict_soft(value, default_empty=True)
+
+    @field_validator(
+        "time_series_velocity",
+        "timeSeriesVelocity",
+        "absolute_timestamps",
+        "absoluteTimestamps",
+        "angular_velocities",
+        "angularVelocities",
+        mode="before",
+    )
+    @classmethod
+    def _coerce_float_lists(cls, value):
+        coerced = _coerce_float_list_soft(value)
+        return [] if coerced is None else coerced
 
 
 # 【v3.0 新增：生物力学错误分类体系】
@@ -1131,11 +1627,15 @@ BIOMECH_ERROR_TAXONOMY = [
 ]
 
 
-def _classify_biomechanical_errors(hit_stats: Optional[dict], score: Optional[int]) -> list[str]:
+def _classify_biomechanical_errors(hit_stats: Optional[Any], score: Optional[float]) -> list[str]:
     """根据本次尝试的三级命中统计与综合评分，启发式推导出本条记录命中的
     生物力学错误分类标签列表（可能为空，也可能同时命中多个维度）。
     """
     if not hit_stats:
+        return []
+    if isinstance(hit_stats, BaseModel):
+        hit_stats = hit_stats.model_dump()
+    if not isinstance(hit_stats, dict):
         return []
     try:
         green = float(hit_stats.get("green", 0) or 0)
@@ -1316,6 +1816,16 @@ def _is_soft_deleted_record(record: dict) -> bool:
     if isinstance(raw, (int, float)):
         return bool(raw)
     return str(raw or "").strip().lower() in {"1", "true", "yes", "y"}
+
+
+def _active_global_records(records: Optional[list] = None) -> list[dict]:
+    """返回 ``is_deleted == False`` 的活跃归档（软删记录仍保留在硬盘上）。"""
+    source = records if isinstance(records, list) else _load_global_records()
+    return [
+        record
+        for record in source
+        if isinstance(record, dict) and not _is_soft_deleted_record(record)
+    ]
 
 
 def _record_test_date(record: dict) -> str:
@@ -1596,36 +2106,68 @@ def _extract_support_chassis_deviation(record: dict) -> Optional[float]:
     return round(_support_lateral_deviation(float(lateral)) + abs(float(ap)), 3)
 
 
+_RADAR_DIM_ALIASES: dict[str, tuple[str, ...]] = {
+    "approach_rhythm": (
+        "approach_rhythm",
+        "approach_rhythm_score",
+        "approach_score",
+        "approach",
+    ),
+    "support_stability": (
+        "support_stability",
+        "support_stability_score",
+        "support_score",
+        "support",
+    ),
+    "backswing_folding": (
+        "backswing_folding",
+        "backswing_folding_score",
+        "backswing_score",
+        "folding",
+    ),
+    "ankle_rigidity": (
+        "ankle_rigidity",
+        "ankle_rigidity_score",
+    ),
+    "whipping_velocity": (
+        "whipping_velocity",
+        "whipping_velocity_score",
+        "whipping_score",
+        "whipping",
+    ),
+}
+
+
+def _pick_radar_dim(radar: dict, dim_key: str) -> Optional[float]:
+    for alias in _RADAR_DIM_ALIASES.get(dim_key, (dim_key,)):
+        num = _safe_float(radar.get(alias))
+        if num is not None:
+            return num
+    return None
+
+
+def _extract_radar_dict(record: dict) -> Optional[dict]:
+    """从归档记录中提取五维雷达字典（兼容多字段名）。"""
+    for key in ("quantified5dScores", "radar_scores", "radarScores"):
+        raw = record.get(key)
+        if isinstance(raw, dict) and raw:
+            return raw
+    detail = record.get("scoreDetail") or record.get("score_detail") or {}
+    if isinstance(detail, dict):
+        raw = detail.get("radar_scores") or detail.get("radarScores")
+        if isinstance(raw, dict) and raw:
+            return raw
+    return None
+
+
 def _sum_radar_scores(radar: Any) -> Optional[float]:
     if not isinstance(radar, dict):
         return None
     vals: list[float] = []
     for key in _RADAR_DIM_KEYS:
-        num = _safe_float(radar.get(key))
-        if num is None:
-            # 兼容旧版 *_score 别名
-            num = _safe_float(radar.get(f"{key}_score"))
+        num = _pick_radar_dim(radar, key)
         if num is not None:
             vals.append(num)
-    # 也兼容 quantified5dScores 的简写键
-    if len(vals) < 3:
-        alias_map = {
-            "support_stability": ("support_stability_score", "support"),
-            "backswing_folding": ("backswing_folding_score", "folding"),
-            "ankle_rigidity": ("ankle_rigidity_score",),
-            "whipping_velocity": ("whipping_velocity_score", "whipping"),
-            "approach_rhythm": ("approach_rhythm_score", "approach"),
-        }
-        vals = []
-        for key, aliases in alias_map.items():
-            num = _safe_float(radar.get(key))
-            if num is None:
-                for a in aliases:
-                    num = _safe_float(radar.get(a))
-                    if num is not None:
-                        break
-            if num is not None:
-                vals.append(num)
     if not vals:
         return None
     return round(sum(vals), 2)
@@ -1633,16 +2175,33 @@ def _sum_radar_scores(radar: Any) -> Optional[float]:
 
 def _extract_five_dim_total(record: dict) -> Optional[float]:
     """五维雷达总分（每维满分 20，合计满分 100）；缺失时回退综合分 score。"""
-    for key in ("quantified5dScores", "radar_scores", "radarScores"):
-        total = _sum_radar_scores(record.get(key))
-        if total is not None:
-            return total
-    detail = record.get("scoreDetail") or record.get("score_detail") or {}
-    if isinstance(detail, dict):
-        total = _sum_radar_scores(detail.get("radar_scores"))
+    radar = _extract_radar_dict(record)
+    if radar is not None:
+        total = _sum_radar_scores(radar)
         if total is not None:
             return total
     return _safe_float(record.get("score"))
+
+
+def _aggregate_radar_average(records: list[dict]) -> dict[str, Optional[float]]:
+    """对所选日期内记录按五维求均值，供教练端综合能力画像。"""
+    buckets: dict[str, list[float]] = {key: [] for key in _RADAR_DIM_KEYS}
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        radar = _extract_radar_dict(record)
+        if not isinstance(radar, dict):
+            continue
+        for key in _RADAR_DIM_KEYS:
+            num = _pick_radar_dim(radar, key)
+            if num is not None:
+                buckets[key].append(num)
+
+    average: dict[str, Optional[float]] = {}
+    for key in _RADAR_DIM_KEYS:
+        vals = buckets[key]
+        average[key] = round(sum(vals) / len(vals), 2) if vals else None
+    return average
 
 
 def _mean(values: list[float]) -> Optional[float]:
@@ -1700,6 +2259,8 @@ def calculate_achievements(
 
     for record in source:
         if not isinstance(record, dict):
+            continue
+        if _is_soft_deleted_record(record):
             continue
         sid = str(record.get("studentId") or record.get("anonymous_id") or "").strip()
         if not sid:
@@ -1912,6 +2473,23 @@ def _metrics_snapshot_from_score_detail(score_detail: Optional[dict]) -> dict:
     return snapshot
 
 
+def _word_report_error_response(
+    message: str,
+    *,
+    status_code: int = 500,
+    detail: Optional[str] = None,
+) -> JSONResponse:
+    """Word 导出失败时的统一 JSON：兼容前端 success 字段，并带 status=error。"""
+    body = {
+        "success": False,
+        "status": "error",
+        "message": message,
+    }
+    if detail:
+        body["detail"] = detail
+    return JSONResponse(status_code=status_code, content=body)
+
+
 @app.post("/api/save_word_report")
 def save_word_report(payload: SaveWordReportRequest):
     """接收前端组装好的学生档案 + AI 诊断报告 + 关键帧图片 Base64 + 模式类型，
@@ -1923,130 +2501,359 @@ def save_word_report(payload: SaveWordReportRequest):
     追加保存进项目根目录的 global_training_db.json，供教练端看板统一消费；
     同时把这条记录原样返回给前端，前端再同步写入 localStorage 作为极速双保险。
 
-    【健壮性说明】word_reporter.save_feedback_to_word() 内部已经对 Base64 图片
-    解码异常、Windows 非法文件名字符做了完整防呆处理，本接口这里只需要再兜底
-    捕获一层意料之外的异常（例如磁盘写满/权限不足等系统级错误），确保接口
-    永远返回结构化的 JSON 结果，绝不会给前端返回一个裸的 500 错误页面。
+    【异常安全网】整段核心逻辑包在 try/except 中：字段缺失 (KeyError)、
+    类型异常 (TypeError/ValueError) 或其它未预料错误都不得拖垮进程，
+    一律打详细日志并以 400/500 JSON 返回前端。
     """
     try:
-        result = word_reporter.save_feedback_to_word(payload.model_dump())
-    except Exception as exc:  # noqa: BLE001 - 任何未预料的系统级异常都不应让接口直接崩溃
-        safe_print(f"【api_server】保存 Word 报告时发生未预料的异常：{exc}")
-        return {"success": False, "message": f"保存 Word 报告失败：{exc}"}
+        try:
+            payload_dict = payload.model_dump() if hasattr(payload, "model_dump") else dict(payload)
+        except Exception as dump_exc:  # noqa: BLE001
+            safe_print(f"【api_server】save_word_report 序列化请求体失败：{dump_exc}")
+            safe_print(traceback.format_exc())
+            return _word_report_error_response(
+                f"报告生成失败，请求数据无法解析: {dump_exc}",
+                status_code=400,
+                detail=str(dump_exc),
+            )
 
-    if result.get("success"):
-        record_type = "delayed" if payload.mode == "delayed" else "realtime"
-        ai_feedback_text = "\n".join(
-            part.strip() for part in (payload.painPoint, payload.prescription) if part and part.strip()
-        )
+        try:
+            result = word_reporter.save_feedback_to_word(payload_dict if isinstance(payload_dict, dict) else {})
+        except (KeyError, TypeError, ValueError, AttributeError) as gen_exc:
+            safe_print(
+                f"【api_server】save_word_report Word 生成阶段数据异常"
+                f"（{type(gen_exc).__name__}）：{gen_exc}"
+            )
+            safe_print(traceback.format_exc())
+            return _word_report_error_response(
+                f"报告生成失败，部分数据缺失: {gen_exc}",
+                status_code=400,
+                detail=f"{type(gen_exc).__name__}: {gen_exc}",
+            )
+        except Exception as gen_exc:  # noqa: BLE001
+            safe_print(f"【api_server】save_word_report Word 生成未预料异常：{gen_exc}")
+            safe_print(traceback.format_exc())
+            return _word_report_error_response(
+                f"报告生成失败: {gen_exc}",
+                status_code=500,
+                detail=str(gen_exc),
+            )
 
-        record_timestamp = payload.generatedAt or time.strftime("%Y-%m-%d %H:%M:%S")
-        biomechanical_errors = _classify_biomechanical_errors(payload.hitStats, payload.score)
+        if not isinstance(result, dict):
+            return _word_report_error_response(
+                "报告生成失败，生成模块返回格式异常",
+                status_code=500,
+            )
 
-        # 【SDT】合并 scoreDetail 轻量快照（脚踝刚性 / 支撑横纵 / 五维雷达）
-        detail_payload = payload.scoreDetail or payload.score_detail
-        detail_dict = detail_payload if isinstance(detail_payload, dict) else None
-        snapshot = _metrics_snapshot_from_score_detail(detail_dict)
-        # 若 indicators.distance_cm 为 measured，覆盖 snapshot 并写入 provenance
-        if isinstance(detail_dict, dict):
-            ind = detail_dict.get("indicators") if isinstance(detail_dict.get("indicators"), dict) else {}
-            dist_ind = ind.get("distance_cm") if isinstance(ind, dict) else None
-            if isinstance(dist_ind, dict) and dist_ind.get("provenance") in (
+        if not result.get("success"):
+            err_msg = result.get("error") or result.get("message") or "未知错误"
+            return _word_report_error_response(
+                f"报告生成失败，部分数据缺失: {err_msg}",
+                status_code=400,
+                detail=str(err_msg),
+            )
+
+        saved_path = result.get("path") or ""
+        saved_directory = result.get("directory")
+        saved_filename = result.get("filename")
+
+        # ---- 写盘已成功：后续归档库同步单独兜底，失败不影响 Word 成功响应 ----
+        record = None
+        try:
+            record_type = "delayed" if getattr(payload, "mode", None) == "delayed" else "realtime"
+            pain = getattr(payload, "painPoint", None) or ""
+            prescription = getattr(payload, "prescription", None) or ""
+            ai_feedback_text = "\n".join(
+                part.strip() for part in (pain, prescription) if part and str(part).strip()
+            )
+
+            record_timestamp = getattr(payload, "generatedAt", None) or time.strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+            biomechanical_errors = _classify_biomechanical_errors(
+                getattr(payload, "hitStats", None),
+                getattr(payload, "score", None),
+            )
+
+            detail_payload = getattr(payload, "scoreDetail", None) or getattr(
+                payload, "score_detail", None
+            )
+            detail_dict = detail_payload if isinstance(detail_payload, dict) else None
+            snapshot = _metrics_snapshot_from_score_detail(detail_dict) or {}
+            if isinstance(detail_dict, dict):
+                ind = (
+                    detail_dict.get("indicators")
+                    if isinstance(detail_dict.get("indicators"), dict)
+                    else {}
+                )
+                dist_ind = ind.get("distance_cm") if isinstance(ind, dict) else None
+                if isinstance(dist_ind, dict) and dist_ind.get("provenance") in (
+                    "measured",
+                    "calibrated",
+                ):
+                    if dist_ind.get("value") is not None:
+                        try:
+                            snapshot["supportFootDistance"] = round(float(dist_ind["value"]), 2)
+                            snapshot["supportFootDistanceProvenance"] = str(
+                                dist_ind.get("provenance")
+                            )
+                        except (TypeError, ValueError):
+                            pass
+
+            knee_val, knee_prov = _resolve_archive_knee_flexion(
+                getattr(payload, "kneeFlexionAngle", None),
+                getattr(payload, "score", None),
+                detail_dict,
+            )
+            support_val, support_prov = _resolve_archive_support_foot(
+                getattr(payload, "score", None),
+                detail_dict,
+                snapshot,
+            )
+
+            record = {
+                "id": str(uuid.uuid4()),
+                "timestamp": record_timestamp,
+                "school": getattr(payload, "school", None) or "",
+                "classGroup": getattr(payload, "classGroup", None) or "",
+                "studentId": getattr(payload, "studentNumber", None) or "",
+                "type": record_type,
+                "score": getattr(payload, "score", None),
+                "biomechanicalErrors": biomechanical_errors,
+                "aiFeedback": ai_feedback_text,
+                "impactFrameBase64": getattr(payload, "impactFrameImage", None),
+                "heatmapBase64": getattr(payload, "heatmapBase64", None)
+                or getattr(payload, "heatmap_base64", None),
+                "path": saved_path,
+                "directory": saved_directory,
+                "testDate": _extract_test_date(record_timestamp),
+                "groupTypeCode": 1 if record_type == "realtime" else 2,
+                "kneeFlexionAngle": knee_val,
+                "kneeFlexionAngleProvenance": knee_prov,
+                "supportFootDistance": support_val,
+                "supportFootDistanceProvenance": support_prov,
+                "primaryErrorCode": _derive_primary_error_code(biomechanical_errors),
+            }
+            if snapshot.get("supportFootDistance") is not None and support_prov in (
                 "measured",
                 "calibrated",
             ):
-                if dist_ind.get("value") is not None:
-                    snapshot["supportFootDistance"] = round(float(dist_ind["value"]), 2)
-                    snapshot["supportFootDistanceProvenance"] = str(dist_ind["provenance"])
+                record["supportFootDistance"] = snapshot["supportFootDistance"]
+                record["supportFootDistanceProvenance"] = support_prov
+            for key, value in snapshot.items():
+                if key in ("supportFootDistance", "supportFootDistanceProvenance"):
+                    continue
+                record[key] = value
+            try:
+                _append_global_record(record)
+            except Exception as db_exc:  # noqa: BLE001
+                safe_print(
+                    f"【api_server】追加记录到全局训练数据库失败（Word 文件已正常保存）：{db_exc}"
+                )
+                safe_print(traceback.format_exc())
+        except (KeyError, TypeError, ValueError, AttributeError) as archive_exc:
+            safe_print(
+                f"【api_server】save_word_report 归档字段组装失败"
+                f"（Word 已保存，跳过全局库同步）：{archive_exc}"
+            )
+            safe_print(traceback.format_exc())
+            record = None
+        except Exception as archive_exc:  # noqa: BLE001
+            safe_print(
+                f"【api_server】save_word_report 归档阶段未预料异常"
+                f"（Word 已保存）：{archive_exc}"
+            )
+            safe_print(traceback.format_exc())
+            record = None
 
-        knee_val, knee_prov = _resolve_archive_knee_flexion(
-            payload.kneeFlexionAngle, payload.score, detail_dict
-        )
-        support_val, support_prov = _resolve_archive_support_foot(
-            payload.score, detail_dict, snapshot
-        )
-
-        record = {
-            "id": str(uuid.uuid4()),
-            "timestamp": record_timestamp,
-            "school": payload.school or "",
-            "classGroup": payload.classGroup or "",
-            "studentId": payload.studentNumber or "",
-            "type": record_type,
-            "score": payload.score,
-            "biomechanicalErrors": biomechanical_errors,
-            "aiFeedback": ai_feedback_text,
-            "impactFrameBase64": payload.impactFrameImage,
-            "heatmapBase64": payload.heatmapBase64 or payload.heatmap_base64,
-            "path": result["path"],
-            "directory": result.get("directory"),
-            # 【v4.0 / Phase3】科研矩阵字段 + provenance（估算不得伪装实测）
-            "testDate": _extract_test_date(record_timestamp),
-            "groupTypeCode": 1 if record_type == "realtime" else 2,
-            "kneeFlexionAngle": knee_val,
-            "kneeFlexionAngleProvenance": knee_prov,
-            "supportFootDistance": support_val,
-            "supportFootDistanceProvenance": support_prov,
-            "primaryErrorCode": _derive_primary_error_code(biomechanical_errors),
-        }
-        if snapshot.get("supportFootDistance") is not None and support_prov in (
-            "measured",
-            "calibrated",
-        ):
-            record["supportFootDistance"] = snapshot["supportFootDistance"]
-            record["supportFootDistanceProvenance"] = support_prov
-        for key, value in snapshot.items():
-            if key in ("supportFootDistance", "supportFootDistanceProvenance"):
-                continue
-            record[key] = value
-        try:
-            _append_global_record(record)
-        except Exception as exc:  # noqa: BLE001 - 数据库追加失败不应影响 Word 本身已经保存成功的结果
-            safe_print(f"【api_server】追加记录到全局训练数据库失败（Word 文件已正常保存）：{exc}")
-
-        return {
+        response_body = {
             "success": True,
-            "message": f"报告已自动保存成 Word！文件已存入：{result['path']}",
-            "path": result["path"],
-            "directory": result.get("directory"),
-            "filename": result.get("filename"),
-            "record": record,
+            "status": "ok",
+            "message": f"报告已自动保存成 Word！文件已存入：{saved_path}",
+            "path": saved_path,
+            "directory": saved_directory,
+            "filename": saved_filename,
         }
+        if record is not None:
+            response_body["record"] = record
+        return response_body
 
-    return {
-        "success": False,
-        "message": f"保存 Word 报告失败：{result.get('error', '未知错误')}",
-    }
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        safe_print(
+            f"【api_server】save_word_report 外层捕获数据异常"
+            f"（{type(exc).__name__}）：{exc}"
+        )
+        safe_print(traceback.format_exc())
+        return _word_report_error_response(
+            f"报告生成失败，部分数据缺失: {exc}",
+            status_code=400,
+            detail=f"{type(exc).__name__}: {exc}",
+        )
+    except Exception as exc:  # noqa: BLE001 - 绝对禁止未捕获异常拖垮服务进程
+        safe_print(f"【api_server】save_word_report 外层未预料异常：{exc}")
+        safe_print(traceback.format_exc())
+        return _word_report_error_response(
+            f"报告生成失败: {exc}",
+            status_code=500,
+            detail=str(exc),
+        )
 
 
 @app.get("/api/get_all_records")
 def get_all_records(include_deleted: bool = False):
     """供教练端数据看板一键拉取全量历史归档数据（实时反馈 A 组 + 延时反馈 B 组）。
 
-    默认过滤 ``is_deleted == True`` 的废记录；传 ``include_deleted=true`` 可审计全量。
+    默认仅返回 ``is_deleted == False``；软删记录继续躺在硬盘 JSON 中，
+    绝不物理清除。传 ``include_deleted=true`` 可审计全量（含已软删）。
     """
-    records = _load_global_records()
-    if not include_deleted:
-        records = [r for r in records if isinstance(r, dict) and not _is_soft_deleted_record(r)]
-    return {"success": True, "records": records, "count": len(records)}
+    with _global_db_lock:
+        records = [r for r in _load_global_records() if isinstance(r, dict)]
+
+    if include_deleted:
+        return {"success": True, "records": records, "count": len(records)}
+
+    active = _active_global_records(records)
+    return {"success": True, "records": active, "count": len(active)}
 
 
 class DeleteCoachRecordRequest(BaseModel):
-    """教练端软删除：仅标记 is_deleted，绝不物理抹除。"""
+    """教练端单条软删除请求（``is_deleted=True``，禁止物理删除）。"""
 
-    id: str
+    model_config = ConfigDict(extra="ignore")
+
+    id: str = ""
     recordId: Optional[str] = None
+
+
+class BatchDeleteRecordsRequest(BaseModel):
+    """批量软删除：接收多个归档记录 ID（``is_deleted=True``）。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    ids: list[str] = Field(default_factory=list)
+    recordIds: Optional[list[str]] = Field(default_factory=list)
 
 
 class CalibrateCoachMetricRequest(BaseModel):
     """Phase 4：教练人工标定焦点指标 → provenance=calibrated。"""
 
-    id: str
+    model_config = ConfigDict(extra="ignore")
+
+    id: str = ""
     recordId: Optional[str] = None
-    metric_key: str
-    value: float
+    metric_key: str = ""
+    value: float = 0.0
     coach_id: Optional[str] = "coach"
-    note: Optional[str] = None
+    note: Optional[str] = ""
+
+    @field_validator("value", mode="before")
+    @classmethod
+    def _coerce_calibrate_value(cls, value):
+        coerced = _coerce_optional_float_soft(value)
+        return 0.0 if coerced is None else coerced
+
+
+def _normalize_batch_ids(payload: BatchDeleteRecordsRequest) -> list[str]:
+    raw_ids = list(payload.ids or []) + list(payload.recordIds or [])
+    seen: set[str] = set()
+    ids: list[str] = []
+    for raw in raw_ids:
+        rid = str(raw or "").strip()
+        if not rid or rid in seen:
+            continue
+        seen.add(rid)
+        ids.append(rid)
+    return ids
+
+
+def _soft_delete_records_by_ids(ids: list[str]) -> dict:
+    """软删除：将 ``is_deleted`` 置 True，记录继续保留在硬盘；同步 ORM。
+
+    绝对禁止 ``del`` / 覆盖式剔除 / DROP。前端清道夫看到的「删除」只是隐身。
+    """
+    if not ids:
+        return {
+            "success": False,
+            "message": "缺少记录 ID 列表",
+            "deletedIds": [],
+            "alreadyDeletedIds": [],
+            "missingIds": [],
+            "count": 0,
+            "ormDeleted": 0,
+        }
+
+    deleted_ids: list[str] = []
+    already_deleted_ids: list[str] = []
+    missing_ids: list[str] = []
+    matched_records: list[dict] = []
+
+    with _global_db_lock:
+        records = _load_global_records()
+        wanted = set(ids)
+        found: set[str] = set()
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            rid = str(record.get("id") or "").strip()
+            if not rid or rid not in wanted:
+                continue
+            found.add(rid)
+            if _is_soft_deleted_record(record):
+                already_deleted_ids.append(rid)
+                continue
+            record["is_deleted"] = True
+            record["isDeleted"] = True
+            deleted_ids.append(rid)
+            matched_records.append(record)
+        for rid in ids:
+            if rid not in found:
+                missing_ids.append(rid)
+        # 全量写回（含软删行），绝不物理剔除
+        _save_global_records([r for r in records if isinstance(r, dict)])
+
+    orm_deleted = 0
+    try:
+        from db import soft_delete_shot_attempt_matching, soft_delete_shot_attempts_by_ids
+
+        orm_deleted += soft_delete_shot_attempts_by_ids(deleted_ids)
+        for record in matched_records:
+            rid = str(record.get("id") or "")
+            if rid.isdigit():
+                continue
+            if _soft_delete_orm_shot_by_json_id(rid):
+                orm_deleted += 1
+                continue
+            anon = str(
+                record.get("anonymous_id")
+                or record.get("studentId")
+                or record.get("student_id")
+                or ""
+            ).strip()
+            day = _record_test_date(record)
+            score = record.get("score")
+            score_f = float(score) if isinstance(score, (int, float)) else None
+            orm_deleted += soft_delete_shot_attempt_matching(
+                anonymous_id=anon,
+                session_date=day,
+                total_score=score_f,
+            )
+    except Exception as exc:  # noqa: BLE001
+        safe_print(f"【api_server】批量 ORM 软删除失败：{exc}")
+
+    return {
+        "success": True,
+        "message": f"已软删除 {len(deleted_ids)} 条记录（数据仍保留在硬盘）",
+        "deletedIds": deleted_ids,
+        "alreadyDeletedIds": already_deleted_ids,
+        "missingIds": missing_ids,
+        "count": len(deleted_ids),
+        "ormDeleted": orm_deleted,
+    }
+
+
+# 兼容旧内部调用名：一律转发软删除，禁止物理删除
+def _hard_delete_records_by_ids(ids: list[str]) -> dict:
+    return _soft_delete_records_by_ids(ids)
 
 
 @app.get("/api/coach/records")
@@ -2066,6 +2873,8 @@ def coach_list_records(
         group —— 实验组别：realtime | delayed | A | B（亦接受 classGroup 中文别名）；
         class_group —— 行政班/组别精确过滤；
         include_deleted —— 默认 False，隐藏软删除废记录。
+
+    额外返回 ``radar_average``：当前筛选结果集内五维雷达各维平均分。
     """
     records = _load_global_records()
     date_from_s = (date_from or "").strip()[:10]
@@ -2089,6 +2898,7 @@ def coach_list_records(
     group_norm = group_aliases.get(group_q, group_q) if group_q else ""
 
     filtered: list[dict] = []
+    source_for_radar: list[dict] = []
     for record in records:
         if not isinstance(record, dict):
             continue
@@ -2140,6 +2950,12 @@ def coach_list_records(
         if len(snapshot) > 120:
             snapshot = snapshot[:117] + "…"
 
+        radar = _extract_radar_dict(record)
+        errors = record.get("biomechanicalErrors") or record.get("biomechanical_errors")
+        if not isinstance(errors, list):
+            errors = []
+
+        source_for_radar.append(record)
         filtered.append(
             {
                 "id": record.get("id"),
@@ -2155,10 +2971,11 @@ def coach_list_records(
                 "score": record.get("score"),
                 "diagnosisSnapshot": snapshot,
                 "aiFeedback": feedback,
-                "is_deleted": _is_soft_deleted_record(record),
-                "path": record.get("path"),
-                "directory": record.get("directory"),
-                # Phase 4：清道夫标定所需量纲快照
+                "biomechanicalErrors": [str(e) for e in errors if e],
+                "quantified5dScores": radar,
+                "radar_scores": radar,
+                "kneeFlexionAngle": record.get("kneeFlexionAngle")
+                or record.get("knee_flexion_angle"),
                 "supportFootDistance": record.get("supportFootDistance"),
                 "supportFootDistanceProvenance": record.get(
                     "supportFootDistanceProvenance"
@@ -2173,55 +2990,60 @@ def coach_list_records(
                 or record.get("ankle_rigidity_provenance"),
                 "lastCalibratedAt": record.get("lastCalibratedAt"),
                 "lastCalibratedMetric": record.get("lastCalibratedMetric"),
+                "is_deleted": _is_soft_deleted_record(record),
+                "path": record.get("path"),
+                "directory": record.get("directory"),
             }
         )
 
     filtered.sort(key=lambda r: str(r.get("timestamp") or ""), reverse=True)
+    radar_average = _aggregate_radar_average(source_for_radar)
     return {
         "success": True,
         "records": filtered,
         "count": len(filtered),
+        "radar_average": radar_average,
     }
+
+
+@app.api_route("/api/records/batch", methods=["DELETE", "POST"])
+def batch_delete_records(payload: BatchDeleteRecordsRequest):
+    """批量软删除归档记录：``is_deleted=True``，同步 ORM；禁止物理删除。
+
+    同时支持 DELETE / POST，避免旧进程或某些客户端对 DELETE+body 不兼容导致 404。
+    """
+    return _soft_delete_records_by_ids(_normalize_batch_ids(payload))
 
 
 @app.post("/api/coach/delete_record")
 def coach_delete_record(payload: DeleteCoachRecordRequest):
-    """【Sprint 5】软删除：将指定记录 ``is_deleted`` 置为 True，保留审计痕迹。"""
+    """单条软删除：仅标记 ``is_deleted=True``，记录仍保留在硬盘 JSON / ORM。"""
     record_id = (payload.id or payload.recordId or "").strip()
     if not record_id:
         return {"success": False, "message": "缺少记录 ID"}
 
-    with _global_db_lock:
-        records = _load_global_records()
-        target: Optional[dict] = None
-        for record in records:
-            if isinstance(record, dict) and str(record.get("id") or "") == record_id:
-                target = record
-                break
-        if target is None:
-            return {"success": False, "message": f"未找到记录：{record_id}"}
-
-        if _is_soft_deleted_record(target):
-            return {
-                "success": True,
-                "message": "该记录已标记为无效",
-                "id": record_id,
-                "alreadyDeleted": True,
-            }
-
-        target["is_deleted"] = True
-        _save_global_records(records)
-
-    # 尽力同步 ORM（失败不影响 JSON 软删成功）
-    orm_hit = _soft_delete_orm_shot_by_json_id(record_id)
-    if not orm_hit:
-        _soft_delete_orm_shot_matching(target)
-
+    result = _soft_delete_records_by_ids([record_id])
+    if not result.get("success"):
+        return result
+    if record_id in (result.get("missingIds") or []):
+        return {"success": False, "message": f"未找到记录：{record_id}"}
+    if record_id in (result.get("alreadyDeletedIds") or []) and record_id not in (
+        result.get("deletedIds") or []
+    ):
+        return {
+            "success": True,
+            "message": "该记录此前已软删除",
+            "id": record_id,
+            "deleted": True,
+            "alreadyDeleted": True,
+            "ormDeleted": result.get("ormDeleted", 0),
+        }
     return {
         "success": True,
-        "message": "已标记为无效，该数据将不参与最终科研统计",
+        "message": "已软删除该记录（数据仍保留在硬盘）",
         "id": record_id,
-        "is_deleted": True,
+        "deleted": True,
+        "ormDeleted": result.get("ormDeleted", 0),
     }
 
 
@@ -2436,6 +3258,8 @@ def _aggregate_progress_history(
     for raw in records:
         if not isinstance(raw, dict):
             continue
+        if _is_soft_deleted_record(raw):
+            continue
         rid = str(raw.get("studentId") or raw.get("student_id") or "").strip()
         if rid != sid:
             continue
@@ -2585,7 +3409,7 @@ def progress_history(
     class_f = (classGroup or class_group or "").strip()
     try:
         points = _aggregate_progress_history(
-            _load_global_records(),
+            _active_global_records(),
             student_id=sid,
             school=school_f,
             class_group=class_f,
@@ -2847,12 +3671,28 @@ def export_spss_wide_matrix():
 
 
 class GenerateClassPrescriptionRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     school: str = ""
     classGroup: str = ""
-    # 键为错误分类标签，值为该分类在全班记录中的出现百分比（0-100）
-    errorStats: dict[str, float] = {}
-    totalRecords: int = 0
+    # 键为错误分类标签，值为该分类在全班记录中的出现百分比（0-100）——必须 float
+    errorStats: dict[str, float] = Field(default_factory=dict)
+    # 记录总数偶发以 12.0 传入；用 float 接收，下游再 int(round(...))
+    totalRecords: float = 0.0
     avgScore: Optional[float] = None
+
+    @field_validator("errorStats", mode="before")
+    @classmethod
+    def _coerce_error_stats(cls, value):
+        return _coerce_float_dict_soft(value, default_empty=True) or {}
+
+    @field_validator("totalRecords", "avgScore", mode="before")
+    @classmethod
+    def _coerce_class_metrics(cls, value, info):
+        coerced = _coerce_optional_float_soft(value)
+        if info.field_name == "totalRecords":
+            return 0.0 if coerced is None else coerced
+        return coerced
 
 
 @app.post("/api/generate_class_prescription")
@@ -2864,7 +3704,7 @@ def generate_class_prescription_endpoint(payload: GenerateClassPrescriptionReque
         school=payload.school,
         class_group=payload.classGroup,
         error_stats=payload.errorStats,
-        total_records=payload.totalRecords,
+        total_records=int(round(float(payload.totalRecords or 0))),
         avg_score=payload.avgScore,
     )
     generated_at = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -2878,10 +3718,23 @@ def generate_class_prescription_endpoint(payload: GenerateClassPrescriptionReque
 
 
 class GenerateIndividualSummaryRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     studentId: str = ""
-    scoreHistory: list[float] = []
-    # 键为错误分类标签，值为该生历史记录中该分类出现的次数
-    errorCounter: dict[str, int] = {}
+    scoreHistory: list[float] = Field(default_factory=list)
+    # 禁止 dict[str, int]：聚合占比/均值可能带小数 → 一律 float
+    errorCounter: dict[str, float] = Field(default_factory=dict)
+
+    @field_validator("scoreHistory", mode="before")
+    @classmethod
+    def _coerce_score_history(cls, value):
+        coerced = _coerce_float_list_soft(value)
+        return [] if coerced is None else coerced
+
+    @field_validator("errorCounter", mode="before")
+    @classmethod
+    def _coerce_error_counter(cls, value):
+        return _coerce_float_dict_soft(value, default_empty=True) or {}
 
 
 @app.post("/api/generate_individual_summary")
@@ -2889,10 +3742,14 @@ def generate_individual_summary_endpoint(payload: GenerateIndividualSummaryReque
     """「个体纵向进化追踪」档案：基于该生全周期历史评分与错误分类统计，
     调用 DeepSeek 生成结构化的「稳定发力优势」与「需克服习惯性盲区」总结。
     """
+    # LLM 侧按「次数」展示时取整；校验层保持 float 以免 422
+    error_counter_int = {
+        str(k): int(round(float(v))) for k, v in (payload.errorCounter or {}).items()
+    }
     ai_result = llm_agent.generate_individual_summary(
         student_id=payload.studentId,
         score_history=payload.scoreHistory,
-        error_counter=payload.errorCounter,
+        error_counter=error_counter_int,
     )
     generated_at = time.strftime("%Y-%m-%d %H:%M:%S")
     return {
@@ -2903,7 +3760,9 @@ def generate_individual_summary_endpoint(payload: GenerateIndividualSummaryReque
 
 
 class OpenFolderRequest(BaseModel):
-    path: str
+    model_config = ConfigDict(extra="ignore")
+
+    path: str = ""
 
 
 @app.post("/api/open_folder")
@@ -2939,6 +3798,68 @@ def open_folder(payload: OpenFolderRequest):
 #         查询参数解析与结果透传。数据优先读 research_shot_logs.json，
 #         不存在时自动桥接 global_training_db.json。
 # --------------------------------------------------------------------------
+
+
+@app.get("/api/analytics/compare_cohorts")
+def analytics_compare_cohorts(cohort_a: str = "", cohort_b: str = ""):
+    """【班级/实验组对比】科研分析聚合。
+
+    Query：
+        cohort_a / cohort_b —— 班级/实验组名称（如「四年级1班-实验A组」）
+
+    返回三维对比：
+      ① trend：按日期 average_score + score_variance（波动区间）
+      ② radar：五维（助跑/支撑/后摆/踝锁/鞭打）均值
+      ③ error_rates：高频 ERR_* 发生占比
+
+    样本为空或不足时 ``sufficient_data=False``，前端渲染「暂无足够数据对比」。
+    """
+    try:
+        from db import compare_cohorts
+
+        payload = compare_cohorts(
+            cohort_a,
+            cohort_b,
+            records=_active_global_records(),
+        )
+        return payload
+    except Exception as exc:  # noqa: BLE001
+        safe_print(f"【api_server】compare_cohorts 失败：{exc}")
+        try:
+            from db import empty_compare_cohorts_payload
+
+            empty = empty_compare_cohorts_payload(
+                (cohort_a or "").strip(),
+                (cohort_b or "").strip(),
+                message="暂无足够数据对比",
+            )
+            empty["success"] = False
+            return empty
+        except Exception:  # noqa: BLE001
+            return {
+                "success": False,
+                "sufficient_data": False,
+                "message": "暂无足够数据对比",
+                "cohort_a": (cohort_a or "").strip(),
+                "cohort_b": (cohort_b or "").strip(),
+                "sample_counts": {"a": 0, "b": 0},
+                "trend": {"dates": [], "cohort_a": [], "cohort_b": []},
+                "radar": {
+                    "dimensions": ["助跑", "支撑", "后摆", "踝锁", "鞭打"],
+                    "keys": [
+                        "approach_rhythm",
+                        "support_stability",
+                        "backswing_folding",
+                        "ankle_rigidity",
+                        "whipping_velocity",
+                    ],
+                    "cohort_a": [None, None, None, None, None],
+                    "cohort_b": [None, None, None, None, None],
+                    "cohort_a_scores": {},
+                    "cohort_b_scores": {},
+                },
+                "error_rates": {"cohort_a": [], "cohort_b": [], "union_codes": []},
+            }
 
 
 @app.get("/api/coach/progress_monitor")
@@ -3015,10 +3936,16 @@ os.makedirs(TELESTRATION_DIR, exist_ok=True)
 class SaveTelestrationImageRequest(BaseModel):
     """前端合并「视频定格帧 + Canvas 涂鸦」后的 JPEG/PNG Base64。"""
 
-    imageBase64: str
+    model_config = ConfigDict(extra="ignore")
+
+    imageBase64: str = ""
     attemptId: Optional[str] = None
     studentNumber: Optional[str] = None
     studentId: Optional[str] = None
+    comment: Optional[str] = ""
+    scores: Optional[dict[str, float]] = Field(default_factory=dict)
+    radar_scores: Optional[dict[str, float]] = Field(default_factory=dict)
+    task_status: Optional[str] = None
 
 
 def _decode_data_url_bytes(data_url: str) -> bytes:

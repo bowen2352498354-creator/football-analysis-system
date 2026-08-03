@@ -179,7 +179,7 @@ body,
   animation: blink-caret 0.9s step-end infinite;
 }
 
-/* ---- Coach Dashboard：三栏局部滚动 + 现代细滚动条 ---- */
+/* ---- Coach Dashboard：三栏填满剩余高度并局部滚动 ---- */
 .coach-dashboard-shell {
   display: flex;
   flex-direction: column;
@@ -188,11 +188,52 @@ body,
   overflow: hidden;
 }
 
+/* CTMS 全局控制台：悬浮条带 */
+.coach-global-control-panel {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+}
+
 .coach-panel-scroll {
-  height: calc(100vh - 80px);
+  /* 必须相对父级 flex 剩余高度，禁止再用 100vh 硬算（会裁切底部） */
+  height: 100%;
+  max-height: 100%;
+  min-height: 0;
   overflow-y: auto;
   overflow-x: hidden;
-  min-height: 0;
+  overscroll-behavior: contain;
+}
+
+/* 班级群体画像：AI 宏观建议卡渐变描边 */
+.class-profiling-ai-card {
+  background: linear-gradient(
+    135deg,
+    rgba(167, 139, 250, 0.75),
+    rgba(56, 189, 248, 0.45),
+    rgba(52, 211, 153, 0.55),
+    rgba(244, 114, 182, 0.4)
+  );
+  background-size: 220% 220%;
+  animation: class-profiling-ai-border 8s ease infinite;
+}
+
+@keyframes class-profiling-ai-border {
+  0% {
+    background-position: 0% 50%;
+  }
+  50% {
+    background-position: 100% 50%;
+  }
+  100% {
+    background-position: 0% 50%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .class-profiling-ai-card {
+    animation: none;
+  }
 }
 
 /* Tailwind-style scrollbar utilities（无需额外插件） */

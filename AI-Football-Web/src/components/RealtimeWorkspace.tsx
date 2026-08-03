@@ -21,6 +21,9 @@ import {
   Save,
   CheckCircle2,
   XCircle,
+  RotateCcw,
+  Timer,
+  Hand,
 } from 'lucide-react'
 import { useTypewriter } from '../hooks/useTypewriter'
 import {
@@ -64,6 +67,9 @@ interface RealtimeWorkspaceProps {
  * ========================================================================== */
 const API_BASE_URL = 'http://localhost:8000'
 const WS_ANALYZE_URL = 'ws://localhost:8000/ws/analyze'
+
+/** A 组干预：诊断反馈展示态强制视觉驻留时长（毫秒），到期自动闭环回待机 */
+const FEEDBACK_DWELL_MS = 10_000
 
 /** 后台推送的三级容错状态字符串（与 pose_tracker.py judge_knee_status 保持一致） */
 type BackendStatus = 'Green' | 'Yellow' | 'Red'
@@ -208,7 +214,17 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
   const [wordSaveStatus, setWordSaveStatus] = useState<WordSaveStatus>('idle')
   const [wordSaveToast, setWordSaveToast] = useState<WordSaveToastState | null>(null)
 
+  /**
+   * 复盘模式：true = 科研标准化 10 秒自动闭环；false = 教学手动复盘（教练可多讲几句）
+   * 默认自动，保证实验流程高频循环效率。
+   */
+  const [isAutoReplay, setIsAutoReplay] = useState(true)
+  /** 自动闭环倒计时剩余秒数；非反馈态或手动模式时为 null */
+  const [dwellSecondsLeft, setDwellSecondsLeft] = useState<number | null>(null)
+
   const isAnalyzing = analysisStatus === 'analyzing'
+  /** 诊断反馈展示态：报告已生成且分析已结束（触发 10s 驻留 / 手动复盘） */
+  const isFeedbackStage = analysisStatus === 'finished' && Boolean(finalReport)
   /** 测试完成且已有击球关键帧：主视口切到射门瞬间分析画面 */
   const impactAnalysisImage = finalReport?.impactFrameImage ?? null
   const showImpactAnalysisStage =
@@ -351,13 +367,19 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
       }
 
       // Sprint 1：用 Action ROI 鞭打发力窗口替换实时累积的全程序列
+      // 一并挂上 absolute_timestamps，供波形 X 轴与 video.currentTime 精准对齐
       const windowSeries = report.time_series_velocity ?? report.timeSeriesVelocity
+      const absTs = report.absolute_timestamps ?? report.absoluteTimestamps
       if (Array.isArray(windowSeries) && windowSeries.length > 0) {
         setOmegaSeries(
-          windowSeries.map((omega, index) => ({
-            frame_index: index,
-            omega: typeof omega === 'number' && Number.isFinite(omega) ? omega : 0,
-          })),
+          windowSeries.map((omega, index) => {
+            const ts = Array.isArray(absTs) ? Number(absTs[index]) : NaN
+            return {
+              frame_index: index,
+              omega: typeof omega === 'number' && Number.isFinite(omega) ? omega : 0,
+              ...(Number.isFinite(ts) ? { absolute_timestamp: ts } : {}),
+            }
+          }),
         )
       }
 
@@ -417,6 +439,65 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [finalReport, globalSettings.enableDataArchiving])
+
+  /** 清空本次复盘结果并强制回到摄像头待机捕获 */
+  function resetToIdleCapture() {
+    wsRef.current?.close()
+    wsRef.current = null
+    setIsConnected(false)
+    setFinalReport(null)
+    setHitStats({ green: 0, yellow: 0, red: 0 })
+    setKneeAngle(null)
+    setBackendStatus(null)
+    setFrameImage(null)
+    setImpactSeek(null)
+    setOmegaSeries([])
+    omegaFrameRef.current = 0
+    setStabilityIndex(null)
+    setDiagnosticNotice(null)
+    setConnectionError(null)
+    setIsGeneratingReport(false)
+    setWordSaveStatus('idle')
+    setLastSessionId(null)
+    setLocalVideoFile(null)
+    setUploadedVideoPath(null)
+    setVideoSourceMode('webcam')
+    setAnalysisStatus('idle')
+    setDwellSecondsLeft(null)
+    showWordSaveToast('复盘结束，请准备下一次踢球', true)
+  }
+
+  /**
+   * A 组「10 秒强制视觉驻留 → 全自动闭环」状态机（受 isAutoReplay 拦截）：
+   * - 自动模式：进入反馈展示态后开启 10s 时间锁，到期 resetToIdleCapture
+   * - 手动模式：不启动定时器，由教练点「返回继续采集」
+   * - 倒计时期间若切到手动，cleanup 立刻 clearTimeout，防止画面突然切走
+   */
+  useEffect(() => {
+    if (!isFeedbackStage || !isAutoReplay) {
+      setDwellSecondsLeft(null)
+      return
+    }
+
+    const totalSec = Math.ceil(FEEDBACK_DWELL_MS / 1000)
+    setDwellSecondsLeft(totalSec)
+    const startedAt = Date.now()
+
+    const timer = window.setTimeout(() => {
+      resetToIdleCapture()
+    }, FEEDBACK_DWELL_MS)
+
+    const tick = window.setInterval(() => {
+      const left = Math.max(0, Math.ceil((FEEDBACK_DWELL_MS - (Date.now() - startedAt)) / 1000))
+      setDwellSecondsLeft(left)
+    }, 200)
+
+    return () => {
+      window.clearTimeout(timer)
+      window.clearInterval(tick)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isFeedbackStage, isAutoReplay, finalReport])
 
   function handleSelectVideoFile(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0]
@@ -538,8 +619,14 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
           studentNumber: studentNumber || '未填写编号',
           score: finalReport.score,
           totalAttempts: finalReport.totalAttempts,
-          painPoint: finalReport.painPoint,
-          prescription: finalReport.prescription,
+          painPoint:
+            finalReport.correction_metaphor || finalReport.painPoint,
+          prescription:
+            finalReport.praise_encouragement || finalReport.prescription,
+          correction_metaphor:
+            finalReport.correction_metaphor || finalReport.painPoint,
+          praise_encouragement:
+            finalReport.praise_encouragement || finalReport.prescription,
           generatedAt: finalReport.generatedAt,
           impactFrameImage: finalReport.impactFrameImage ?? null,
           heatmapBase64:
@@ -681,19 +768,46 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
           </span>
         </div>
 
-        <div className="flex items-center gap-2">
-          {!isAnalyzing && analysisStatus !== 'stopping' ? (
+        <div className="flex flex-wrap items-center gap-2">
+          {/* 自动闭环 / 手动复盘模式切换 */}
+          <div
+            className="inline-flex items-center gap-0.5 rounded-full border border-slate-700/80 bg-slate-900/60 p-0.5"
+            role="group"
+            aria-label="复盘模式"
+          >
             <button
               type="button"
-              onClick={handleStart}
-              disabled={isStartDisabled}
-              title={isStartDisabled ? '请先选择并等待本地 MP4 文件上传完成' : undefined}
-              className="flex items-center gap-1.5 rounded-full bg-[var(--GREEN_OPTIMAL)] px-4 py-1.5 text-xs font-semibold text-slate-950 transition hover:brightness-110 active:scale-95 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-400"
+              role="switch"
+              aria-checked={isAutoReplay}
+              onClick={() => setIsAutoReplay(true)}
+              className={`inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-[11px] font-medium transition ${
+                isAutoReplay
+                  ? 'bg-emerald-500/20 text-emerald-300 ring-1 ring-emerald-400/40'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+              title="科研标准化：反馈展示 10 秒后自动返回待机"
             >
-              <Play className="h-3.5 w-3.5" />
-              开始分析
+              <Timer className="h-3 w-3" />
+              自动闭环 (10秒)
             </button>
-          ) : (
+            <button
+              type="button"
+              role="switch"
+              aria-checked={!isAutoReplay}
+              onClick={() => setIsAutoReplay(false)}
+              className={`inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-[11px] font-medium transition ${
+                !isAutoReplay
+                  ? 'bg-amber-500/20 text-amber-200 ring-1 ring-amber-400/40'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+              title="教学灵活：教练讲解完毕后手动返回采集"
+            >
+              <Hand className="h-3 w-3" />
+              手动复盘
+            </button>
+          </div>
+
+          {isAnalyzing || analysisStatus === 'stopping' ? (
             <button
               type="button"
               onClick={handleStop}
@@ -706,6 +820,41 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
                 <Square className="h-3.5 w-3.5" />
               )}
               结束分析
+            </button>
+          ) : isFeedbackStage ? (
+            <button
+              type="button"
+              onClick={resetToIdleCapture}
+              disabled={isAutoReplay}
+              title={
+                isAutoReplay
+                  ? '自动闭环进行中，倒计时结束后将返回待机；可切换至「手动复盘」以取消自动跳转'
+                  : '清空本次复盘结果，返回摄像头待机捕获'
+              }
+              className="flex items-center gap-1.5 rounded-full bg-sky-500 px-4 py-1.5 text-xs font-semibold text-slate-950 transition hover:brightness-110 active:scale-95 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-300"
+            >
+              {isAutoReplay ? (
+                <>
+                  <Timer className="h-3.5 w-3.5" />
+                  自动返回 ({dwellSecondsLeft ?? Math.ceil(FEEDBACK_DWELL_MS / 1000)}s)...
+                </>
+              ) : (
+                <>
+                  <RotateCcw className="h-3.5 w-3.5" />
+                  返回继续采集
+                </>
+              )}
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={handleStart}
+              disabled={isStartDisabled}
+              title={isStartDisabled ? '请先选择并等待本地 MP4 文件上传完成' : undefined}
+              className="flex items-center gap-1.5 rounded-full bg-[var(--GREEN_OPTIMAL)] px-4 py-1.5 text-xs font-semibold text-slate-950 transition hover:brightness-110 active:scale-95 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-400"
+            >
+              <Play className="h-3.5 w-3.5" />
+              开始分析
             </button>
           )}
         </div>
@@ -749,10 +898,14 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
         <SynchronizedVideoWorkspace
           videoSrc={videoSourceMode === 'file' ? localVideoObjectUrl : null}
           velocitySeries={omegaSeries}
+          absoluteTimestamps={
+            finalReport?.absolute_timestamps ?? finalReport?.absoluteTimestamps ?? null
+          }
           tImpact={finalReport?.tImpact ?? finalReport?.t_impact ?? null}
           impactIndexInWindow={impactIndexInWindow}
           seriesFrameOffset={seriesFrameOffset}
           fps={30}
+          autoPlayOnSeek
           /* 分析结束后切回本地视频，保证波形 scrub 能同步可见画面（不再被分析帧永久盖住） */
           preferLiveOverlay={
             isAnalyzing ||
@@ -760,6 +913,11 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
             (showImpactAnalysisStage && videoSourceMode !== 'file')
           }
           externalSeek={impactSeek}
+          jointHighlights={
+            finalReport?.scoreDetail?.joint_highlights ??
+            finalReport?.joint_highlights ??
+            null
+          }
           title="Video Workspace"
           subtitle={
             showImpactAnalysisStage

@@ -18,6 +18,8 @@ cluster_rct.db
 session_checkpoint.db
 session_checkpoint.json
 session_checkpoint.db-*
+backups/
+*.bak
 
 # --- whitelist protection for core backend code ---
 !*.py

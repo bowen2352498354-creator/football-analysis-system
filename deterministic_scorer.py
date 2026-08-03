@@ -35,17 +35,29 @@ from biomech_primitives import (
     ANKLE_STIFFNESS_YIELDING,
     DEFAULT_VIDEO_FPS,
     FOLD_ROI_MIN_VALID_FRAMES,
+    LANDMARK_CONFIDENCE_MIN,
     ankle_half_window_frames,
     ankle_window_dorsiflex_drop_deg,
     calculate_3d_joint_angle,
+    calculate_3d_joint_angle_or_none,
+    calculate_sagittal_angle_or_none,
     calculate_ankle_stiffness_variance,
     calculate_support_foot_offset_detailed,
     crosscheck_pcr_vs_world_lateral,
     estimate_body_height_px,
+    gap_fill_scalar_series,
     infer_swing_leg_side,
+    is_valid_joint_point,
     slice_ankle_impact_window_bounds,
     swing_leg_joint_keys,
 )
+
+# --------------------------------------------------------------------------
+# FSM Timeout Guard 常量（射门 FSM 实现见 workers/auto_shot_capture.py）
+# --------------------------------------------------------------------------
+# 中间态（如 APPROACH / 准备击球）超过该帧数未完成转换 → 强制回 IDLE
+FSM_APPROACH_TIMEOUT_FRAMES = 60  # ≈2s @30fps
+FSM_IMPACT_LOCKED_TIMEOUT_FRAMES = 120
 from indicator_builder import (
     ACTION_ROI_HALF_FRAMES,
     PROVENANCE_CALIBRATED,
@@ -66,7 +78,10 @@ from indicator_builder import (
 # 反向 import error_diagnoser 即成环。这些 helper 只在评分执行期被调用，
 # 届时 error_diagnoser 已完成加载，惰性取用完全安全且零性能负担。
 def calculate_angle(a, b, c, *, is_knee_extension: bool = False) -> float:
-    """以 b 为顶点的空间夹角（度）；与 error_diagnoser.calculate_angle 同源。"""
+    """以 b 为顶点的关节夹角（度）；与 error_diagnoser.calculate_angle 同源。
+
+    髋/膝屈伸（``is_knee_extension=True``）走矢状面 atan2。
+    """
     return calculate_3d_joint_angle(a, b, c, is_knee_extension=is_knee_extension)
 
 
@@ -90,6 +105,13 @@ def _support_toe_angle_deg(frame_record: dict, ball_center=None) -> float:
 
 def build_spatial_heatmap_payload(*args, **kwargs):
     from error_diagnoser import build_spatial_heatmap_payload as _impl
+
+    return _impl(*args, **kwargs)
+
+
+def build_joint_highlights(*args, **kwargs):
+    """惰性代理：具身隐喻关节红绿灯高亮（实现见 error_diagnoser）。"""
+    from error_diagnoser import build_joint_highlights as _impl
 
     return _impl(*args, **kwargs)
 
@@ -389,6 +411,58 @@ def slice_action_roi_bounds(
     return int(start), int(end)
 
 
+def _frame_joint_visibility(rec: dict, joint: str) -> float:
+    """读取帧内关节点 visibility；缺省视为 1.0（旧数据无该字段）。"""
+    vis = rec.get("visibility") if isinstance(rec, dict) else None
+    if isinstance(vis, dict) and joint in vis:
+        try:
+            return float(vis.get(joint) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+    return 1.0
+
+
+def _roi_knee_angles_with_gap_fill(
+    frames: list[dict],
+    roi_start: int,
+    roi_end_inclusive: int,
+    *,
+    swing_side: str = "right",
+    min_visibility: float = LANDMARK_CONFIDENCE_MIN,
+) -> list[Optional[float]]:
+    """ROI 内逐帧膝角；单帧关键点缺失时用前后帧运动趋势补帧（max_gap=2）。"""
+    hip_k, knee_k, ankle_k, _foot_k = swing_leg_joint_keys(swing_side)
+    raw: list[Optional[float]] = []
+    lo = int(max(0, roi_start))
+    hi = int(min(len(frames) - 1, roi_end_inclusive)) if frames else -1
+    if hi < lo:
+        return []
+    for i in range(lo, hi + 1):
+        try:
+            rec = frames[i]
+            if not isinstance(rec, dict):
+                raw.append(None)
+                continue
+            hip, knee, ankle = rec.get(hip_k), rec.get(knee_k), rec.get(ankle_k)
+            vis_ok = (
+                _frame_joint_visibility(rec, hip_k) >= min_visibility
+                and _frame_joint_visibility(rec, knee_k) >= min_visibility
+                and _frame_joint_visibility(rec, ankle_k) >= min_visibility
+            )
+            if not vis_ok or not (
+                is_valid_joint_point(hip)
+                and is_valid_joint_point(knee)
+                and is_valid_joint_point(ankle)
+            ):
+                raw.append(None)
+                continue
+            ang = calculate_sagittal_angle_or_none(hip, knee, ankle)
+            raw.append(float(ang) if ang is not None else None)
+        except Exception:  # noqa: BLE001
+            raw.append(None)
+    return gap_fill_scalar_series(raw, max_gap=2)
+
+
 def _roi_max_folding_angle(
     frames: list[dict],
     t_impact: int,
@@ -403,33 +477,53 @@ def _roi_max_folding_angle(
     对外 ``max_folding_angle`` = ``180 - min(膝内角)``。
     返回 ``(max_folding_angle|None, 极值帧索引, ok)``。
     ``ok=False``：有效帧不足 ``min_valid_frames`` 或无有限膝角。
+
+    【补帧】单帧关键点丢失时用前后帧趋势插值，降低状态/极值漏检率。
     """
     fallback_idx = int(max(roi_start, min(max(roi_start, roi_end - 1), t_impact)))
     if not frames:
         return None, fallback_idx, False
-    hip_k, knee_k, ankle_k, _foot_k = swing_leg_joint_keys(swing_side)
     t = int(max(roi_start, min(roi_end - 1, t_impact)))
+    filled = _roi_knee_angles_with_gap_fill(
+        frames, roi_start, t, swing_side=swing_side
+    )
     best_interior = None
     best_idx = fallback_idx
     valid_count = 0
-    for i in range(roi_start, min(roi_end, t + 1)):
-        try:
-            rec = frames[i]
-            knee = float(
-                calculate_3d_joint_angle(rec[hip_k], rec[knee_k], rec[ankle_k])
-            )
-            if not np.isfinite(knee) or knee <= 0.0:
-                continue
-            valid_count += 1
-            if best_interior is None or knee < best_interior:
-                best_interior = knee
-                best_idx = int(i)
-        except Exception:
+    for offset, knee in enumerate(filled):
+        if knee is None:
             continue
+        try:
+            kv = float(knee)
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(kv) or kv <= 0.0:
+            continue
+        valid_count += 1
+        if best_interior is None or kv < best_interior:
+            best_interior = kv
+            best_idx = int(roi_start + offset)
     if best_interior is None or valid_count < int(min_valid_frames):
         return None, fallback_idx, False
     max_folding = float(max(0.0, 180.0 - float(best_interior)))
     return max_folding, int(best_idx), True
+
+
+def fsm_should_timeout_reset(
+    state_name: str,
+    frames_in_state: int,
+    *,
+    approach_timeout: int = FSM_APPROACH_TIMEOUT_FRAMES,
+    impact_timeout: int = FSM_IMPACT_LOCKED_TIMEOUT_FRAMES,
+) -> bool:
+    """判定射门 FSM 中间态是否应超时强制回 IDLE（供测试与外部编排复用）。"""
+    name = str(state_name or "").strip().upper()
+    n = int(frames_in_state)
+    if name in ("APPROACH", "PREPARE", "准备击球"):
+        return n >= int(approach_timeout)
+    if name in ("IMPACT_LOCKED", "IMPACT"):
+        return n >= int(impact_timeout)
+    return False
 
 
 def _roi_whipping_velocity(
@@ -488,7 +582,14 @@ def _roi_whipping_velocity(
             rec = frames[i]
             try:
                 angles.append(
-                    float(calculate_angle(rec["right_hip"], rec["right_knee"], rec["right_ankle"]))
+                    float(
+                        calculate_angle(
+                            rec["right_hip"],
+                            rec["right_knee"],
+                            rec["right_ankle"],
+                            is_knee_extension=True,
+                        )
+                    )
                 )
             except Exception:
                 angles.append(angles[-1] if angles else 150.0)
@@ -1363,6 +1464,28 @@ class DeterministicScorer:
                 heatmap_base64 = None
                 spatial_trajectory = None
 
+        # 具身隐喻：问题关节高亮（像素坐标 + 临床绝对时间戳 → 前端 Canvas）
+        joint_highlights: list = []
+        if frames:
+            try:
+                abs_ts = [
+                    float(rec.get("timestamp_sec", i / max(video_fps, 1e-6)))
+                    if isinstance(rec, dict)
+                    else float(i / max(video_fps, 1e-6))
+                    for i, rec in enumerate(frames)
+                ]
+                joint_highlights = build_joint_highlights(
+                    frames,
+                    int(t_impact),
+                    indicators,
+                    swing_side=swing_side,
+                    absolute_timestamps=abs_ts,
+                    fps=float(video_fps),
+                    roi_start=int(roi_start) if roi_start is not None else None,
+                )
+            except Exception:
+                joint_highlights = []
+
         detail = {
             "TotalScore": total_score,
             "t_impact": int(t_impact),
@@ -1390,6 +1513,8 @@ class DeterministicScorer:
             # Sprint 1：单趟次支撑脚 / 摆腿时空热力图（PNG base64，无 data URI 前缀）
             "heatmap_base64": heatmap_base64,
             "spatial_trajectory": spatial_trajectory,
+            # 具身隐喻：问题关节 2D 像素 + RED/YELLOW/GREEN
+            "joint_highlights": joint_highlights,
         }
         return total_score, detail
 

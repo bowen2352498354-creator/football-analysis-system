@@ -37,6 +37,10 @@ POST_IMPACT_FRAMES: int = 30  # 与前窗合计 90 帧核心切片
 COOLDOWN_SEC: float = 3.5  # 强制冷却 3–5s 中位值，防抖
 DEFAULT_CLIP_FPS: float = 30.0
 BUFFER_HEADROOM_FRAMES: int = 10  # 缓冲下界余量：前窗+后窗+余量
+# 【Timeout Guard】中间态卡滞防范：APPROACH 超过 ~2s（60 帧@30fps）强制回 IDLE
+APPROACH_TIMEOUT_FRAMES: int = 60
+# IMPACT_LOCKED 异常滞留（写盘线程挂死）：超时强制回 IDLE，避免永久卡死
+IMPACT_LOCKED_TIMEOUT_FRAMES: int = 120
 
 _SCRIPT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_AUTO_CLIP_DIR = os.path.join(_SCRIPT_DIR, "auto_capture_clips")
@@ -191,6 +195,11 @@ class AutoShotCaptureEngine:
         self._cooldown_until: float = 0.0
         self._attempt_count: int = 0
         self._save_in_flight: bool = False
+        # Timeout Guard：记录进入中间态时的帧号
+        self._state_entered_frame: int = 0
+        self._last_pushed_frame_index: int = 0
+        self.approach_timeout_frames: int = int(APPROACH_TIMEOUT_FRAMES)
+        self.impact_locked_timeout_frames: int = int(IMPACT_LOCKED_TIMEOUT_FRAMES)
 
         self._on_log = on_log
         self._on_state_change = on_state_change
@@ -290,10 +299,12 @@ class AutoShotCaptureEngine:
             return self.state
 
         ts = float(timestamp) if timestamp is not None else time.time()
+        fi = int(frame_index)
+        self._last_pushed_frame_index = fi
         # 必须 copy：推理环会原地改写同一块内存
         self._buffer.append(
             BufferedFrame(
-                frame_index=int(frame_index),
+                frame_index=fi,
                 bgr=frame_bgr.copy(),
                 timestamp=ts,
             )
@@ -302,6 +313,18 @@ class AutoShotCaptureEngine:
         with self._state_lock:
             state = self._state
             locked_t = self._locked_t_impact
+            entered = int(self._state_entered_frame)
+
+        # 【Timeout Guard】中间态超时强制回 IDLE，防止丢帧导致永久卡滞
+        if state == ShotFsmState.APPROACH:
+            if fi - entered >= int(self.approach_timeout_frames):
+                self._locked_t_impact = None
+                self._transition(ShotFsmState.IDLE)
+                self._log(
+                    f"FSM Timeout Guard：APPROACH 超过 "
+                    f"{self.approach_timeout_frames} 帧未锁定触球 → 强制 IDLE"
+                )
+                return self.state
 
         if state == ShotFsmState.COOLDOWN:
             if time.time() >= self._cooldown_until:
@@ -311,7 +334,16 @@ class AutoShotCaptureEngine:
             return self.state
 
         if state == ShotFsmState.IMPACT_LOCKED and locked_t is not None:
-            if int(frame_index) >= int(locked_t) + self.post_frames:
+            if fi - entered >= int(self.impact_locked_timeout_frames):
+                self._locked_t_impact = None
+                self._save_in_flight = False
+                self._transition(ShotFsmState.IDLE)
+                self._log(
+                    f"FSM Timeout Guard：IMPACT_LOCKED 超过 "
+                    f"{self.impact_locked_timeout_frames} 帧未落盘 → 强制 IDLE"
+                )
+                return self.state
+            if fi >= int(locked_t) + self.post_frames:
                 self._dispatch_clip_save(int(locked_t))
 
         return self.state
@@ -565,6 +597,7 @@ class AutoShotCaptureEngine:
             if old == new_state:
                 return
             self._state = new_state
+            self._state_entered_frame = int(self._last_pushed_frame_index)
         if self._on_state_change is not None:
             try:
                 self._on_state_change(old, new_state)

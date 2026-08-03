@@ -323,56 +323,116 @@ class TestBlurredFrameCache:
 # build_time_series_velocity_window
 # ---------------------------------------------------------------------------
 
+def _patch_smooth_keep_pack(omega_series):
+    """Mock 平滑器，但保留真实 pack_action_roi_series / 时间戳公式。"""
+    import pose_tracker as real_pt
+
+    ctx = patch("shot_analysis_service.pt")
+    mock_pt = ctx.start()
+    mock_pt.KinematicSignalProcessor.smooth_joint_trajectories.return_value = omega_series
+    mock_pt.pack_action_roi_series = real_pt.pack_action_roi_series
+    mock_pt.build_absolute_timestamps = real_pt.build_absolute_timestamps
+    return ctx
+
+
+class TestBuildAbsoluteTimestamps:
+    def test_formula_and_empty(self):
+        import pose_tracker as real_pt
+
+        assert real_pt.build_absolute_timestamps(10, 0, 30.0) == []
+        ts = real_pt.build_absolute_timestamps(60, 3, 30.0)
+        assert ts == [2.0, 2.033333, 2.066667]
+        packed = real_pt.pack_action_roi_series([1.0, 2.0], start_frame_index=90, fps=30.0)
+        assert packed["absolute_timestamps"] == [3.0, 3.033333]
+        assert packed["start_frame_index"] == 90
+
+
 class TestBuildTimeSeriesVelocityWindow:
     def test_empty_trajectory_returns_empty(self):
         p = make_pipeline()
-        window, idx, roi_start = p.build_time_series_velocity_window()
+        window, idx, roi_start, timestamps = p.build_time_series_velocity_window()
         assert window == []
         assert idx == 0
         assert roi_start == 0
+        assert timestamps == []
 
     def test_returns_correct_types(self):
         p = make_pipeline()
         p._trajectory_omega = [float(i) for i in range(100)]
         p.t_impact = 50
+        p._video_fps = 30.0
 
-        with patch("shot_analysis_service.pt") as mock_pt:
-            mock_pt.KinematicSignalProcessor.smooth_joint_trajectories.return_value = (
-                p._trajectory_omega
+        ctx = _patch_smooth_keep_pack(p._trajectory_omega)
+        try:
+            window, idx, roi_start, timestamps = p.build_time_series_velocity_window(
+                t_impact=50
             )
-            window, idx, roi_start = p.build_time_series_velocity_window(t_impact=50)
+        finally:
+            ctx.stop()
 
         assert isinstance(window, list)
         assert all(isinstance(v, float) for v in window)
         assert isinstance(idx, int)
         assert isinstance(roi_start, int)
+        assert isinstance(timestamps, list)
+        assert len(timestamps) == len(window)
+        assert all(isinstance(t, float) for t in timestamps)
 
     def test_impact_index_in_window_clamped(self):
         """边界：t_impact=0 时 impact_index 应为 0，不应为负值。"""
         p = make_pipeline()
         p._trajectory_omega = [float(i) for i in range(60)]
+        p._video_fps = 30.0
 
-        with patch("shot_analysis_service.pt") as mock_pt:
-            mock_pt.KinematicSignalProcessor.smooth_joint_trajectories.return_value = (
-                p._trajectory_omega
+        ctx = _patch_smooth_keep_pack(p._trajectory_omega)
+        try:
+            window, idx, roi_start, timestamps = p.build_time_series_velocity_window(
+                t_impact=0
             )
-            window, idx, roi_start = p.build_time_series_velocity_window(t_impact=0)
+        finally:
+            ctx.stop()
 
         assert idx >= 0
         assert roi_start == 0  # 应为 max(0, 0-30) = 0
+        assert len(timestamps) == len(window)
+        if timestamps:
+            assert timestamps[0] == 0.0
+
+    def test_absolute_timestamps_match_fps_formula(self):
+        """absolute_timestamps[i] == (roi_start + i) / fps。"""
+        p = make_pipeline()
+        p._trajectory_omega = [float(i) for i in range(100)]
+        p.t_impact = 50
+        p._video_fps = 25.0
+
+        ctx = _patch_smooth_keep_pack(p._trajectory_omega)
+        try:
+            window, _idx, roi_start, timestamps = p.build_time_series_velocity_window(
+                t_impact=50
+            )
+        finally:
+            ctx.stop()
+
+        assert len(timestamps) == len(window) > 0
+        for i, ts in enumerate(timestamps):
+            assert abs(ts - (roi_start + i) / 25.0) < 1e-6
 
     def test_t_impact_from_attribute_when_arg_is_none(self):
         p = make_pipeline()
         p._trajectory_omega = [1.0, 5.0, 3.0, 2.0]
         p.t_impact = 1  # 属性值应被使用
+        p._video_fps = 30.0
 
-        with patch("shot_analysis_service.pt") as mock_pt:
-            mock_pt.KinematicSignalProcessor.smooth_joint_trajectories.return_value = (
-                p._trajectory_omega
+        ctx = _patch_smooth_keep_pack(p._trajectory_omega)
+        try:
+            window, idx, roi_start, timestamps = p.build_time_series_velocity_window(
+                t_impact=None
             )
-            window, idx, roi_start = p.build_time_series_velocity_window(t_impact=None)
+        finally:
+            ctx.stop()
 
         assert isinstance(window, list)
+        assert isinstance(timestamps, list)
         # 应使用 p.t_impact=1 作为中心
 
 

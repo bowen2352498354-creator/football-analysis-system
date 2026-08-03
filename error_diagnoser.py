@@ -52,6 +52,7 @@ from biomech_primitives import (
     ankle_half_window_frames,
     ankle_window_dorsiflex_drop_deg,
     calculate_3d_joint_angle,
+    calculate_sagittal_angle,
     calculate_ankle_stiffness_variance,
     calculate_support_foot_offset_cm,
     calculate_support_foot_offset_detailed,
@@ -275,7 +276,10 @@ def _as_vec3(point) -> np.ndarray:
 
 
 def calculate_angle(a, b, c, *, is_knee_extension: bool = False) -> float:
-    """以 b 为顶点的空间夹角（度）。V3.1 起委托 ``calculate_3d_joint_angle``。"""
+    """以 b 为顶点的关节夹角（度）。
+
+    髋/膝屈伸（``is_knee_extension=True``）走矢状面 atan2；其余仍为 3D arccos。
+    """
     return calculate_3d_joint_angle(a, b, c, is_knee_extension=is_knee_extension)
 
 
@@ -806,7 +810,13 @@ def _support_metrics(frames, phase: PhaseWindow, ball_center, cm_per_pixel) -> d
     if ankle_px is not None:
         body_h_px = estimate_body_height_px(landmarks=rec)
         pcr_offset_cm = float(
-            calculate_support_foot_offset_cm(ankle_px, ball_bbox, body_h_px=body_h_px)
+            calculate_support_foot_offset_cm(
+                ankle_px,
+                ball_bbox,
+                body_h_px=body_h_px,
+                world_lateral_cm=float(lateral_raw * 100.0),
+                world_foot_len_m=float(foot_len_m),
+            )
         )
 
     if use_world:
@@ -892,7 +902,7 @@ def _backswing_metrics(frames, plan: TemporalIsolationPlan) -> dict[str, Any]:
             continue
         rec = frames[i]
         knee_angles.append(
-            calculate_3d_joint_angle(rec[hip_k], rec[knee_k], rec[ankle_k])
+            calculate_sagittal_angle(rec[hip_k], rec[knee_k], rec[ankle_k])
         )
         thigh_angles.append(_thigh_retraction_deg(rec))
 
@@ -903,7 +913,7 @@ def _backswing_metrics(frames, plan: TemporalIsolationPlan) -> dict[str, Any]:
         for i in range(safe_start, safe_end + 1):
             rec = frames[i]
             knee_angles.append(
-                calculate_3d_joint_angle(rec[hip_k], rec[knee_k], rec[ankle_k])
+                calculate_sagittal_angle(rec[hip_k], rec[knee_k], rec[ankle_k])
             )
             thigh_angles.append(_thigh_retraction_deg(rec))
         start_i, end_i = safe_start, safe_end
@@ -953,7 +963,9 @@ def _impact_metrics(frames, plan: TemporalIsolationPlan) -> dict[str, Any]:
         )
         for i in idxs
     ]
-    # 【V3.1/Phase2】全序列 + 按时长冲击窗方差（附关键点可见度门控）
+    # 【V3.1/Phase2】全序列 + 按时长冲击窗方差（可见度门控 + 中值滤波去飞点）
+    # 方差权威实现见 biomech_primitives.calculate_ankle_stiffness_variance：
+    # 冲击窗扩邻域 → 插值 → kernel=3 中值平滑 → 仅平滑数组参与 np.var；空序列返回 0.0
     full_ankle_series = [
         calculate_3d_joint_angle(
             frames[i][knee_k], frames[i][ankle_k], frames[i][foot_k]
@@ -965,12 +977,15 @@ def _impact_metrics(frames, plan: TemporalIsolationPlan) -> dict[str, Any]:
         for i in range(len(frames))
     ] if frames else None
     fps = float(getattr(plan, "fps", DEFAULT_VIDEO_FPS) or DEFAULT_VIDEO_FPS)
-    variance, stiffness_status = calculate_ankle_stiffness_variance(
-        full_ankle_series,
-        plan.t0_index,
-        fps=fps,
-        landmark_visibility_series=full_ankle_vis,
-    )
+    try:
+        variance, stiffness_status = calculate_ankle_stiffness_variance(
+            full_ankle_series,
+            plan.t0_index,
+            fps=fps,
+            landmark_visibility_series=full_ankle_vis,
+        )
+    except Exception:  # noqa: BLE001
+        variance, stiffness_status = 0.0, ANKLE_STIFFNESS_LOCKED
     t0_local = idxs.index(plan.t0_index) if plan.t0_index in idxs else len(idxs) // 2
     ankle_at_t0 = float(ankle_angles[t0_local]) if ankle_angles else 140.0
     # 背屈角骤降：窗口内 max - min
@@ -1147,7 +1162,7 @@ def _early_deceleration_metrics(frames, t0_index: int) -> dict[str, Any]:
         hip = _joint_prefer_world(frames[i], "right_hip")
         knee = _joint_prefer_world(frames[i], "right_knee")
         ankle = _joint_prefer_world(frames[i], "right_ankle")
-        knee_angles.append(calculate_angle(hip, knee, ankle))
+        knee_angles.append(calculate_sagittal_angle(hip, knee, ankle))
         timestamps.append(float(frames[i]["timestamp_sec"]))
         index_map.append(i)
 
@@ -1155,7 +1170,9 @@ def _early_deceleration_metrics(frames, t0_index: int) -> dict[str, Any]:
         # 置信过滤过严时回退全窗像素坐标
         timestamps = [float(frames[i]["timestamp_sec"]) for i in range(lo, hi + 1)]
         knee_angles = [
-            calculate_angle(frames[i]["right_hip"], frames[i]["right_knee"], frames[i]["right_ankle"])
+            calculate_sagittal_angle(
+                frames[i]["right_hip"], frames[i]["right_knee"], frames[i]["right_ankle"]
+            )
             for i in range(lo, hi + 1)
         ]
         index_map = list(range(lo, hi + 1))
@@ -1391,6 +1408,294 @@ def resolve_keyframe_index(diagnosis: dict[str, Any]) -> int:
 # --------------------------------------------------------------------------
 # 主入口
 # --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# 具身隐喻：T0 问题关节红绿灯高亮（前端 Canvas）
+# --------------------------------------------------------------------------
+
+# 指标状态 → 简写色码（前端约定 RED / YELLOW / GREEN）
+_STATUS_TO_COLOR_CODE: dict[str, str] = {
+    STATUS_GREEN: "GREEN",
+    STATUS_YELLOW: "YELLOW",
+    STATUS_RED: "RED",
+    "GREEN": "GREEN",
+    "YELLOW": "YELLOW",
+    "RED": "RED",
+}
+_COLOR_SEVERITY: dict[str, int] = {"GREEN": 0, "YELLOW": 1, "RED": 2}
+
+
+def status_to_color_code(status: Any) -> str:
+    """把 GREEN_OPTIMAL / YELLOW_APPROACHING / RED_DEVIATED 映射为 RED|YELLOW|GREEN。"""
+    text = str(status or "").strip().upper()
+    if text in _STATUS_TO_COLOR_CODE:
+        return _STATUS_TO_COLOR_CODE[text]
+    if "RED" in text:
+        return "RED"
+    if "YELLOW" in text:
+        return "YELLOW"
+    if "GREEN" in text:
+        return "GREEN"
+    return "GREEN"
+
+
+def _metric_to_joint_name(metric_key: str, swing_side: str = "right") -> Optional[str]:
+    """八大量纲 → T0 应高亮的图像平面关节点名（随摆动腿侧翻转）。"""
+    hip_k, knee_k, ankle_k, foot_k = swing_leg_joint_keys(swing_side)
+    support_side = "left" if not str(swing_side).lower().startswith("l") else "right"
+    support_knee = f"{support_side}_knee"
+    support_ankle = f"{support_side}_ankle"
+    support_foot = f"{support_side}_foot_index"
+    mapping = {
+        "distance_cm": support_ankle,
+        "toe_angle": support_foot,
+        "max_folding_angle": knee_k,
+        "whipping_velocity": knee_k,
+        "impact_knee_angle": knee_k,
+        "ankle_rigidity": ankle_k,
+        "support_knee_angle": support_knee,
+        "hip_torsion_angle": hip_k,
+    }
+    return mapping.get(str(metric_key))
+
+
+def _joint_xy_image_plane(
+    frame_record: dict,
+    joint: str,
+    *,
+    frame_width: Optional[float] = None,
+    frame_height: Optional[float] = None,
+) -> Optional[tuple[float, float, str]]:
+    """读取图像平面 2D 坐标。
+
+    返回 ``(x, y, coordinate_space)``：
+      - 默认 ``pixel``：``serialize_pose_frame_record`` 已写入的绝对像素；
+      - 若检测到归一化 0–1 坐标且提供了宽高，则乘以宽高转为像素；
+      - 若为归一化且无宽高，则原样返回 ``normalized``（由前端乘容器尺寸）。
+    """
+    if not isinstance(frame_record, dict) or joint not in frame_record:
+        return None
+    try:
+        vec = _as_vec3(frame_record[joint])
+    except (TypeError, ValueError):
+        return None
+    x, y = float(vec[0]), float(vec[1])
+    if not (np.isfinite(x) and np.isfinite(y)):
+        return None
+
+    looks_normalized = 0.0 <= x <= 1.0 and 0.0 <= y <= 1.0
+    # 像素坐标下人体关键极少同时落在 [0,1]×[0,1]；若整帧肩宽也 < 2px 则更像归一化
+    if looks_normalized:
+        try:
+            ls = _as_vec3(frame_record.get("left_shoulder", [0, 0, 0]))
+            rs = _as_vec3(frame_record.get("right_shoulder", [0, 0, 0]))
+            shoulder_span = float(np.linalg.norm(rs[:2] - ls[:2]))
+        except (TypeError, ValueError):
+            shoulder_span = 0.0
+        if shoulder_span <= 2.0:
+            fw = float(frame_width) if frame_width and frame_width > 1 else None
+            fh = float(frame_height) if frame_height and frame_height > 1 else None
+            if fw is not None and fh is not None:
+                return round(x * fw, 2), round(y * fh, 2), "pixel"
+            return round(x, 6), round(y, 6), "normalized"
+    return round(x, 2), round(y, 2), "pixel"
+
+
+# 量纲缺省相位偏移（相对 T0，帧）：直腿/支撑多在触球瞬间；折叠偏后摆；随前偏 T0 后
+_METRIC_PHASE_OFFSET_FRAMES: dict[str, int] = {
+    "distance_cm": 0,  # 支撑脚过宽/过近 → T0 / 落地
+    "toe_angle": 0,
+    "support_knee_angle": 0,
+    "impact_knee_angle": 0,  # 直腿击球 → T0
+    "ankle_rigidity": 0,
+    "hip_torsion_angle": 0,
+    "max_folding_angle": -8,  # 后摆蓄力折叠
+    "whipping_velocity": -3,  # 鞭打峰值略早于触球
+    "follow_through": 6,  # 随前缺失 → T0 之后
+    "cross_body_follow_through": 6,
+}
+
+
+def _build_absolute_timestamps_from_frames(
+    frames: list[dict],
+    *,
+    fps: Optional[float] = None,
+) -> list[float]:
+    """从逐帧 ``timestamp_sec`` 构建绝对秒数组；缺失时按 fps 回退。"""
+    safe_fps = float(fps) if fps and float(fps) > 1e-6 else float(DEFAULT_VIDEO_FPS)
+    out: list[float] = []
+    for i, rec in enumerate(frames):
+        ts = None
+        if isinstance(rec, dict) and rec.get("timestamp_sec") is not None:
+            try:
+                ts = float(rec["timestamp_sec"])
+            except (TypeError, ValueError):
+                ts = None
+        if ts is None or not np.isfinite(ts):
+            ts = float(i) / safe_fps
+        out.append(max(0.0, float(ts)))
+    return out
+
+
+def _resolve_error_frame_index(
+    entry: dict,
+    metric_key: str,
+    *,
+    t0_index: int,
+    n_frames: int,
+) -> int:
+    """锁定错误发生帧：优先指标 ``extreme_frame_index``，否则按量纲相位偏移。"""
+    n = max(1, int(n_frames))
+    t0 = int(max(0, min(n - 1, int(t0_index))))
+    raw = entry.get("extreme_frame_index")
+    if raw is not None and raw != "":
+        try:
+            idx = int(round(float(raw)))
+            return int(max(0, min(n - 1, idx)))
+        except (TypeError, ValueError):
+            pass
+    offset = int(_METRIC_PHASE_OFFSET_FRAMES.get(str(metric_key), 0))
+    return int(max(0, min(n - 1, t0 + offset)))
+
+
+def _resolve_error_timestamp_sec(
+    error_frame: int,
+    *,
+    absolute_timestamps: Optional[list] = None,
+    frames: Optional[list[dict]] = None,
+    fps: Optional[float] = None,
+    roi_start: Optional[int] = None,
+) -> float:
+    """从 ``absolute_timestamps``（或帧内 timestamp_sec）提取临床绝对秒。"""
+    idx = int(error_frame)
+    safe_fps = float(fps) if fps and float(fps) > 1e-6 else float(DEFAULT_VIDEO_FPS)
+
+    # 1) 与全序列等长的绝对秒数组
+    if isinstance(absolute_timestamps, (list, tuple)) and absolute_timestamps:
+        if 0 <= idx < len(absolute_timestamps):
+            try:
+                ts = float(absolute_timestamps[idx])
+                if np.isfinite(ts):
+                    return round(max(0.0, ts), 4)
+            except (TypeError, ValueError):
+                pass
+        # 2) ROI 窗内数组：absolute_timestamps[i] 对应绝对帧 roi_start+i
+        if roi_start is not None:
+            local = idx - int(roi_start)
+            if 0 <= local < len(absolute_timestamps):
+                try:
+                    ts = float(absolute_timestamps[local])
+                    if np.isfinite(ts):
+                        return round(max(0.0, ts), 4)
+                except (TypeError, ValueError):
+                    pass
+
+    # 3) 帧记录自带 timestamp_sec
+    if isinstance(frames, list) and 0 <= idx < len(frames):
+        rec = frames[idx]
+        if isinstance(rec, dict) and rec.get("timestamp_sec") is not None:
+            try:
+                ts = float(rec["timestamp_sec"])
+                if np.isfinite(ts):
+                    return round(max(0.0, ts), 4)
+            except (TypeError, ValueError):
+                pass
+
+    return round(max(0.0, float(idx) / safe_fps), 4)
+
+
+def build_joint_highlights(
+    frames: list[dict],
+    t0_index: int,
+    indicators: Optional[dict] = None,
+    *,
+    swing_side: str = "right",
+    frame_width: Optional[float] = None,
+    frame_height: Optional[float] = None,
+    absolute_timestamps: Optional[list] = None,
+    fps: Optional[float] = None,
+    roi_start: Optional[int] = None,
+) -> list[dict[str, Any]]:
+    """组装 ``joint_highlights``：像素坐标 + 红绿灯 + 临床绝对时间戳。
+
+    每个条目含必填 ``error_timestamp_sec``（与 ``absolute_timestamps`` / 视频
+    ``currentTime`` 对齐）。错误帧优先取指标 ``extreme_frame_index``
+    （后摆折叠 / 触球瞬间 / 随前等相位各不相同），坐标取自该帧而非一律 T0。
+    同一关节多项命中时保留更严重色码。
+    """
+    if not frames or not isinstance(indicators, dict) or not indicators:
+        return []
+    n = len(frames)
+    t0 = int(max(0, min(n - 1, int(t0_index))))
+
+    abs_ts = (
+        list(absolute_timestamps)
+        if isinstance(absolute_timestamps, (list, tuple)) and absolute_timestamps
+        else _build_absolute_timestamps_from_frames(frames, fps=fps)
+    )
+
+    # 同关节去重：保留更严重色码；metric_key / 时间戳随赢家走
+    by_joint: dict[str, dict[str, Any]] = {}
+    for metric_key, entry in indicators.items():
+        if not isinstance(entry, dict):
+            continue
+        joint_name = _metric_to_joint_name(str(metric_key), swing_side)
+        if not joint_name:
+            continue
+        err_frame = _resolve_error_frame_index(
+            entry, str(metric_key), t0_index=t0, n_frames=n
+        )
+        err_rec = frames[err_frame]
+        if not isinstance(err_rec, dict):
+            continue
+        xy = _joint_xy_image_plane(
+            err_rec,
+            joint_name,
+            frame_width=frame_width,
+            frame_height=frame_height,
+        )
+        if xy is None:
+            continue
+        x, y, coord_space = xy
+        color = status_to_color_code(entry.get("status"))
+        error_timestamp_sec = _resolve_error_timestamp_sec(
+            err_frame,
+            absolute_timestamps=abs_ts,
+            frames=frames,
+            fps=fps,
+            roi_start=roi_start,
+        )
+        payload = {
+            "joint_name": joint_name,
+            "x": x,
+            "y": y,
+            "color_code": color,
+            "error_timestamp_sec": error_timestamp_sec,
+            "error_frame_index": int(err_frame),
+            "metric_key": str(metric_key),
+            "coordinate_space": coord_space,
+        }
+        prev = by_joint.get(joint_name)
+        if prev is None or _COLOR_SEVERITY.get(color, 0) > _COLOR_SEVERITY.get(
+            str(prev.get("color_code")), 0
+        ):
+            by_joint[joint_name] = payload
+
+    # 稳定顺序：按 BIOMECH 常见阅读顺序（支撑→摆腿→髋）
+    order = (
+        "left_ankle",
+        "left_foot_index",
+        "left_knee",
+        "left_hip",
+        "right_hip",
+        "right_knee",
+        "right_ankle",
+        "right_foot_index",
+    )
+    ordered = [by_joint[k] for k in order if k in by_joint]
+    ordered.extend(v for k, v in by_joint.items() if k not in order)
+    return ordered
+
+
 def diagnose_with_temporal_isolation(
     frames: list[dict],
     ball_center: Optional[np.ndarray] = None,
@@ -1412,6 +1717,7 @@ def diagnose_with_temporal_isolation(
             "phase_windows": None,
             "t0_meta": {"t0_fallback": "empty_frames"},
             "decision_reason": "空帧序列，无法进行时序隔离诊断",
+            "joint_highlights": [],
         }
 
     n = len(frames)
@@ -1429,6 +1735,7 @@ def diagnose_with_temporal_isolation(
             "phase_windows": None,
             "t0_meta": {"t0_fallback": "sixty_percent_short_clip", "sample_frame_count": n},
             "decision_reason": "有效帧不足，无法进行时序隔离诊断",
+            "joint_highlights": [],
         }
 
     timestamps = [float(f["timestamp_sec"]) for f in frames]
@@ -1453,7 +1760,7 @@ def diagnose_with_temporal_isolation(
         safe_end = max(0, t0_index - 1)
         safe_start = max(0, safe_end - MIN_PHASE_WINDOW_FRAMES + 1)
         knee_fallback = [
-            calculate_angle(
+            calculate_sagittal_angle(
                 frames[i]["right_hip"], frames[i]["right_knee"], frames[i]["right_ankle"]
             )
             for i in range(safe_start, safe_end + 1)
@@ -1480,10 +1787,10 @@ def diagnose_with_temporal_isolation(
             hip = _joint_prefer_world(f, "right_hip")
             knee = _joint_prefer_world(f, "right_knee")
             ankle = _joint_prefer_world(f, "right_ankle")
-            knee_series.append(calculate_angle(hip, knee, ankle))
+            knee_series.append(calculate_sagittal_angle(hip, knee, ankle))
         else:
             knee_series.append(
-                calculate_angle(f["right_hip"], f["right_knee"], f["right_ankle"])
+                calculate_sagittal_angle(f["right_hip"], f["right_knee"], f["right_ankle"])
             )
     omega = _time_derivative_series(knee_series, timestamps)
     pre_t0_omega = [abs(omega[i]) for i in range(0, t0_index + 1)]
@@ -1613,7 +1920,23 @@ def diagnose_with_temporal_isolation(
     metrics["hip_torsion_angle"] = round(
         float(score_detail["indicators"]["hip_torsion_angle"]["value"]), 1
     )
+    # 具身隐喻：问题关节高亮（含临床绝对时间戳，避免全时段常亮）
+    swing_side = str(score_detail.get("swing_leg") or "right")
+    joint_highlights = score_detail.get("joint_highlights")
+    if not isinstance(joint_highlights, list) or not joint_highlights:
+        joint_highlights = build_joint_highlights(
+            frames,
+            t0_index,
+            score_detail.get("indicators"),
+            swing_side=swing_side,
+            absolute_timestamps=timestamps,
+            fps=float(DEFAULT_VIDEO_FPS),
+        )
+        score_detail["joint_highlights"] = joint_highlights
+    diagnosis["joint_highlights"] = list(joint_highlights)
+    metrics["joint_highlights"] = list(joint_highlights)
     diagnosis["metrics"] = metrics
+    diagnosis["score_detail"] = score_detail
     return diagnosis
 
 

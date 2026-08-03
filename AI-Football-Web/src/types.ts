@@ -118,6 +118,10 @@ export interface FinalDiagnosisReport {
   painPoint: string
   /** 教练处方建议 */
   prescription: string
+  /** OPTIMAL 纠错具身隐喻（与 painPoint 同源） */
+  correction_metaphor?: string
+  /** OPTIMAL 表扬鼓励（与 prescription 同源） */
+  praise_encouragement?: string
   /** 拼接完整的报告正文，用于打字机展示与导出 */
   fullText: string
   /** 报告生成时间 */
@@ -145,6 +149,8 @@ export interface FinalDiagnosisReport {
   avgKneeAngle?: number | null
   /** DeterministicScorer 完整评分明细（含 8 大量纲 status / extreme_frame_index） */
   scoreDetail?: ScoreDetailPayload | null
+  /** 具身隐喻关节高亮（与 scoreDetail.joint_highlights 同源，顶层可选直取） */
+  joint_highlights?: JointHighlight[] | null
   /** 触球绝对零点帧索引 */
   t_impact?: number | null
   /** 驼峰别名，与 t_impact 等价 */
@@ -164,6 +170,13 @@ export interface FinalDiagnosisReport {
    */
   time_series_velocity?: number[] | null
   timeSeriesVelocity?: number[] | null
+  /**
+   * Action ROI 切片内每帧在原视频中的绝对秒：
+   * `absolute_timestamps[i] = (action_roi.start + i) / fps`。
+   * 与 HTML5 `video.currentTime` 对齐，消除波形-视频时空脱节。
+   */
+  absolute_timestamps?: number[] | null
+  absoluteTimestamps?: number[] | null
   /**
    * 触球点在 `time_series_velocity` 窗口内的索引（边界未截断时为 30）。
    */
@@ -259,6 +272,39 @@ export interface AggregateDiagnosisReport {
   fullText: string
   /** 报告生成时间 */
   generatedAt: string
+  /** 大模型调用失败时的具体错误（超时/鉴权等）；有值时前端应展示该文案而非模糊占位 */
+  llmError?: string | null
+  /** 最佳 vs 待改进双关键帧（与 /api/review/student_summary 同源） */
+  comparison_frames?: ComparisonFrames | null
+  comparison_available?: boolean
+}
+
+/** 复盘看板：单侧关键帧对比条目（best / improve） */
+export interface ComparisonFrameSide {
+  score: number
+  image_url?: string | null
+  attempt_id?: number | string
+  /** 仅 improve 侧：主要痛点短标签 */
+  main_error?: string | null
+}
+
+/** 复盘看板：最佳 vs 待改进双关键帧载荷 */
+export interface ComparisonFrames {
+  best: ComparisonFrameSide
+  improve: ComparisonFrameSide
+}
+
+/** GET /api/review/student_summary 响应 */
+export interface StudentReviewSummary {
+  success: boolean
+  student_id: string
+  session_date?: string | null
+  session_id?: string | null
+  attempt_count: number
+  attempts?: Array<{ attempt_id?: number | string; score: number; has_image?: boolean }>
+  comparison_frames?: ComparisonFrames | null
+  comparison_available?: boolean
+  message?: string
 }
 
 /* ------------------------------------------------------------------ */
@@ -371,6 +417,15 @@ export interface GlobalTrainingRecord {
   isDeleted?: boolean
 }
 
+/** 五维雷达均值聚合（GET /api/coach/records → radar_average） */
+export interface RadarAverageScores {
+  approach_rhythm?: number | null
+  support_stability?: number | null
+  backswing_folding?: number | null
+  ankle_rigidity?: number | null
+  whipping_velocity?: number | null
+}
+
 /** GET /api/coach/records 列表行（诊断快照已截断，不含大图 Base64） */
 export interface CoachSanitizerRecord {
   id: string
@@ -384,6 +439,10 @@ export interface CoachSanitizerRecord {
   score: number | null
   diagnosisSnapshot?: string
   aiFeedback?: string
+  biomechanicalErrors?: string[]
+  quantified5dScores?: Quantified5dScores | null
+  radar_scores?: Quantified5dScores | null
+  kneeFlexionAngle?: number | null
   is_deleted?: boolean
   path?: string | null
   directory?: string | null
@@ -396,6 +455,26 @@ export interface CoachSanitizerRecord {
   ankleRigidityProvenance?: string | null
   lastCalibratedAt?: string | null
   lastCalibratedMetric?: string | null
+}
+
+/** GET /api/coach/records 响应 */
+export interface CoachRecordsResponse {
+  success: boolean
+  message?: string
+  records?: CoachSanitizerRecord[]
+  count?: number
+  radar_average?: RadarAverageScores | null
+}
+
+/** POST|DELETE /api/records/batch 响应（物理删除） */
+export interface BatchDeleteRecordsResponse {
+  success: boolean
+  message?: string
+  deletedIds?: string[]
+  alreadyDeletedIds?: string[]
+  missingIds?: string[]
+  count?: number
+  ormDeleted?: number
 }
 
 export type CoachCalibrateMetricKey =
@@ -461,6 +540,50 @@ export interface ProgressHistoryResponse {
 
 /** 教练端看板视角切换：全班集体宏观诊断 / 个体纵向进化追踪 */
 export type CoachDashboardPerspective = 'classOverview' | 'individual'
+
+/** GET /api/analytics/compare_cohorts — 按日趋势点 */
+export interface CohortTrendPoint {
+  date: string
+  average_score: number | null
+  score_variance: number | null
+  n?: number
+}
+
+/** GET /api/analytics/compare_cohorts — 错误码占比行 */
+export interface CohortErrorRateRow {
+  code: string
+  count: number
+  rate: number
+  percentage?: number
+}
+
+/** GET /api/analytics/compare_cohorts 三维对比响应 */
+export interface CohortCompareResponse {
+  success: boolean
+  sufficient_data: boolean
+  message?: string | null
+  cohort_a?: string
+  cohort_b?: string
+  sample_counts?: { a?: number; b?: number }
+  trend?: {
+    dates: string[]
+    cohort_a: CohortTrendPoint[]
+    cohort_b: CohortTrendPoint[]
+  }
+  radar?: {
+    dimensions: string[]
+    keys: string[]
+    cohort_a: Array<number | null>
+    cohort_b: Array<number | null>
+    cohort_a_scores?: RadarAverageScores | null
+    cohort_b_scores?: RadarAverageScores | null
+  }
+  error_rates?: {
+    cohort_a: CohortErrorRateRow[]
+    cohort_b: CohortErrorRateRow[]
+    union_codes?: string[]
+  }
+}
 
 /**
  * 课堂疲劳熔断报警（与 session_monitor.FatigueMonitor / GET /api/fatigue_alert 对齐）
@@ -575,6 +698,24 @@ export interface BiomechIndicatorValue {
 /** 整趟分析总体合规态：仅 PERFECT 允许右栏绿色「全部合规」提示 */
 export type OverallComplianceStatus = 'PERFECT' | 'IMPERFECT' | string
 
+/** 后端 scoreDetail.joint_highlights 单条（Canvas 叠加用） */
+export interface JointHighlight {
+  joint_name: string
+  x: number
+  y: number
+  /** RED | YELLOW | GREEN */
+  color_code: 'RED' | 'YELLOW' | 'GREEN' | string
+  /**
+   * 错误发生帧的临床绝对时间戳（秒），与 video.currentTime / absolute_timestamps 对齐。
+   * 前端仅在播放头靠近该时刻时渲染，避免全时段常亮。
+   */
+  error_timestamp_sec: number
+  /** 可选：错误绝对帧索引 */
+  error_frame_index?: number | null
+  metric_key?: string | null
+  coordinate_space?: 'pixel' | 'normalized' | string
+}
+
 /** POST /api/generate_report 返回的 scoreDetail 结构 */
 export interface ScoreDetailPayload {
   TotalScore?: number
@@ -599,10 +740,17 @@ export interface ScoreDetailPayload {
     half_window?: number
     length?: number
     roi_frame_count?: number
+    /** 与顶层 absolute_timestamps 同源：切片内原视频绝对秒 */
+    absolute_timestamps?: number[] | null
   }
   /** Sprint 1：单趟次时空热力图 PNG base64 */
   heatmap_base64?: string | null
   spatial_trajectory?: SpatialTrajectoryRelative | null
+  /**
+   * 具身隐喻：触球瞬间 (T0) 问题关节红绿灯高亮。
+   * x/y 默认为源视频绝对像素；coordinate_space==="normalized" 时为 0–1。
+   */
+  joint_highlights?: JointHighlight[] | null
 }
 
 /** 点击指标卡片时，通知 VideoWorkspace Seek 到物理极值帧的事件载荷 */

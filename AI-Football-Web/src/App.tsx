@@ -49,7 +49,11 @@ function App() {
           transition={{ duration: 0.25, ease: 'easeOut' }}
         >
           {activeView === 'realtime' && <RealtimeWorkspace globalSettings={globalSettings} />}
-          {activeView === 'zen' && <ZenWorkspace globalSettings={globalSettings} />}
+          {activeView === 'zen' && (
+            <div className="flex h-full min-h-0 flex-1 flex-col overflow-hidden">
+              <ZenWorkspace globalSettings={globalSettings} />
+            </div>
+          )}
           {activeView === 'coach' && (
             <div className="flex h-full min-h-0 flex-1 flex-col overflow-hidden">
               <CoachDashboard />

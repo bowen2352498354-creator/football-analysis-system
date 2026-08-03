@@ -124,28 +124,32 @@ def test_support_foot_offset_rejects_tiny_bbox_uses_fallback_and_clamp():
     assert calculate_support_foot_offset_cm(far_ankle, tiny) == 60.0
 
 
-def test_knee_extension_anatomical_correction():
-    """触球伸展语境：angle < 130 视为补角反转，翻转为 180-angle。"""
-    # 构造内角 ≈ 52° 的三点（锐角）→ 补角 128°
-    hip = (0.0, 1.0, 0.0)
+def test_sagittal_knee_angle_stable_near_extension():
+    """矢状面 atan2：近 180° 直腿在 X 轴抖动下不翻成锐角。"""
+    from biomech_primitives import calculate_sagittal_angle
+
     knee = (0.0, 0.0, 0.0)
-    rad = np.radians(52.0)
-    ankle = (float(np.sin(rad)), float(np.cos(rad)), 0.0)
-    raw = calculate_3d_joint_angle(hip, knee, ankle, is_knee_extension=False)
-    assert abs(raw - 52.0) < 1e-6
-    fixed = calculate_3d_joint_angle(hip, knee, ankle, is_knee_extension=True)
-    assert abs(fixed - 128.0) < 1e-6
-    # 半伸展假象 110° 也应在触球语境下翻转为 70°（阈值 130）
-    rad110 = np.radians(110.0)
-    ankle110 = (float(np.sin(rad110)), float(np.cos(rad110)), 0.0)
-    assert abs(calculate_3d_joint_angle(hip, knee, ankle110, is_knee_extension=False) - 110.0) < 1e-6
-    assert abs(calculate_3d_joint_angle(hip, knee, ankle110, is_knee_extension=True) - 70.0) < 1e-6
-    # 折叠解算保持默认：不翻转
-    assert abs(calculate_3d_joint_angle(hip, knee, ankle) - 52.0) < 1e-6
-    # 已在伸展带内（≥130）不再二次翻转
-    rad150 = np.radians(150.0)
-    ankle150 = (float(np.sin(rad150)), float(np.cos(rad150)), 0.0)
-    assert abs(calculate_3d_joint_angle(hip, knee, ankle150, is_knee_extension=True) - 150.0) < 1e-6
+    # 矢状面近乎伸直，但左右（X）同向偏移——3D arccos 会压到 ~118°
+    hip = (0.3, 0.5, -0.05)
+    ankle = (0.3, -0.5, 0.05)
+    sag = calculate_3d_joint_angle(hip, knee, ankle, is_knee_extension=True)
+    raw_3d = calculate_3d_joint_angle(hip, knee, ankle, is_knee_extension=False)
+    assert sag > 170.0
+    assert raw_3d < 130.0
+
+    # 无 X 噪声的直腿基准仍 ≈ 180°
+    clean = calculate_sagittal_angle((0.0, 0.5, -0.05), knee, (0.0, -0.5, 0.05))
+    assert clean > 170.0
+    assert abs(sag - clean) < 5.0
+
+    # 矢状面真实屈曲（Y-Z 上约 90°）保持锐角，不再做 180-angle 误补
+    flexed = calculate_3d_joint_angle(
+        (0.0, 1.0, 0.0), knee, (0.0, 0.0, 1.0), is_knee_extension=True
+    )
+    assert abs(flexed - 90.0) < 1.0
+
+    signed = calculate_sagittal_angle(hip, knee, ankle, signed=True)
+    assert abs(abs(signed) - sag) < 1e-6
 
 
 def test_ankle_stiffness_rejects_visibility_jump_and_rounds():
@@ -176,18 +180,30 @@ def test_ankle_stiffness_locked():
 
 
 def test_ankle_stiffness_slight_deformation():
-    # 人为构造 t±1 三帧方差落在 [2, 5]
-    series = [130.0, 135.0, 132.0]
-    var, status = calculate_ankle_stiffness_variance(series, t_impact_index=1)
+    # 持续渐变（非单帧尖峰）：中值滤波后冲击窗方差仍落在 [2, 5]
+    series = [128.0, 130.0, 133.0, 136.0, 134.0]
+    var, status = calculate_ankle_stiffness_variance(series, t_impact_index=2)
     assert 2.0 <= var <= 5.0
     assert status == ANKLE_STIFFNESS_SLIGHT_DEFORMATION
 
 
 def test_ankle_stiffness_yielding():
-    series = [100.0, 120.0, 90.0]
-    var, status = calculate_ankle_stiffness_variance(series, t_impact_index=1)
+    # 大幅持续波动，中值后仍 > 5
+    series = [100.0, 110.0, 130.0, 95.0, 105.0]
+    var, status = calculate_ankle_stiffness_variance(series, t_impact_index=2)
     assert var > 5.0
     assert status == ANKLE_STIFFNESS_YIELDING
+
+
+def test_ankle_stiffness_median_rejects_single_frame_spike():
+    """单帧极值噪点不得拉爆方差；中值滤波后应仍 LOCKED。"""
+    series = [140.0, 140.1, 200.0, 139.9, 140.0]
+    var, status = calculate_ankle_stiffness_variance(series, t_impact_index=2)
+    assert status == ANKLE_STIFFNESS_LOCKED
+    assert var < 2.0
+    # 空数组安全
+    assert calculate_ankle_stiffness_variance([], 0)[0] == 0.0
+    assert calculate_ankle_stiffness_variance(None, 0)[0] == 0.0
 
 
 def test_ankle_stiffness_boundary_safe_truncate():

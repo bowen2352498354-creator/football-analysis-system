@@ -90,6 +90,46 @@ class ShotAttemptLogCreate(BaseModel):
     total_score: Optional[float] = Field(None, ge=0, le=100)
     is_deleted: bool = False
 
+    @field_validator("impact_frame_index", mode="before")
+    @classmethod
+    def _coerce_impact_frame_index(cls, value):
+        if value is None or isinstance(value, bool):
+            raise ValueError("impact_frame_index 必须为非负整数")
+        if hasattr(value, "item") and not isinstance(value, (str, bytes)):
+            value = value.item()
+        return int(round(float(value)))
+
+    @field_validator("timepoint_session_id", mode="before")
+    @classmethod
+    def _coerce_timepoint_session_id(cls, value):
+        if value is None or value == "":
+            return None
+        if hasattr(value, "item") and not isinstance(value, (str, bytes)):
+            value = value.item()
+        return int(round(float(value)))
+
+    @field_validator(
+        "distance_cm",
+        "toe_angle",
+        "max_folding_angle",
+        "whipping_velocity",
+        "impact_knee_angle",
+        "ankle_rigidity",
+        "support_knee_angle",
+        "hip_torsion_angle",
+        "total_score",
+        mode="before",
+    )
+    @classmethod
+    def _coerce_metric_floats(cls, value):
+        if value is None or value == "":
+            return None
+        if isinstance(value, bool):
+            raise ValueError("业务指标不能为布尔值")
+        if hasattr(value, "item") and not isinstance(value, (str, bytes)):
+            value = value.item()
+        return float(value)
+
 
 class ShotAttemptLogRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -121,6 +161,15 @@ class TimepointSessionCreate(BaseModel):
     experimental_group: Optional[ExperimentalGroup] = None
     planned_min_shots: int = Field(DEFAULT_MIN_SHOTS_PER_SESSION, ge=1)
     notes: Optional[str] = Field(None, max_length=512)
+
+    @field_validator("planned_min_shots", mode="before")
+    @classmethod
+    def _coerce_planned_min_shots(cls, value):
+        if value is None or value == "":
+            return DEFAULT_MIN_SHOTS_PER_SESSION
+        if hasattr(value, "item") and not isinstance(value, (str, bytes)):
+            value = value.item()
+        return int(round(float(value)))
 
 
 class TimepointSessionRead(BaseModel):

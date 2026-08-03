@@ -1,25 +1,26 @@
 # -*- coding: utf-8 -*-
 """
 llm_agent.py
-小学五年级足球教练隐喻转译引擎（大模型代理模块）——职责严格解耦
+10 岁足球启蒙教练 · OPTIMAL 双段式具身隐喻转译引擎（大模型代理模块）
 
 【权限铁律】
     大语言模型完全不接触数值评分计算。评分由 error_diagnoser.DeterministicScorer
-    纯数学独占；本模块只允许接收其输出的缺陷 JSON，转译为鼓励孩子的一句隐喻。
+    纯数学独占；本模块只允许接收其输出的缺陷 JSON，转译为「纠错+表扬」双段式童趣话术。
 
 功能说明：
     1. 使用官方 openai Python 库调用 DeepSeek（OpenAI 兼容协议）；
-    2. 核心函数 generate_feedback(diagnosis_json)：输入诊断 JSON，返回一句隐喻短语；
-    3. System Prompt 强制：小学五年级足球教练口径；绝对禁止专业术语；
-    4. temperature 强制锁定 LLM_TEMPERATURE=0.2。
+    2. generate_feedback / generate_session_report：缺陷 JSON → OPTIMAL 双字段 JSON；
+    3. System Prompt 强制：童趣画面感、词汇黑名单、具身隐喻库、JSON 结构输出；
+    4. temperature 强制锁定 LLM_TEMPERATURE=0.2；解析失败走静态兜底字典。
 """
 
 import json
 import os
 import re
+import time
+from typing import Any, Optional
 
 from dotenv import load_dotenv
-from openai import OpenAI
 
 from error_diagnoser import (
     is_aigc_measurable_provenance,
@@ -37,12 +38,6 @@ load_dotenv()
 
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 
-if not DEEPSEEK_API_KEY:
-    raise ValueError(
-        "未检测到 DEEPSEEK_API_KEY 环境变量，请在项目根目录的 .env 文件中配置，"
-        "例如：DEEPSEEK_API_KEY=你的真实密钥"
-    )
-
 # DeepSeek 官方接口地址完全兼容 OpenAI 的 SDK 调用方式，
 # 只需要把 base_url 从默认的 OpenAI 官方地址换成 DeepSeek 的地址即可
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
@@ -50,29 +45,121 @@ DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 # DeepSeek 提供的对话模型名称（对应"深度思考"关闭状态下的标准对话模型）
 DEEPSEEK_MODEL_NAME = "deepseek-chat"
 
-# 创建一个全局唯一的客户端实例，避免每次调用函数都重新创建连接，提升效率
-client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
+# 【网络韧性】单次请求超时 5s；指数退避重试，彻底失败走静态模板 Fallback
+LLM_TIMEOUT_SEC = 5.0
+LLM_MAX_RETRIES = 3
+LLM_BACKOFF_BASE_SEC = 0.5
+
+# 无 Key / 初始化失败时 client=None，所有 generate_* 自动降级到规则引擎文案
+client = None
+if not DEEPSEEK_API_KEY:
+    print(
+        "【llm_agent】警告：未检测到 DEEPSEEK_API_KEY，"
+        "AIGC 将全程使用静态模板 Fallback（系统不崩溃）。"
+    )
+else:
+    try:
+        from openai import OpenAI
+
+        client = OpenAI(
+            api_key=DEEPSEEK_API_KEY,
+            base_url=DEEPSEEK_BASE_URL,
+            timeout=LLM_TIMEOUT_SEC,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"【llm_agent】OpenAI 客户端初始化失败，启用 Fallback：{exc}")
+        client = None
+
+
+def _chat_completions_with_backoff(
+    *,
+    messages: list,
+    temperature: float,
+    response_format: Optional[dict] = None,
+) -> Any:
+    """带 5s 超时与指数退避重试的 chat.completions 调用。
+
+    全部重试失败或 client 不可用时抛出最后一次异常，由调用方切换 Fallback。
+    """
+    if client is None:
+        raise RuntimeError("LLM client unavailable (missing API key or init failure)")
+
+    last_exc: Optional[BaseException] = None
+    for attempt in range(int(LLM_MAX_RETRIES)):
+        try:
+            kwargs: dict[str, Any] = {
+                "model": DEEPSEEK_MODEL_NAME,
+                "messages": messages,
+                "temperature": temperature,
+                "timeout": LLM_TIMEOUT_SEC,
+            }
+            if response_format is not None:
+                kwargs["response_format"] = response_format
+            return client.chat.completions.create(**kwargs)
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if attempt >= int(LLM_MAX_RETRIES) - 1:
+                break
+            sleep_s = float(LLM_BACKOFF_BASE_SEC) * (2 ** attempt)
+            print(
+                f"【llm_agent】API 调用失败（第 {attempt + 1}/{LLM_MAX_RETRIES} 次），"
+                f"{sleep_s:.1f}s 后指数退避重试：{exc}"
+            )
+            time.sleep(sleep_s)
+    assert last_exc is not None
+    raise last_exc
 
 # --------------------------------------------------------------------------
-# 第二步：System Prompt —— 小学五年级足球教练（一句隐喻，不可违抗）
+# 第二步：System Prompt —— 10 岁启蒙教练（OPTIMAL 双段式 JSON，不可违抗）
 # --------------------------------------------------------------------------
 
-# 【权限铁律】大模型完全不接触数值评分计算。它只能把缺陷 JSON 翻译成鼓励孩子的隐喻。
+# 【权限铁律】大模型完全不接触数值评分计算。它只能把缺陷 JSON 翻译成童趣双段话术。
 # temperature 强制锁定 0.2。
 LLM_TEMPERATURE = 0.2
 
+# correction_metaphor 三段式目标 ≤40 字；硬上限略放宽以免裁断 Few-Shot 完整句
+_CORRECTION_TARGET_CHARS = 40
+_CORRECTION_MAX_CHARS = 45
+_PRAISE_MAX_CHARS = 30
+
 SYSTEM_PROMPT = (
-    "你是一名小学五年级足球教练。你的唯一任务是将传入的缺陷JSON，翻译为鼓励孩子的【一句】童话或生活隐喻。\n"
-    "【绝对禁令】：严禁使用'矢状面'、'生物力学'、'实测值'、'方差'等任何专业术语。\n"
-    "【强制话术库参考】：\n"
-    " - 支撑脚问题：'像大树的根一样深深扎进泥土里'\n"
-    " - 折叠角/膝盖：'像把弓弦拉到最满，然后嗖的一下射出'\n"
-    " - 脚踝未锁紧：'把脚面变成一块坚硬的铁板'\n"
-    "直接输出隐喻短语，字数限制在 60 字以内，禁止任何列表或段落格式。"
+    "你现在是一名面对 10 岁小学生的足球启蒙教练。你的语言必须充满童趣、极具画面感。\n"
+    "【权限铁律】你绝不计算、修改或输出任何数值评分；你只能把缺陷 JSON 翻译成孩子听得懂的双段式话术。\n"
+    "【词汇黑名单 Hard Ban】绝对禁止使用以下词汇及类似学术术语："
+    "矢状面、额状面、欧氏距离、生物力学、重心转移、动力链、本体感觉、角速度、方差。"
+    "违规将导致系统崩溃。\n"
+    "【correction_metaphor 句式铁律 · 禁止本末倒置】必须且只能按以下模板生成一整句，"
+    "绝不允许先说隐喻再提问题：\n"
+    "[你刚才的+具体错误动作]，就像[通俗易懂的物理比喻]一样！下次试试[具体的修正动作]。\n"
+    "警告：绝不允许颠倒顺序（绝不能先说隐喻）；比喻必须极其生活化；"
+    "禁止使用任何超过小学生理解能力的词汇；"
+    f"correction_metaphor 总字数严格控制在 {_CORRECTION_TARGET_CHARS} 字以内"
+    f"（硬上限 {_CORRECTION_MAX_CHARS} 字）。\n"
+    "【Few-Shot 标准示范 · 严格模仿这种贴切通俗风格】\n"
+    "支撑脚过远：你刚才踢球时支撑脚离球太远了，就像跨栏一样！下次试试把脚踩在离球一拳近的地方。\n"
+    "直腿击球：你刚才踢球时膝盖太直了，就像一根冻住的冰棍一样！下次试试像弹簧一样把小腿弯一弯再弹出去。\n"
+    "脚踝松弛：你刚才触球时脚腕软绵绵的，就像煮熟的面条一样！下次试试把脚面绷紧，变成一块硬硬的铁板。\n"
+    "躯干后仰：你刚才踢球时身子往后倒了，就像坐在太师椅上一样！下次试试把胸口像大虾一样往前压一压。\n"
+    "随前动作缺失：你刚才踢完球脚马上就停住了，就像踩了急刹车一样！下次试试踢完后，让脚跟着球再往前送一送。\n"
+    "【OPTIMAL 动机保护 · 强制 JSON】只返回合法 JSON 对象，禁止 Markdown 代码围栏与多余文字。"
+    "字段必须严格分离：\n"
+    "{\n"
+    f'  "correction_metaphor": "按上方三段式模板写纠错句（≤{_CORRECTION_MAX_CHARS}字）",\n'
+    f'  "praise_encouragement": "挖掘本次动作中哪怕极小的一个优点，给予强烈情绪价值与夸奖（≤{_PRAISE_MAX_CHARS}字）"\n'
+    "}\n"
+    "两个字段都必须填写。必须使用简体中文。"
 )
 
 # 会话报告与单次反馈共用同一不可违抗命令
 REPORT_SYSTEM_PROMPT = SYSTEM_PROMPT
+
+# 模型抽风 / 网络失败时的静态兜底（纠错三段式 + 表扬）
+_STATIC_OPTIMAL_FALLBACK = {
+    "correction_metaphor": (
+        "你刚才踢球时膝盖太直了，就像一根冻住的冰棍一样！下次试试像弹簧一样把小腿弯一弯再弹出去。"
+    ),
+    "praise_encouragement": "这次尝试非常勇敢，继续保持！",
+}
 
 # 红色缺陷优先级（供兜底规则选用对应话术）
 _RED_DEFECT_PRIORITY = (
@@ -108,69 +195,94 @@ _INDICATOR_UNIT = {
     "whipping_velocity": "°/s",
 }
 
-# 缺陷键 → 强制话术库隐喻（模型失败时的规则化兜底）
+# 缺陷键 → OPTIMAL 双段兜底（纠错三段式 + 表扬）；模型失败时按主缺陷选用
+_OPTIMAL_FALLBACK_BY_DEFECT = {
+    "ankle_rigidity": {
+        "correction_metaphor": (
+            "你刚才触球时脚腕软绵绵的，就像煮熟的面条一样！"
+            "下次试试把脚面绷紧，变成一块硬硬的铁板。"
+        ),
+        "praise_encouragement": "你敢用力出脚，超勇敢！",
+    },
+    "distance_cm": {
+        "correction_metaphor": (
+            "你刚才踢球时支撑脚离球太远了，就像跨栏一样！"
+            "下次试试把脚踩在离球一拳近的地方。"
+        ),
+        "praise_encouragement": "这次跑过来很有劲，真棒！",
+    },
+    "toe_angle": {
+        "correction_metaphor": (
+            "你刚才支撑脚尖指歪了，就像跨栏跑偏一样！"
+            "下次试试让脚尖对准球门再踢球。"
+        ),
+        "praise_encouragement": "你眼睛盯着球，很专注！",
+    },
+    "max_folding_angle": {
+        "correction_metaphor": (
+            "你刚才踢球时膝盖太直了，就像一根冻住的冰棍一样！"
+            "下次试试像弹簧一样把小腿弯一弯再弹出去。"
+        ),
+        "praise_encouragement": "这一脚踢得很用力，好样的！",
+    },
+    "impact_knee_angle": {
+        "correction_metaphor": (
+            "你刚才踢球时膝盖太直了，就像一根冻住的冰棍一样！"
+            "下次试试像弹簧一样把小腿弯一弯再弹出去。"
+        ),
+        "praise_encouragement": "你出脚很果断，继续加油！",
+    },
+    "support_knee_angle": {
+        "correction_metaphor": (
+            "你刚才支撑腿绷得太直了，就像一根冻住的冰棍一样！"
+            "下次试试膝盖微微弯一点再站稳。"
+        ),
+        "praise_encouragement": "你站得很认真，真不错！",
+    },
+    "hip_torsion_angle": {
+        "correction_metaphor": (
+            "你刚才踢球时身子往后倒了，就像坐在太师椅上一样！"
+            "下次试试把胸口像大虾一样往前压一压。"
+        ),
+        "praise_encouragement": "你全身都在动，很有精神！",
+    },
+    "whipping_velocity": {
+        "correction_metaphor": (
+            "你刚才踢完球脚马上就停住了，就像踩了急刹车一样！"
+            "下次试试踢完后，让脚跟着球再往前送一送。"
+        ),
+        "praise_encouragement": "你越踢越敢试，太棒了！",
+    },
+}
+
+# 兼容旧名：单句纠错隐喻（供少数内部调用）
 _METAPHOR_FALLBACK_BY_DEFECT = {
-    "ankle_rigidity": "把脚面变成一块坚硬的铁板，踢球时稳稳顶住小球。",
-    "distance_cm": "像大树的根一样深深扎进泥土里，站稳了再踢球。",
-    "toe_angle": "像大树的根一样深深扎进泥土里，脚尖对准前方目标。",
-    "max_folding_angle": "像把弓弦拉到最满，然后嗖的一下射出。",
-    "impact_knee_angle": "像把弓弦拉到最满，然后嗖的一下射出。",
-    "support_knee_angle": "像大树的根一样深深扎进泥土里，膝盖微微弯着更稳。",
-    "hip_torsion_angle": "像把弓弦拉到最满，然后嗖的一下射出。",
-    "whipping_velocity": "像把弓弦拉到最满，然后嗖的一下射出。",
+    key: val["correction_metaphor"] for key, val in _OPTIMAL_FALLBACK_BY_DEFECT.items()
 }
 
-# ── Fallback 分级：第二节「为什么会这样」，第三节「下次怎么做」 ────────────────
-# 【设计约束】LLM 不可用时，孩子仍必须拿到两件不同的信息：
-#   · 第二节 = 原因说明（用同一套隐喻解释这一脚为什么没踢好，只讲现象与成因）；
-#   · 第三节 = 行动指令（下一脚具体做什么，必须是孩子能立刻执行的一个动作）。
-# 两者严禁复用同一句话，否则等于只给了一半反馈。
-# 话术同样遵守 SYSTEM_PROMPT 铁律：不出现任何专业术语、不出现任何数值。
+# 旧三节制兜底仍保留给实测值复述测试（不对孩子展示学术词；AIGC 主路径已弃用）
 _FALLBACK_CAUSE_BY_DEFECT = {
-    "ankle_rigidity": "你的脚面这一下软软的，像一块没绷紧的海绵，力气都被它自己吃掉了，没能传给小球。",
-    "distance_cm": "你站的位置离小球有点不合适，身子还在晃，就像小树的根没扎稳，风一吹就摇。",
-    "toe_angle": "你支撑那只脚的脚尖歪向了别处，身子被它带着跑偏，球自然也跟着往旁边跑。",
-    "max_folding_angle": "你的腿是直着甩出去的，就像弓弦只拉开一点点就放手，攒不住劲儿。",
-    "impact_knee_angle": "碰到球的那一瞬间膝盖伸得太开了，弓弦提前松掉，最后一下没能弹出来。",
-    "support_knee_angle": "你支撑的那条腿绷得太直，像一根硬木棍撑在地上，站不住也缓不住劲。",
-    "hip_torsion_angle": "你只用了腿在踢，腰和屁股没转过来，就像拧发条只拧了一半就放手。",
-    "whipping_velocity": "你的小腿甩过来的时候慢慢的，像慢慢推门而不是弹簧弹开，速度没攒够。",
+    key: val["correction_metaphor"] for key, val in _OPTIMAL_FALLBACK_BY_DEFECT.items()
 }
-
 _FALLBACK_ACTION_BY_DEFECT = {
-    "ankle_rigidity": "下一脚记住：踢之前先把脚面绷紧，把它想成一块坚硬的铁板，用铁板稳稳顶一下小球。",
-    "distance_cm": "下一脚记住：先站到球的旁边一小步的地方，双脚像大树的根扎进泥土里，站稳了再踢。",
-    "toe_angle": "下一脚记住：踢之前低头看一眼支撑脚的脚尖，让它直直指向你想让球去的地方，再出脚。",
-    "max_folding_angle": "下一脚记住：出脚前先把小腿往屁股方向折一下，像把弓弦拉到最满，再嗖的一下射出去。",
-    "impact_knee_angle": "下一脚记住：碰到球的那一刻膝盖再多留一点弯，等脚背贴上球，才把腿甩直。",
-    "support_knee_angle": "下一脚记住：支撑腿的膝盖微微弯一点点，像准备起跳那样，弯着站反而更稳更有劲。",
-    "hip_torsion_angle": "下一脚记住：先把肚子和肩膀一起转向球门，让腰带着腿一块儿甩出去，别只用腿。",
-    "whipping_velocity": "下一脚记住：把小腿当成弹簧，折起来之后猛地弹出去，越快越好，试着比刚才快一点。",
+    key: val["praise_encouragement"] for key, val in _OPTIMAL_FALLBACK_BY_DEFECT.items()
 }
 
 
 def _cause_fallback_for_defect(defect: str) -> str:
-    """第二节话术（原因说明）；未知缺陷键回落到折叠角。"""
-    return _FALLBACK_CAUSE_BY_DEFECT.get(
-        defect, _FALLBACK_CAUSE_BY_DEFECT["max_folding_angle"]
+    """兼容旧接口：返回该缺陷的纠错隐喻。"""
+    dual = _OPTIMAL_FALLBACK_BY_DEFECT.get(
+        defect, _OPTIMAL_FALLBACK_BY_DEFECT["max_folding_angle"]
     )
+    return dual["correction_metaphor"]
 
 
 def _action_fallback_for_defect(defect: str) -> str:
-    """第三节话术（行动指令）；未知缺陷键回落到折叠角。"""
-    return _FALLBACK_ACTION_BY_DEFECT.get(
-        defect, _FALLBACK_ACTION_BY_DEFECT["max_folding_angle"]
+    """兼容旧接口：返回该缺陷的表扬话术。"""
+    dual = _OPTIMAL_FALLBACK_BY_DEFECT.get(
+        defect, _OPTIMAL_FALLBACK_BY_DEFECT["max_folding_angle"]
     )
-
-
-_RED_DEFECT_FALLBACK_LINES = {
-    key: (
-        f"【一、 客观实测面诊】\n{phrase}\n\n"
-        f"【二、 生物力学致错根因】\n{_cause_fallback_for_defect(key)}\n\n"
-        f"【三、 临床纠正药方】\n{_action_fallback_for_defect(key)}"
-    )
-    for key, phrase in _METAPHOR_FALLBACK_BY_DEFECT.items()
-}
+    return dual["praise_encouragement"]
 
 
 def _normalize_diagnosis_json(diagnosis_json) -> dict:
@@ -285,35 +397,28 @@ def _strip_code_fences(text: str) -> str:
     """剔除模型偶发包裹的 Markdown 代码围栏。"""
     cleaned = (text or "").strip()
     if cleaned.startswith("```"):
-        cleaned = re.sub(r"^```(?:markdown|md)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(
+            r"^```(?:json|markdown|md)?\s*", "", cleaned, flags=re.IGNORECASE
+        )
         cleaned = re.sub(r"\s*```$", "", cleaned)
     return cleaned.strip()
 
 
-def _split_clinical_markdown(text: str) -> tuple[str, str]:
-    """兼容旧三节制拆分；新口径下一句隐喻同时写入 painPoint / prescription。"""
-    cleaned = _strip_code_fences(text)
-    match = re.search(r"【三[、．.\s]*临床纠正药方】", cleaned)
-    if match:
-        pain_point = cleaned[: match.start()].strip()
-        prescription = cleaned[match.start() :].strip()
-        return pain_point, prescription
-    metaphor = _clamp_metaphor_phrase(cleaned)
-    return metaphor, metaphor
-
-
-def _clamp_metaphor_phrase(text: str) -> str:
-    """压成单句隐喻：去围栏、去列表标记，硬裁 60 字。"""
+def _clamp_optimal_phrase(text: str, limit: int = _PRAISE_MAX_CHARS) -> str:
+    """压成单句童趣话术：去围栏、去标签前缀，按字段硬裁字数。"""
     cleaned = _strip_code_fences(text)
     cleaned = re.sub(r"^[\s\-•*·、。]+", "", cleaned)
     cleaned = re.sub(r"\s+", "", cleaned.replace("\n", ""))
-    if len(cleaned) > 60:
-        cleaned = cleaned[:60]
-    return cleaned or _METAPHOR_FALLBACK_BY_DEFECT["max_folding_angle"]
+    for prefix in ("【魔法指令】", "【闪光点发现】"):
+        if cleaned.startswith(prefix):
+            cleaned = cleaned[len(prefix) :]
+    if len(cleaned) > limit:
+        cleaned = cleaned[:limit]
+    return cleaned
 
 
-def _pick_metaphor_fallback(diagnosis: dict) -> str:
-    """按红色缺陷优先级挑选话术库隐喻；无红则看黄，再兜底折叠角话术。"""
+def _pick_primary_defect_key(diagnosis: dict) -> str:
+    """红优先、黄次之；都没有则回落到折叠角。"""
     defect = _pick_primary_red_defect(diagnosis)
     if not defect:
         detail = (diagnosis or {}).get("score_detail") or {}
@@ -324,22 +429,142 @@ def _pick_metaphor_fallback(diagnosis: dict) -> str:
                 if isinstance(item, dict) and item.get("status") == "YELLOW_APPROACHING":
                     defect = key
                     break
-    if not defect:
-        defect = "max_folding_angle"
-    return _METAPHOR_FALLBACK_BY_DEFECT.get(
-        defect, _METAPHOR_FALLBACK_BY_DEFECT["max_folding_angle"]
+    return defect or "max_folding_angle"
+
+
+def _optimal_fallback_dual(diagnosis: Optional[dict] = None) -> dict:
+    """按主缺陷挑选双段兜底；未知缺陷或空诊断走静态兜底。"""
+    if not diagnosis:
+        return dict(_STATIC_OPTIMAL_FALLBACK)
+    defect = _pick_primary_defect_key(diagnosis)
+    dual = _OPTIMAL_FALLBACK_BY_DEFECT.get(defect)
+    if not dual:
+        return dict(_STATIC_OPTIMAL_FALLBACK)
+    return {
+        "correction_metaphor": dual["correction_metaphor"],
+        "praise_encouragement": dual["praise_encouragement"],
+    }
+
+
+def _extract_json_object(text: str) -> Optional[dict]:
+    """从模型原文提取 JSON 对象；失败返回 None。"""
+    cleaned = _strip_code_fences(text)
+    if not cleaned:
+        return None
+    try:
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, dict):
+            return parsed
+    except (TypeError, ValueError, json.JSONDecodeError):
+        pass
+    match = re.search(r"\{[\s\S]*\}", cleaned)
+    if not match:
+        return None
+    try:
+        parsed = json.loads(match.group(0))
+        return parsed if isinstance(parsed, dict) else None
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _parse_optimal_dual_feedback(
+    raw_text: str, diagnosis: Optional[dict] = None
+) -> dict:
+    """解析 OPTIMAL 双段 JSON；非标准返回时走静态/缺陷兜底字典。"""
+    try:
+        parsed = _extract_json_object(raw_text)
+        if not parsed:
+            raise ValueError("LLM 未返回可解析 JSON")
+        correction = _clamp_optimal_phrase(
+            str(parsed.get("correction_metaphor") or ""),
+            limit=_CORRECTION_MAX_CHARS,
+        )
+        praise = _clamp_optimal_phrase(
+            str(parsed.get("praise_encouragement") or ""),
+            limit=_PRAISE_MAX_CHARS,
+        )
+        if not correction or not praise:
+            raise ValueError("OPTIMAL 双字段为空")
+        return {
+            "correction_metaphor": correction,
+            "praise_encouragement": praise,
+        }
+    except Exception as exc:  # noqa: BLE001
+        print(f"【llm_agent】OPTIMAL JSON 解析失败，启用静态兜底：{exc}")
+        return _optimal_fallback_dual(diagnosis)
+
+
+def _format_optimal_dual_text(dual: dict) -> str:
+    """把双段字典拼成字幕/日志可读字符串（兼容旧 str 调用方）。"""
+    correction = (dual or {}).get("correction_metaphor") or _STATIC_OPTIMAL_FALLBACK[
+        "correction_metaphor"
+    ]
+    praise = (dual or {}).get("praise_encouragement") or _STATIC_OPTIMAL_FALLBACK[
+        "praise_encouragement"
+    ]
+    return f"【魔法指令】{correction} 【闪光点发现】{praise}"
+
+
+def _dual_to_report_fields(dual: dict) -> dict:
+    """映射到前端既有 painPoint / prescription，并透出新字段名。"""
+    correction = (dual or {}).get("correction_metaphor") or _STATIC_OPTIMAL_FALLBACK[
+        "correction_metaphor"
+    ]
+    praise = (dual or {}).get("praise_encouragement") or _STATIC_OPTIMAL_FALLBACK[
+        "praise_encouragement"
+    ]
+    return {
+        "painPoint": correction,
+        "prescription": praise,
+        "correction_metaphor": correction,
+        "praise_encouragement": praise,
+    }
+
+
+def _split_clinical_markdown(text: str) -> tuple[str, str]:
+    """兼容旧拆分；优先解析 OPTIMAL JSON，否则整段当作纠错话术。"""
+    parsed = _extract_json_object(text)
+    if parsed:
+        correction = _clamp_optimal_phrase(
+            str(parsed.get("correction_metaphor") or ""),
+            limit=_CORRECTION_MAX_CHARS,
+        )
+        praise = _clamp_optimal_phrase(
+            str(parsed.get("praise_encouragement") or ""),
+            limit=_PRAISE_MAX_CHARS,
+        )
+        if correction and praise:
+            return correction, praise
+    cleaned = _strip_code_fences(text)
+    match = re.search(
+        r"【三[、．.\s]*(?:临床纠正药方|闪光点发现)】", cleaned
     )
+    if match:
+        return cleaned[: match.start()].strip(), cleaned[match.start() :].strip()
+    phrase = _clamp_optimal_phrase(
+        cleaned, limit=_CORRECTION_MAX_CHARS
+    ) or _STATIC_OPTIMAL_FALLBACK["correction_metaphor"]
+    return phrase, phrase
+
+
+def _clamp_metaphor_phrase(text: str) -> str:
+    """兼容旧接口：压成单句纠错隐喻（≤ correction 硬上限）。"""
+    cleaned = _clamp_optimal_phrase(text, limit=_CORRECTION_MAX_CHARS)
+    return cleaned or _METAPHOR_FALLBACK_BY_DEFECT["max_folding_angle"]
+
+
+def _pick_metaphor_fallback(diagnosis: dict) -> str:
+    """按主缺陷挑选纠错隐喻兜底。"""
+    return _optimal_fallback_dual(diagnosis)["correction_metaphor"]
 
 
 def _build_clinical_fallback_markdown(diagnosis: dict) -> str:
-    """无模型可用时生成结构化三段式报告。
+    """实测值复述清单 + OPTIMAL 双段兜底（供 provenance E2E 测试与调试复盘）。
 
     【一、 客观实测面诊】—— 仅引用 measured/calibrated 数值；
                           焦点指标非实测则写"未提供实测值"，绝不引用 scoring_value。
-    【二、 生物力学致错根因】—— 原因说明：用隐喻解释这一脚「为什么」没踢好。
-    【三、 临床纠正药方】   —— 行动指令：告诉孩子「下次怎么做」的单个可执行动作。
-                          二、三节话术分别取自 _FALLBACK_CAUSE_BY_DEFECT /
-                          _FALLBACK_ACTION_BY_DEFECT，严禁复用同一句。
+    【二、 魔法指令】   —— correction_metaphor
+    【三、 闪光点发现】 —— praise_encouragement
     """
     diagnosis = diagnosis or {}
     detail = diagnosis.get("score_detail") or {}
@@ -385,27 +610,12 @@ def _build_clinical_fallback_markdown(diagnosis: dict) -> str:
                 lines_sec1.append(f"  · {label}：未提供实测值")
 
     sec1_body = "\n".join(lines_sec1) if lines_sec1 else "  · 本次未采集到实测数据"
-
-    # ── 第二节（原因说明）、第三节（行动指令）：按主要缺陷分别选话术 ──────────
-    # 【设计约束】二节 ≠ 三节：前者解释「为什么会这样」，后者告诉孩子「下次怎么做」。
-    defect = _pick_primary_red_defect(diagnosis)
-    if not defect:
-        if isinstance(indicators, dict):
-            for key in _RED_DEFECT_PRIORITY:
-                item = indicators.get(key) or {}
-                if isinstance(item, dict) and item.get("status") == "YELLOW_APPROACHING":
-                    defect = key
-                    break
-    if not defect:
-        defect = "max_folding_angle"
-
-    sec2_cause = _cause_fallback_for_defect(defect)
-    sec3_action = _action_fallback_for_defect(defect)
+    dual = _optimal_fallback_dual(diagnosis)
 
     return (
         f"【一、 客观实测面诊】\n{sec1_body}\n\n"
-        f"【二、 生物力学致错根因】\n{sec2_cause}\n\n"
-        f"【三、 临床纠正药方】\n{sec3_action}"
+        f"【二、 魔法指令】\n{dual['correction_metaphor']}\n\n"
+        f"【三、 闪光点发现】\n{dual['praise_encouragement']}"
     )
 
 
@@ -424,27 +634,20 @@ def build_aigc_user_message(diagnosis: dict) -> str:
     """与 generate_feedback 同源的 user message（供 E2E 断言，不发起网络请求）。"""
     safe_payload = build_aigc_safe_payload(diagnosis)
     return (
-        "下面是缺陷 JSON。请按系统命令输出【一句】鼓励孩子的童话或生活隐喻，"
-        "禁止专业术语，禁止列表或段落，60 字以内：\n"
+        "下面是缺陷 JSON。请严格按系统命令只返回 JSON 对象，字段仅允许 "
+        "correction_metaphor 与 praise_encouragement；禁止专业术语；"
+        f"correction_metaphor 必须按「问题→比喻→下次试试」三段式且≤{_CORRECTION_TARGET_CHARS}字；"
+        f"praise_encouragement≤{_PRAISE_MAX_CHARS}字：\n"
         f"{json.dumps(safe_payload, ensure_ascii=False)}"
     )
 
 
-# --------------------------------------------------------------------------
-# 第三步：核心对外函数 generate_feedback
-# --------------------------------------------------------------------------
-
-
-def generate_feedback(diagnosis_json, status=None):
-    """调用 DeepSeek：把缺陷 JSON 翻译为鼓励孩子的一句隐喻。
-
-    【权限解耦】
-        - 本函数绝不计算、修改或返回任何数值评分。
-        - 唯一合法输入是 error_diagnoser 输出的诊断 JSON（dict 或 JSON 字符串）。
-        - 兼容旧调用 generate_feedback(angle: float, status: str)。
+def generate_optimal_dual_feedback(diagnosis_json, status=None) -> dict:
+    """调用 DeepSeek：把缺陷 JSON 转译为 OPTIMAL 双段字典。
 
     返回：
-        str，一句隐喻短语（≤60 字）。
+        {"correction_metaphor": str, "praise_encouragement": str}
+        任何异常 / 非 JSON 均返回静态或缺陷级兜底，绝不抛出。
     """
     # 旧签名兼容：generate_feedback(angle, status)
     if isinstance(diagnosis_json, (int, float)) and status is not None:
@@ -473,19 +676,40 @@ def generate_feedback(diagnosis_json, status=None):
     user_message = build_aigc_user_message(diagnosis)
 
     try:
-        response = client.chat.completions.create(
-            model=DEEPSEEK_MODEL_NAME,
+        response = _chat_completions_with_backoff(
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_message},
             ],
             temperature=LLM_TEMPERATURE,
+            response_format={"type": "json_object"},
         )
-        return _clamp_metaphor_phrase(response.choices[0].message.content or "")
+        raw_text = response.choices[0].message.content or ""
+        return _parse_optimal_dual_feedback(raw_text, diagnosis)
 
     except Exception as exc:  # noqa: BLE001 - 网络/接口异常时需要兜底，不能让程序崩溃
-        print(f"【llm_agent】调用 DeepSeek 接口失败，使用兜底提示语。错误信息：{exc}")
-        return _build_clinical_fallback_markdown(diagnosis)
+        print(f"【llm_agent】调用 DeepSeek 接口失败，使用静态模板 Fallback。错误信息：{exc}")
+        return _optimal_fallback_dual(diagnosis)
+
+
+# --------------------------------------------------------------------------
+# 第三步：核心对外函数 generate_feedback
+# --------------------------------------------------------------------------
+
+
+def generate_feedback(diagnosis_json, status=None):
+    """调用 DeepSeek：把缺陷 JSON 翻译为 OPTIMAL 双段童趣话术。
+
+    【权限解耦】
+        - 本函数绝不计算、修改或返回任何数值评分。
+        - 唯一合法输入是 error_diagnoser 输出的诊断 JSON（dict 或 JSON 字符串）。
+        - 兼容旧调用 generate_feedback(angle: float, status: str)。
+
+    返回：
+        str，【魔法指令】+【闪光点发现】可读拼接（兼容字幕/日志调用方）。
+    """
+    dual = generate_optimal_dual_feedback(diagnosis_json, status)
+    return _format_optimal_dual_text(dual)
 
 
 # --------------------------------------------------------------------------
@@ -508,23 +732,24 @@ def _deterministic_session_score_from_hits(hit_stats: dict) -> float:
 def _build_fallback_report(hit_stats, total_attempts, deterministic_score=None, diagnosis=None):
     """当 DeepSeek 接口调用失败或返回内容解析失败时的规则化兜底报告。
 
-    score 永远来自确定性数学；文案为一句鼓励隐喻。
+    score 永远来自确定性数学；文案为 OPTIMAL 双段字典。
     """
     if deterministic_score is not None:
         score = round(float(deterministic_score), 2)
     else:
         score = _deterministic_session_score_from_hits(hit_stats)
 
-    metaphor = _build_clinical_fallback_markdown(diagnosis or {})
-    if not (diagnosis or {}).get("score_detail") and not (diagnosis or {}).get("indicators"):
-        if int(hit_stats.get("red", 0) or 0) > 0:
-            metaphor = _METAPHOR_FALLBACK_BY_DEFECT["distance_cm"]
-        elif int(hit_stats.get("yellow", 0) or 0) > 0:
-            metaphor = _METAPHOR_FALLBACK_BY_DEFECT["max_folding_angle"]
-        else:
-            metaphor = "像大树的根一样深深扎进泥土里，再像弓弦拉满嗖的一下射出。"
-        _ = total_attempts  # 保留参数语义，供调用方传入会话规模
-    return {"score": score, "painPoint": metaphor, "prescription": metaphor}
+    diagnosis = diagnosis or {}
+    if diagnosis.get("score_detail") or diagnosis.get("indicators"):
+        dual = _optimal_fallback_dual(diagnosis)
+    elif int(hit_stats.get("red", 0) or 0) > 0:
+        dual = dict(_OPTIMAL_FALLBACK_BY_DEFECT["distance_cm"])
+    elif int(hit_stats.get("yellow", 0) or 0) > 0:
+        dual = dict(_OPTIMAL_FALLBACK_BY_DEFECT["max_folding_angle"])
+    else:
+        dual = dict(_STATIC_OPTIMAL_FALLBACK)
+    _ = total_attempts  # 保留参数语义，供调用方传入会话规模
+    return {"score": score, **_dual_to_report_fields(dual)}
 
 
 def generate_session_report(
@@ -534,7 +759,7 @@ def generate_session_report(
     deterministic_score=None,
     diagnosis_json=None,
 ):
-    """把「一整次训练」的缺陷 JSON / 红黄绿统计转译为一句鼓励隐喻；评分绝不经 LLM。
+    """把「一整次训练」的缺陷 JSON / 红黄绿统计转译为 OPTIMAL 双段话术；评分绝不经 LLM。
 
     参数：
         hit_stats：dict，形如 {"green": 12, "yellow": 3, "red": 2}
@@ -545,7 +770,8 @@ def generate_session_report(
         diagnosis_json：可选，error_diagnoser 输出的 JSON 诊断报告。
 
     返回：
-        dict，含 "score"（确定性数学）、"painPoint" / "prescription"（同一句隐喻）。
+        dict，含 "score"（确定性数学）、"painPoint"（纠错隐喻）、"prescription"（表扬）、
+        以及同义字段 "correction_metaphor" / "praise_encouragement"。
     """
     hit_stats = hit_stats or {}
     total_attempts = sum(hit_stats.get(k, 0) for k in ("green", "yellow", "red"))
@@ -556,12 +782,14 @@ def generate_session_report(
         score = _deterministic_session_score_from_hits(hit_stats)
 
     if total_attempts == 0 and not diagnosis_json:
-        empty_metaphor = "像大树的根一样深深扎进泥土里，再试一次你会更棒。"
-        return {
-            "score": 0.0,
-            "painPoint": empty_metaphor,
-            "prescription": empty_metaphor,
+        empty_dual = {
+            "correction_metaphor": (
+                "你刚才还没踢出去，就像弓弦没拉开一样！"
+                "下次试试先弯弯小腿再弹出去。"
+            ),
+            "praise_encouragement": "你来试一脚就很棒，继续加油！",
         }
+        return {"score": 0.0, **_dual_to_report_fields(empty_dual)}
 
     diagnosis = _normalize_diagnosis_json(diagnosis_json)
     safe_payload = {
@@ -583,29 +811,30 @@ def generate_session_report(
             pass
 
     user_message = (
-        "下面是缺陷 JSON。请按系统命令输出【一句】鼓励孩子的童话或生活隐喻，"
-        "禁止专业术语，禁止列表或段落，60 字以内：\n"
+        "下面是缺陷 JSON。请严格按系统命令只返回 JSON 对象，字段仅允许 "
+        "correction_metaphor 与 praise_encouragement；禁止专业术语；"
+        f"correction_metaphor 必须按「问题→比喻→下次试试」三段式且≤{_CORRECTION_TARGET_CHARS}字；"
+        f"praise_encouragement≤{_PRAISE_MAX_CHARS}字：\n"
         f"{json.dumps(safe_payload, ensure_ascii=False)}"
     )
 
     try:
-        response = client.chat.completions.create(
-            model=DEEPSEEK_MODEL_NAME,
+        response = _chat_completions_with_backoff(
             messages=[
                 {"role": "system", "content": REPORT_SYSTEM_PROMPT},
                 {"role": "user", "content": user_message},
             ],
             temperature=LLM_TEMPERATURE,
+            response_format={"type": "json_object"},
         )
-        metaphor = _clamp_metaphor_phrase(response.choices[0].message.content or "")
-        if not metaphor:
-            raise ValueError("DeepSeek 返回的隐喻短语为空")
+        raw_text = response.choices[0].message.content or ""
+        dual = _parse_optimal_dual_feedback(raw_text, diagnosis)
 
         # 【铁律】即便模型幻觉输出了 score，也一律丢弃，强制使用确定性分数
-        return {"score": score, "painPoint": metaphor, "prescription": metaphor}
+        return {"score": score, **_dual_to_report_fields(dual)}
 
     except Exception as exc:  # noqa: BLE001 - 网络异常/解析失败等都需要兜底
-        print(f"【llm_agent】调用 DeepSeek 生成综合报告失败，使用规则化兜底报告。错误信息：{exc}")
+        print(f"【llm_agent】调用 DeepSeek 生成综合报告失败，使用静态模板 Fallback。错误信息：{exc}")
         return _build_fallback_report(
             hit_stats, total_attempts, deterministic_score=score, diagnosis=diagnosis
         )
@@ -616,13 +845,13 @@ def generate_session_report(
 # 同一位学生连续 2~3 次尝试之间的「跨次趋势诊断」生成
 # --------------------------------------------------------------------------
 
-# 聚合诊断：同一学生连续 2~3 次尝试的跨次趋势（科研口径，禁止比喻）
+# 聚合诊断：同一学生历史 ≥2 次有效尝试的跨次/跨课时趋势（科研口径，禁止比喻）
 AGGREGATE_SYSTEM_PROMPT = """你是严谨的高校运动生物力学专家。绝对禁止使用任何修辞手法、比喻\
 （如木棍、弹簧、弹簧门、滑滑梯、扫把、弓弦、大树、铁板等）、拟人或情绪化词汇。\
 违背此规则将被判定为严重错误！
 
-基于同一受试者本节课连续 2~3 次踢球测试的评分/命中统计变化，撰写跨次趋势诊断，\
-供教师课前快速判读运动表现稳定性。
+基于同一受试者历史至少 2 次踢球测试的评分/命中统计变化（可跨课时、不限同一天），\
+撰写跨次趋势诊断，供教师课后快速判读运动表现稳定性。
 
 【铁律】
 - 禁止寒暄、过渡句、鼓励语；只陈述趋势机制与可执行纠正。
@@ -643,10 +872,10 @@ def _build_fallback_aggregate_report(attempts_summary):
     """DeepSeek 接口调用失败或解析失败时的规则化兜底聚合诊断。"""
     scores = [a.get("score") for a in attempts_summary if isinstance(a.get("score"), (int, float))]
 
-    if not scores:
+    if len(scores) < 2:
         return {
-            "trendDescription": "本节课有效测试评分样本不足，无法建立跨次生物力学趋势推断。",
-            "prescription": "下节课至少完整完成 2 次踢球测试，以支撑跨次趋势诊断。",
+            "trendDescription": "该生历史有效测试评分不足 2 次，无法建立跨课时生物力学趋势推断。",
+            "prescription": "累计完成至少 2 次踢球测试后再出具聚合诊断（可不在同一天）。",
         }
 
     first_score, last_score = scores[0], scores[-1]
@@ -663,8 +892,32 @@ def _build_fallback_aggregate_report(attempts_summary):
     return {"trendDescription": trend, "prescription": prescription}
 
 
+def _classify_aggregate_llm_error(exc: BaseException) -> str:
+    """把 DeepSeek / 网络异常归类为前端可展示的中文错误文案。"""
+    name = type(exc).__name__
+    text = str(exc) or ""
+    lowered = f"{name} {text}".lower()
+    if (
+        "timeout" in lowered
+        or "timed out" in lowered
+        or name in {"APITimeoutError", "TimeoutError", "ReadTimeout", "ConnectTimeout"}
+    ):
+        return "大模型生成超时，请重试"
+    if (
+        "connection" in lowered
+        or "connect" in lowered
+        or name in {"APIConnectionError", "ConnectError"}
+    ):
+        return "无法连接大模型服务，请检查网络后重试"
+    if "rate limit" in lowered or "429" in lowered:
+        return "大模型请求过于频繁，请稍后再试"
+    if "auth" in lowered or "401" in lowered or "403" in lowered:
+        return "大模型鉴权失败，请检查 API Key 配置"
+    return f"大模型生成失败：{text[:120] if text else name}，请重试"
+
+
 def generate_aggregate_diagnosis(student_number, attempts_summary):
-    """调用 DeepSeek 大模型，把同一位学生「本节课连续 2~3 次尝试」的评分/
+    """调用 DeepSeek 大模型，把同一位学生「历史有效尝试（跨课时亦可）」的评分/
     三级命中统计变化趋势，转译成结构化的跨次聚合诊断（trendDescription /
     prescription 两个字段）。
 
@@ -672,18 +925,27 @@ def generate_aggregate_diagnosis(student_number, attempts_summary):
         student_number：str，学生学号，仅用于让大模型的表达更有针对性。
         attempts_summary：list[dict]，每一项形如
             {"attemptNumber": 1, "score": 82, "hitStats": {"green": 5, "yellow": 2, "red": 0}}，
-            按尝试发生的先后顺序排列。
+            按尝试发生的先后顺序排列。阈值已放宽：只要有效评分样本 ≥ 2
+            （无论是否同一天）即可生成趋势聚合。
 
     返回：
-        dict，包含 "trendDescription"（str）、"prescription"（str）两个字段。
-        任何异常情况下都会返回结构完整的兜底数据，绝不抛出异常。
+        dict，包含 "trendDescription"（str）、"prescription"（str）两个字段；
+        若大模型调用失败，额外附带 "error"（str）供前端展示具体原因，
+        同时仍返回规则化兜底正文，避免白屏。
     """
     attempts_summary = attempts_summary or []
 
-    if not attempts_summary:
+    valid_scores = [
+        item.get("score")
+        for item in attempts_summary
+        if isinstance(item.get("score"), (int, float))
+    ]
+
+    if len(valid_scores) < 2:
         return {
-            "trendDescription": "本节课未采集到该生尝试数据，无法建立跨次生物力学趋势推断。",
-            "prescription": "先完成至少一次踢球测试后再出具聚合诊断。",
+            "trendDescription": "该生历史有效测试评分不足 2 次，无法建立跨课时生物力学趋势推断。",
+            "prescription": "累计完成至少 2 次有效踢球测试后再出具聚合诊断（可不在同一天）。",
+            "error": "历史有效数据不足 2 次，暂无法生成聚合诊断",
         }
 
     lines = []
@@ -699,14 +961,13 @@ def generate_aggregate_diagnosis(student_number, attempts_summary):
 
     user_message = (
         f"学生学号：{student_number or '未填写'}。"
-        f"该学生本节课一共完成了 {len(attempts_summary)} 次踢球测试，统计如下：\n"
+        f"该学生历史一共完成了 {len(attempts_summary)} 次踢球测试（可跨课时），统计如下：\n"
         f"{attempts_text}\n"
         f"禁止比喻与寒暄。严格按系统提示词返回 JSON（trendDescription / prescription）。"
     )
 
     try:
-        response = client.chat.completions.create(
-            model=DEEPSEEK_MODEL_NAME,
+        response = _chat_completions_with_backoff(
             messages=[
                 {"role": "system", "content": AGGREGATE_SYSTEM_PROMPT},
                 {"role": "user", "content": user_message},
@@ -726,8 +987,14 @@ def generate_aggregate_diagnosis(student_number, attempts_summary):
         return {"trendDescription": trend_description, "prescription": prescription}
 
     except Exception as exc:  # noqa: BLE001 - 网络异常/JSON 解析失败等都需要兜底
-        print(f"【llm_agent】调用 DeepSeek 生成聚合诊断失败，使用规则化兜底报告。错误信息：{exc}")
-        return _build_fallback_aggregate_report(attempts_summary)
+        error_message = _classify_aggregate_llm_error(exc)
+        print(
+            f"【llm_agent】调用 DeepSeek 生成聚合诊断失败，使用静态模板 Fallback。"
+            f"错误信息：{exc} → 前端提示：{error_message}"
+        )
+        fallback = _build_fallback_aggregate_report(attempts_summary)
+        fallback["error"] = error_message
+        return fallback
 
 
 # --------------------------------------------------------------------------
@@ -802,8 +1069,7 @@ def generate_class_prescription(school, class_group, error_stats, total_records,
     )
 
     try:
-        response = client.chat.completions.create(
-            model=DEEPSEEK_MODEL_NAME,
+        response = _chat_completions_with_backoff(
             messages=[
                 {"role": "system", "content": CLASS_PRESCRIPTION_SYSTEM_PROMPT},
                 {"role": "user", "content": user_message},
@@ -822,7 +1088,7 @@ def generate_class_prescription(school, class_group, error_stats, total_records,
         return {"diagnosis": diagnosis, "prescription": prescription}
 
     except Exception as exc:  # noqa: BLE001 - 网络异常/JSON 解析失败等都需要兜底
-        print(f"【llm_agent】调用 DeepSeek 生成集体教学诊断简报失败，使用规则化兜底报告。错误信息：{exc}")
+        print(f"【llm_agent】调用 DeepSeek 生成集体教学诊断简报失败，使用静态模板 Fallback。错误信息：{exc}")
         return _build_fallback_class_prescription(error_stats, total_records)
 
 
@@ -916,8 +1182,7 @@ def generate_individual_summary(student_id, score_history, error_counter):
     )
 
     try:
-        response = client.chat.completions.create(
-            model=DEEPSEEK_MODEL_NAME,
+        response = _chat_completions_with_backoff(
             messages=[
                 {"role": "system", "content": INDIVIDUAL_SUMMARY_SYSTEM_PROMPT},
                 {"role": "user", "content": user_message},
@@ -936,7 +1201,7 @@ def generate_individual_summary(student_id, score_history, error_counter):
         return {"strengths": strengths, "weaknesses": weaknesses}
 
     except Exception as exc:  # noqa: BLE001 - 网络异常/JSON 解析失败等都需要兜底
-        print(f"【llm_agent】调用 DeepSeek 生成个体纵向进化总结失败，使用规则化兜底报告。错误信息：{exc}")
+        print(f"【llm_agent】调用 DeepSeek 生成个体纵向进化总结失败，使用静态模板 Fallback。错误信息：{exc}")
         return _build_fallback_individual_summary(score_history, error_counter)
 
 
@@ -945,7 +1210,7 @@ def generate_individual_summary(student_id, score_history, error_counter):
 # --------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # 直接运行本文件时，用一组模拟诊断 JSON 测试科研级三节制转译（不含评分）
+    # 直接运行本文件时，用一组模拟诊断 JSON 测试 OPTIMAL 双段式转译（不含评分）
     test_diagnosis = {
         "primary_error_code": "ERR_A2_SUPPORT_WIDE",
         "t_impact": 60,
@@ -960,6 +1225,8 @@ if __name__ == "__main__":
     }
     print(f"测试输入诊断 JSON（含实测值、无评分数值）：{json.dumps(test_diagnosis, ensure_ascii=False)}")
     print("正在调用 DeepSeek 大模型，请稍候……")
-    result = generate_feedback(test_diagnosis)
-    print("大模型返回的三节制科研诊断 Markdown：")
-    print(result)
+    dual = generate_optimal_dual_feedback(test_diagnosis)
+    print("大模型返回的 OPTIMAL 双段 JSON：")
+    print(json.dumps(dual, ensure_ascii=False, indent=2))
+    print("可读拼接：")
+    print(generate_feedback(test_diagnosis))

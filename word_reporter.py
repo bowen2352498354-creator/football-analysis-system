@@ -272,28 +272,104 @@ def _decode_base64_image_to_stream(image_base64: Optional[str]) -> Optional[io.B
 # --------------------------------------------------------------------------
 
 
+def _safe_display(value, fallback: str = _NO_DATA_TEXT) -> str:
+    """Null-safe display helper for Word cells: None / blank / NaN → fallback."""
+    if value is None:
+        return fallback
+    if isinstance(value, float):
+        try:
+            import math
+
+            if math.isnan(value) or math.isinf(value):
+                return fallback
+        except Exception:  # noqa: BLE001
+            return fallback
+    text = str(value).strip()
+    if not text or text.lower() in ("none", "null", "undefined", "nan"):
+        return fallback
+    return text
+
+
+def _safe_score_display(score) -> str:
+    """Score cell: empty →「暂无评分」; otherwise 「{n} 分」."""
+    if score is None or score == "":
+        return _NO_SCORE_TEXT
+    try:
+        numeric = float(score)
+        if numeric != numeric:  # NaN
+            return _NO_SCORE_TEXT
+        # Prefer integer display when whole number
+        if numeric == int(numeric):
+            return f"{int(numeric)}{_UNIT_SCORE_SUFFIX}"
+        return f"{numeric:.1f}{_UNIT_SCORE_SUFFIX}"
+    except (TypeError, ValueError):
+        return _NO_SCORE_TEXT
+
+
+def _safe_count_display(count) -> str:
+    """Sample-count cell: empty →「暂无数据」."""
+    if count is None or count == "":
+        return _NO_DATA_TEXT
+    try:
+        numeric = float(count)
+        if numeric != numeric:
+            return _NO_DATA_TEXT
+        return f"{int(round(numeric))}{_UNIT_TIMES_SUFFIX}"
+    except (TypeError, ValueError):
+        return _NO_DATA_TEXT
+
+
+def _safe_error_codes_display(data: dict) -> str:
+    """Biomechanical / error-code list → readable Chinese, or「暂无数据」."""
+    if not isinstance(data, dict):
+        return _NO_DATA_TEXT
+    raw = (
+        data.get("biomechanicalErrors")
+        or data.get("biomechanical_errors")
+        or data.get("errorCodes")
+        or data.get("primaryErrorCode")
+        or data.get("primary_error_code")
+    )
+    if raw is None or raw == "":
+        return _NO_DATA_TEXT
+    if isinstance(raw, (list, tuple, set)):
+        parts = [_safe_display(item, "") for item in raw]
+        parts = [p for p in parts if p]
+        return "、".join(parts) if parts else _NO_DATA_TEXT
+    return _safe_display(raw, _NO_DATA_TEXT)
+
+
 def _add_metadata_table(document: Document, rows: list[tuple[str, str]]) -> None:
     """Insert a two-column metadata table below the title: bold label on the
     left, corresponding value on the right.
     """
-    table = document.add_table(rows=len(rows), cols=2)
+    safe_rows = [
+        (_safe_display(label, ""), _safe_display(value, _NO_DATA_TEXT))
+        for label, value in (rows or [])
+    ]
+    if not safe_rows:
+        safe_rows = [(_NO_DATA_TEXT, _NO_DATA_TEXT)]
+
+    table = document.add_table(rows=len(safe_rows), cols=2)
     table.style = "Light Grid Accent 1"
     table.autofit = True
 
-    for row_index, (label, value) in enumerate(rows):
+    for row_index, (label, value) in enumerate(safe_rows):
         label_cell = table.cell(row_index, 0)
         value_cell = table.cell(row_index, 1)
 
         label_cell.text = ""
         label_paragraph = label_cell.paragraphs[0]
-        label_run = label_paragraph.add_run(f"{_LABEL_BRACKET_LEFT}{label}{_LABEL_BRACKET_RIGHT}")
+        label_run = label_paragraph.add_run(
+            f"{_LABEL_BRACKET_LEFT}{label}{_LABEL_BRACKET_RIGHT}"
+        )
         label_run.bold = True
         label_run.font.size = Pt(11)
         _set_run_east_asian_font(label_run, _FONT_BODY_EASTASIA)
 
         value_cell.text = ""
         value_paragraph = value_cell.paragraphs[0]
-        value_run = value_paragraph.add_run(str(value))
+        value_run = value_paragraph.add_run(_safe_display(value, _NO_DATA_TEXT))
         value_run.font.size = Pt(11)
         _set_run_east_asian_font(value_run, _FONT_BODY_EASTASIA)
 
@@ -305,7 +381,7 @@ def _add_section_heading(document: Document, text: str) -> None:
     paragraph = document.add_paragraph()
     paragraph.paragraph_format.space_before = Pt(14)
     paragraph.paragraph_format.space_after = Pt(6)
-    run = paragraph.add_run(text)
+    run = paragraph.add_run(_safe_display(text, _NO_DATA_TEXT))
     run.bold = True
     run.font.size = Pt(14)
     run.font.color.rgb = RGBColor(0x1F, 0x6F, 0x4A)
@@ -317,21 +393,36 @@ def _add_body_paragraph(document: Document, text: str) -> None:
     paragraph = document.add_paragraph()
     paragraph.paragraph_format.space_after = Pt(10)
     paragraph.paragraph_format.line_spacing = 1.35
-    run = paragraph.add_run(text or _NO_TEXT_FALLBACK)
+    run = paragraph.add_run(_safe_display(text, _NO_TEXT_FALLBACK))
     run.font.size = Pt(12)
     _set_run_east_asian_font(run, _FONT_BODY_EASTASIA)
 
 
+_LABEL_ERROR_CODES = "\u751f\u7269\u529b\u5b66\u9519\u8bef\u7801"  # ??????
+
+
 def _build_document(data: dict, mode: str) -> Document:
-    """Build the full Word document object from the data dict (not yet saved to disk)."""
-    school = data.get("school") or _FALLBACK_SCHOOL_TEXT
-    class_group = data.get("classGroup") or _FALLBACK_CLASSGROUP_TEXT
-    student_number = data.get("studentNumber") or data.get("studentId") or _FALLBACK_STUDENT_NUM_TEXT
-    score = data.get("score")
-    total_attempts = data.get("totalAttempts")
-    generated_at = data.get("generatedAt") or time.strftime("%Y-%m-%d %H:%M:%S")
-    pain_point = data.get("painPoint") or ""
-    prescription = data.get("prescription") or ""
+    """Build the full Word document object from the data dict (not yet saved to disk).
+
+    Every field is read via .get() / null-safe helpers so missing score / name /
+    error codes never raise and never write the literal string "None".
+    """
+    data = data if isinstance(data, dict) else {}
+
+    school = _safe_display(data.get("school"), _FALLBACK_SCHOOL_TEXT)
+    class_group = _safe_display(data.get("classGroup"), _FALLBACK_CLASSGROUP_TEXT)
+    student_number = _safe_display(
+        data.get("studentNumber") or data.get("studentId") or data.get("name"),
+        _FALLBACK_STUDENT_NUM_TEXT,
+    )
+    score_display = _safe_score_display(data.get("score"))
+    total_attempts_display = _safe_count_display(data.get("totalAttempts"))
+    generated_at = _safe_display(
+        data.get("generatedAt"), time.strftime("%Y-%m-%d %H:%M:%S")
+    )
+    pain_point = _safe_display(data.get("painPoint") or data.get("comment"), _NO_TEXT_FALLBACK)
+    prescription = _safe_display(data.get("prescription"), _NO_TEXT_FALLBACK)
+    error_codes_display = _safe_error_codes_display(data)
 
     document = Document()
 
@@ -355,17 +446,15 @@ def _build_document(data: dict, mode: str) -> Document:
 
     document.add_paragraph()
 
-    score_display = f"{score}{_UNIT_SCORE_SUFFIX}" if score is not None else _NO_SCORE_TEXT
-    total_attempts_display = f"{total_attempts}{_UNIT_TIMES_SUFFIX}" if total_attempts is not None else _NO_DATA_TEXT
-
     _add_metadata_table(
         document,
         rows=[
             (_LABEL_TIMESTAMP, generated_at),
             (_LABEL_SCHOOL_CLASS, f"{school} - {class_group}"),
-            (_LABEL_STUDENT_NUM, str(student_number)),
+            (_LABEL_STUDENT_NUM, student_number),
             (_LABEL_SCORE, score_display),
             (_LABEL_SAMPLE_COUNT, total_attempts_display),
+            (_LABEL_ERROR_CODES, error_codes_display),
         ],
     )
 
@@ -429,18 +518,43 @@ def save_feedback_to_word(data: dict) -> dict:
         or {"success": False, "error": "..."} on failure.
     """
     try:
-        mode = data.get("mode") if data.get("mode") in MODE_FOLDER_NAME else "realtime"
-        school = data.get("school") or ""
-        class_group = data.get("classGroup") or ""
-        student_number_raw = data.get("studentNumber") or data.get("studentId") or ""
+        if not isinstance(data, dict):
+            data = {}
 
-        target_dir = build_target_directory(mode, school, class_group, student_number_raw)
+        mode_raw = data.get("mode")
+        mode = mode_raw if mode_raw in MODE_FOLDER_NAME else "realtime"
+        school = _safe_display(data.get("school"), "")
+        # Empty school should stay empty for folder builder (it has its own fallback)
+        if school == _NO_DATA_TEXT:
+            school = ""
+        class_group_raw = data.get("classGroup")
+        class_group = "" if class_group_raw is None else str(class_group_raw).strip()
+        student_number_raw = (
+            data.get("studentNumber") or data.get("studentId") or data.get("name") or ""
+        )
+        if student_number_raw is None:
+            student_number_raw = ""
 
-        document = _build_document(data, mode)
+        target_dir = build_target_directory(mode, school, class_group, str(student_number_raw))
+
+        try:
+            document = _build_document(data, mode)
+        except (KeyError, TypeError, ValueError, AttributeError) as build_exc:
+            _safe_print(
+                f"[word_reporter] error: build document failed "
+                f"({type(build_exc).__name__}): {build_exc}"
+            )
+            return {
+                "success": False,
+                "error": f"报告生成失败，部分数据缺失: {build_exc}",
+            }
 
         # File naming convention: YYYY-MM-DD_HH-mm_<student number>_<report>.docx
         timestamp_label = time.strftime("%Y-%m-%d_%H-%M")
-        student_number_clean = sanitize_path_component(student_number_raw, _FALLBACK_STUDENT_FOLDER)
+        student_number_clean = sanitize_path_component(
+            str(student_number_raw) if student_number_raw is not None else "",
+            _FALLBACK_STUDENT_FOLDER,
+        )
         filename = f"{timestamp_label}_{student_number_clean}_{_FILENAME_SUFFIX}.docx"
 
         full_path = target_dir / filename
@@ -454,6 +568,12 @@ def save_feedback_to_word(data: dict) -> dict:
             "directory": str(target_dir.resolve()),
             "filename": filename,
         }
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        _safe_print(
+            f"[word_reporter] error: save word report data missing "
+            f"({type(exc).__name__}): {exc}"
+        )
+        return {"success": False, "error": f"报告生成失败，部分数据缺失: {exc}"}
     except Exception as exc:  # noqa: BLE001 - any failure must be reported, never crash the caller
         _safe_print(f"[word_reporter] error: save word report failed: {exc}")
         return {"success": False, "error": str(exc)}

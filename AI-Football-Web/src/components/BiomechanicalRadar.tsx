@@ -132,11 +132,31 @@ export default function BiomechanicalRadar({
     const el = chartRef.current
     if (!el) return
 
-    const chart = instanceRef.current ?? echarts.init(el, undefined, { renderer: 'canvas' })
-    instanceRef.current = chart
+    let chart = instanceRef.current
+    try {
+      if (!chart || chart.isDisposed?.()) {
+        chart = echarts.init(el, undefined, { renderer: 'canvas' })
+        instanceRef.current = chart
+      }
+    } catch {
+      return
+    }
 
     if (!hasData) {
-      chart.clear()
+      try {
+        chart.clear()
+      } catch {
+        /* ignore */
+      }
+      return
+    }
+
+    let primaryParsed: RadarScores
+    let compareParsed: RadarScores | null = null
+    try {
+      primaryParsed = JSON.parse(primaryKey) as RadarScores
+      compareParsed = compareKey ? (JSON.parse(compareKey) as RadarScores) : null
+    } catch {
       return
     }
 
@@ -145,12 +165,12 @@ export default function BiomechanicalRadar({
       max: 20,
     }))
 
-    const primaryParsed = JSON.parse(primaryKey) as RadarScores
-    const compareParsed = compareKey ? (JSON.parse(compareKey) as RadarScores) : null
-
     const seriesData: Array<Record<string, unknown>> = [
       {
-        value: FIVE_D_DIMENSIONS.map((d) => primaryParsed[d.key]),
+        value: FIVE_D_DIMENSIONS.map((d) => {
+          const v = primaryParsed[d.key]
+          return typeof v === 'number' && Number.isFinite(v) ? v : 0
+        }),
         name: primaryLabel,
         symbol: 'circle',
         symbolSize: 6,
@@ -162,7 +182,10 @@ export default function BiomechanicalRadar({
 
     if (compareParsed) {
       seriesData.push({
-        value: FIVE_D_DIMENSIONS.map((d) => compareParsed[d.key]),
+        value: FIVE_D_DIMENSIONS.map((d) => {
+          const v = compareParsed![d.key]
+          return typeof v === 'number' && Number.isFinite(v) ? v : 0
+        }),
         name: compareLabel,
         symbol: 'circle',
         symbolSize: 5,
@@ -172,80 +195,90 @@ export default function BiomechanicalRadar({
       })
     }
 
-    chart.setOption(
-      {
-        backgroundColor: 'transparent',
-        animation: true,
-        animationDuration: 1100,
-        animationEasing: 'cubicOut',
-        animationDurationUpdate: 600,
-        tooltip: {
-          trigger: 'item',
-          backgroundColor: 'rgba(0,0,0,0.82)',
-          borderColor: 'rgba(255,255,255,0.12)',
-          textStyle: { color: '#e2e8f0', fontSize: 11 },
-          formatter: (params: unknown) => {
-            const p = params as { name?: string; value?: number[]; seriesName?: string }
-            const vals = Array.isArray(p.value) ? p.value : []
-            const rows = FIVE_D_DIMENSIONS.map(
-              (d, i) => `${d.label}：${vals[i] ?? 0}/20`,
-            ).join('<br/>')
-            return `<div style="font-weight:600;margin-bottom:4px">${p.seriesName ?? ''}</div>${rows}`
-          },
-        },
-        legend: compareParsed
-          ? {
-              bottom: 0,
-              textStyle: { color: 'rgba(255,255,255,0.45)', fontSize: 10 },
-              data: [primaryLabel, compareLabel],
-            }
-          : undefined,
-        radar: {
-          indicator,
-          center: ['50%', compareParsed ? '46%' : '50%'],
-          radius: compact ? '62%' : '68%',
-          startAngle: 90,
-          splitNumber: 4,
-          shape: 'polygon',
-          axisName: {
-            color: 'rgba(226, 232, 240, 0.7)',
-            fontSize: 11,
-            fontWeight: 500,
-          },
-          axisLine: {
-            lineStyle: { color: 'rgba(100, 116, 139, 0.45)' },
-          },
-          splitLine: {
-            lineStyle: { color: 'rgba(71, 85, 105, 0.55)', width: 1 },
-          },
-          splitArea: {
-            show: true,
-            areaStyle: {
-              color: [
-                'rgba(15, 23, 42, 0.15)',
-                'rgba(30, 41, 59, 0.35)',
-                'rgba(15, 23, 42, 0.25)',
-                'rgba(30, 58, 138, 0.22)',
-              ],
+    try {
+      chart.setOption(
+        {
+          backgroundColor: 'transparent',
+          animation: true,
+          animationDuration: 1100,
+          animationEasing: 'cubicOut',
+          animationDurationUpdate: 600,
+          tooltip: {
+            trigger: 'item',
+            backgroundColor: 'rgba(0,0,0,0.82)',
+            borderColor: 'rgba(255,255,255,0.12)',
+            textStyle: { color: '#e2e8f0', fontSize: 11 },
+            formatter: (params: unknown) => {
+              const p = params as { name?: string; value?: number[]; seriesName?: string }
+              const vals = Array.isArray(p.value) ? p.value : []
+              const rows = FIVE_D_DIMENSIONS.map(
+                (d, i) => `${d.label}：${vals[i] ?? 0}/20`,
+              ).join('<br/>')
+              return `<div style="font-weight:600;margin-bottom:4px">${p.seriesName ?? ''}</div>${rows}`
             },
           },
-        },
-        series: [
-          {
-            type: 'radar',
-            name: '五维雷达',
-            data: seriesData,
-            emphasis: {
-              lineStyle: { width: 3 },
-              areaStyle: { color: 'rgba(16, 185, 129, 0.55)' },
+          legend: compareParsed
+            ? {
+                bottom: 0,
+                textStyle: { color: 'rgba(255,255,255,0.45)', fontSize: 10 },
+                data: [primaryLabel, compareLabel],
+              }
+            : undefined,
+          radar: {
+            indicator,
+            center: ['50%', compareParsed ? '46%' : '50%'],
+            radius: compact ? '62%' : '68%',
+            startAngle: 90,
+            splitNumber: 4,
+            shape: 'polygon',
+            axisName: {
+              color: 'rgba(226, 232, 240, 0.7)',
+              fontSize: 11,
+              fontWeight: 500,
+            },
+            axisLine: {
+              lineStyle: { color: 'rgba(100, 116, 139, 0.45)' },
+            },
+            splitLine: {
+              lineStyle: { color: 'rgba(71, 85, 105, 0.55)', width: 1 },
+            },
+            splitArea: {
+              show: true,
+              areaStyle: {
+                color: [
+                  'rgba(15, 23, 42, 0.15)',
+                  'rgba(30, 41, 59, 0.35)',
+                  'rgba(15, 23, 42, 0.25)',
+                  'rgba(30, 58, 138, 0.22)',
+                ],
+              },
             },
           },
-        ],
-      },
-      { notMerge: true },
-    )
+          series: [
+            {
+              type: 'radar',
+              name: '五维雷达',
+              data: seriesData,
+              emphasis: {
+                lineStyle: { width: 3 },
+                areaStyle: { color: 'rgba(16, 185, 129, 0.55)' },
+              },
+            },
+          ],
+        },
+        { notMerge: true },
+      )
+    } catch {
+      return
+    }
 
-    const onResize = () => chart.resize()
+    const onResize = () => {
+      try {
+        instanceRef.current?.resize()
+      } catch {
+        /* ignore */
+      }
+    }
     window.addEventListener('resize', onResize)
     return () => {
       window.removeEventListener('resize', onResize)
@@ -254,7 +287,11 @@ export default function BiomechanicalRadar({
 
   useEffect(() => {
     return () => {
-      instanceRef.current?.dispose()
+      try {
+        instanceRef.current?.dispose()
+      } catch {
+        /* ignore */
+      }
       instanceRef.current = null
     }
   }, [])
@@ -263,7 +300,9 @@ export default function BiomechanicalRadar({
     <div className={`biomech-radar ${compact ? 'biomech-radar--compact' : ''} ${className}`.trim()}>
       <div className="mb-3 flex items-end justify-between gap-2">
         <div>
-          <p className="text-[11px] text-white/40">五维生物力学量化雷达 · V3.1</p>
+          <p className="text-[11px] text-white/40">
+            {primaryLabel === '综合均值' ? '综合均值能力画像 · V3.1' : '五维生物力学量化雷达 · V3.1'}
+          </p>
           <p className="text-3xl font-bold tabular-nums text-emerald-300">
             {hasData ? Math.round(total * 10) / 10 : '--'}
             <span className="ml-1 text-sm font-medium text-white/35">/ 100</span>

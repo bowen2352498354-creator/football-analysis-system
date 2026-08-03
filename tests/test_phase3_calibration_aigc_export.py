@@ -117,8 +117,8 @@ def test_aigc_e2e_fallback_quotes_measured_and_blocks_defaults():
     assert "17.5" not in text
 
 
-def test_aigc_e2e_generate_feedback_offline_fallback_contains_measured(monkeypatch):
-    """强制 LLM 失败走 fallback，断言复述实测值（零网络）。"""
+def test_aigc_e2e_generate_feedback_offline_fallback_optimal_dual(monkeypatch):
+    """强制 LLM 失败走 OPTIMAL 双段兜底（零网络）；实测值仍由 clinical helper 复述。"""
     diagnosis = {
         "score_detail": {
             "indicators": {
@@ -158,11 +158,20 @@ def test_aigc_e2e_generate_feedback_offline_fallback_contains_measured(monkeypat
     import llm_agent as la
 
     monkeypatch.setattr(la, "client", _Client())
+    dual = la.generate_optimal_dual_feedback(diagnosis)
+    assert dual["correction_metaphor"]
+    assert dual["praise_encouragement"]
+    assert dual["correction_metaphor"].startswith("你刚才")
+    assert "就像" in dual["correction_metaphor"] and "下次试试" in dual["correction_metaphor"]
+    assert len(dual["correction_metaphor"]) <= la._CORRECTION_MAX_CHARS
+    assert len(dual["praise_encouragement"]) <= la._PRAISE_MAX_CHARS
     text = generate_feedback(diagnosis)
-    assert "19.2" in text
-    assert "82.0" in text or "82" in text
-    assert "1.1" in text
-    assert "【一、 客观实测面诊】" in text
+    assert "【魔法指令】" in text and "【闪光点发现】" in text
+    # 实测值复述仍由 clinical helper 负责（不塞进孩子话术）
+    clinical = _build_clinical_fallback_markdown(diagnosis)
+    assert "19.2" in clinical
+    assert "82.0" in clinical or "82" in clinical
+    assert "1.1" in clinical
 
 
 def test_scorer_to_aigc_e2e_pcr_measured_roundtrip():

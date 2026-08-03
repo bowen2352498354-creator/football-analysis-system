@@ -272,6 +272,10 @@ export const DEFAULT_GLOBAL_SETTINGS: GlobalSettings = {
 
 const CUSTOM_SCHOOLS_STORAGE_KEY = 'aiff_custom_schools_v1'
 const CUSTOM_CLASS_GROUPS_STORAGE_KEY = 'aiff_custom_class_groups_v1'
+/** 被教师主动删除的预设学校（避免刷新后预设重新出现） */
+const HIDDEN_SCHOOLS_STORAGE_KEY = 'aiff_hidden_schools_v1'
+/** 被教师主动删除的预设班级/组别 */
+const HIDDEN_CLASS_GROUPS_STORAGE_KEY = 'aiff_hidden_class_groups_v1'
 
 /** 从 localStorage 安全读取一份字符串数组，任何异常（未支持/解析失败）都静默兜底为空数组 */
 function readStringListFromStorage(storageKey: string): string[] {
@@ -294,19 +298,68 @@ function writeStringListToStorage(storageKey: string, list: string[]): void {
   }
 }
 
+/** 从隐藏列表中移除某项（重新新增同名预设时恢复可见） */
+function unhideName(storageKey: string, name: string): void {
+  const hidden = readStringListFromStorage(storageKey)
+  if (!hidden.includes(name)) return
+  writeStringListToStorage(
+    storageKey,
+    hidden.filter((item) => item !== name),
+  )
+}
+
 /** 读取教师历史新增并持久化保存过的自定义学校/机构名称列表 */
 export function loadCustomSchoolNames(): string[] {
   return readStringListFromStorage(CUSTOM_SCHOOLS_STORAGE_KEY)
 }
 
+/** 读取已被删除的预设学校名称 */
+export function loadHiddenSchoolNames(): string[] {
+  return readStringListFromStorage(HIDDEN_SCHOOLS_STORAGE_KEY)
+}
+
+/**
+ * 合并「未隐藏的预设 + 自定义」，得到学校下拉的完整可选项列表。
+ */
+export function loadSchoolOptions(): string[] {
+  const hidden = new Set(loadHiddenSchoolNames())
+  const presets = PRESET_SCHOOL_NAMES.filter((name) => !hidden.has(name))
+  const customs = loadCustomSchoolNames().filter((name) => !presets.includes(name) && !hidden.has(name))
+  return [...presets, ...customs]
+}
+
 /** 新增一个自定义学校/机构名称并持久化保存（自动去重、去除首尾空白） */
 export function saveCustomSchoolName(name: string): string[] {
   const trimmed = name.trim()
+  if (!trimmed) return loadSchoolOptions()
+  // 若该名称曾作为预设被隐藏，重新新增时取消隐藏，使其重新出现在列表中
+  unhideName(HIDDEN_SCHOOLS_STORAGE_KEY, trimmed)
   const existing = loadCustomSchoolNames()
-  if (!trimmed || existing.includes(trimmed) || PRESET_SCHOOL_NAMES.includes(trimmed)) return existing
-  const next = [...existing, trimmed]
-  writeStringListToStorage(CUSTOM_SCHOOLS_STORAGE_KEY, next)
-  return next
+  if (!existing.includes(trimmed) && !PRESET_SCHOOL_NAMES.includes(trimmed)) {
+    writeStringListToStorage(CUSTOM_SCHOOLS_STORAGE_KEY, [...existing, trimmed])
+  }
+  return loadSchoolOptions()
+}
+
+/**
+ * 删除学校选项（自定义 / 预设 / 归档幽灵名均可）：
+ * - 自定义：从自定义列表移除
+ * - 任意名称：写入隐藏名单，刷新后不再出现于导航与教练端全局控制台
+ * 返回删除后的完整可选列表（预设 + 自定义 − 隐藏）。
+ */
+export function removeSchoolOption(name: string): string[] {
+  const trimmed = name.trim()
+  if (!trimmed) return loadSchoolOptions()
+
+  const custom = loadCustomSchoolNames().filter((item) => item !== trimmed)
+  writeStringListToStorage(CUSTOM_SCHOOLS_STORAGE_KEY, custom)
+
+  const hidden = loadHiddenSchoolNames()
+  if (!hidden.includes(trimmed)) {
+    writeStringListToStorage(HIDDEN_SCHOOLS_STORAGE_KEY, [...hidden, trimmed])
+  }
+
+  return loadSchoolOptions()
 }
 
 /** 读取教师历史新增并持久化保存过的自定义班级/分组名称列表 */
@@ -314,14 +367,116 @@ export function loadCustomClassGroupNames(): string[] {
   return readStringListFromStorage(CUSTOM_CLASS_GROUPS_STORAGE_KEY)
 }
 
+/** 读取已被删除的预设班级/组别名称 */
+export function loadHiddenClassGroupNames(): string[] {
+  return readStringListFromStorage(HIDDEN_CLASS_GROUPS_STORAGE_KEY)
+}
+
+/**
+ * 合并「未隐藏的预设 + 自定义」，得到班级/组别下拉的完整可选项列表。
+ */
+export function loadClassGroupOptions(): string[] {
+  const hidden = new Set(loadHiddenClassGroupNames())
+  const presets = PRESET_CLASS_GROUP_NAMES.filter((name) => !hidden.has(name))
+  const customs = loadCustomClassGroupNames().filter((name) => !presets.includes(name) && !hidden.has(name))
+  return [...presets, ...customs]
+}
+
 /** 新增一个自定义班级/分组名称并持久化保存（自动去重、去除首尾空白） */
 export function saveCustomClassGroupName(name: string): string[] {
   const trimmed = name.trim()
+  if (!trimmed) return loadClassGroupOptions()
+  unhideName(HIDDEN_CLASS_GROUPS_STORAGE_KEY, trimmed)
   const existing = loadCustomClassGroupNames()
-  if (!trimmed || existing.includes(trimmed) || PRESET_CLASS_GROUP_NAMES.includes(trimmed)) return existing
-  const next = [...existing, trimmed]
-  writeStringListToStorage(CUSTOM_CLASS_GROUPS_STORAGE_KEY, next)
-  return next
+  if (!existing.includes(trimmed) && !PRESET_CLASS_GROUP_NAMES.includes(trimmed)) {
+    writeStringListToStorage(CUSTOM_CLASS_GROUPS_STORAGE_KEY, [...existing, trimmed])
+  }
+  return loadClassGroupOptions()
+}
+
+/**
+ * 删除班级/组别选项（自定义 / 预设 / 归档幽灵名均可），返回删除后的完整可选列表。
+ * 任意名称均写入隐藏名单，避免教练端全局控制台再次出现。
+ */
+export function removeClassGroupOption(name: string): string[] {
+  const trimmed = name.trim()
+  if (!trimmed) return loadClassGroupOptions()
+
+  const custom = loadCustomClassGroupNames().filter((item) => item !== trimmed)
+  writeStringListToStorage(CUSTOM_CLASS_GROUPS_STORAGE_KEY, custom)
+
+  const hidden = loadHiddenClassGroupNames()
+  if (!hidden.includes(trimmed)) {
+    writeStringListToStorage(HIDDEN_CLASS_GROUPS_STORAGE_KEY, [...hidden, trimmed])
+  }
+
+  return loadClassGroupOptions()
+}
+
+/* ------------------------------------------------------------------ */
+/* 教练端「班级/实验组对比」下拉：可新增 / 隐藏（幽灵班级清理）          */
+/* ------------------------------------------------------------------ */
+
+const CUSTOM_COHORT_COMPARE_STORAGE_KEY = 'aiff_custom_cohort_compare_v1'
+const HIDDEN_COHORT_COMPARE_STORAGE_KEY = 'aiff_hidden_cohort_compare_v1'
+
+/** 读取对比面板自定义新增的班级/实验组名称 */
+export function loadCustomCohortCompareNames(): string[] {
+  return readStringListFromStorage(CUSTOM_COHORT_COMPARE_STORAGE_KEY)
+}
+
+/** 读取对比面板中被教师主动隐藏的班级/实验组名称 */
+export function loadHiddenCohortCompareNames(): string[] {
+  return readStringListFromStorage(HIDDEN_COHORT_COMPARE_STORAGE_KEY)
+}
+
+/**
+ * 合并「全量归档班级 + 自定义新增 − 已隐藏」，得到对比下拉可选项。
+ * @param liveOptions 当前后端活跃记录中实际存在的班级列表
+ */
+export function loadCohortCompareOptions(liveOptions: string[] = []): string[] {
+  const hidden = new Set(loadHiddenCohortCompareNames())
+  const live = liveOptions
+    .map((name) => name.trim())
+    .filter((name) => Boolean(name) && !hidden.has(name))
+  const customs = loadCustomCohortCompareNames().filter(
+    (name) => Boolean(name) && !hidden.has(name) && !live.includes(name),
+  )
+  return Array.from(new Set([...live, ...customs])).sort((a, b) => a.localeCompare(b, 'zh-CN'))
+}
+
+/** 新增一个对比班级选项并持久化（去重、去空白） */
+export function saveCustomCohortCompareName(name: string, liveOptions: string[] = []): string[] {
+  const trimmed = name.trim()
+  if (!trimmed) return loadCohortCompareOptions(liveOptions)
+  // 重新新增同名项时取消隐藏
+  const hidden = loadHiddenCohortCompareNames().filter((item) => item !== trimmed)
+  writeStringListToStorage(HIDDEN_COHORT_COMPARE_STORAGE_KEY, hidden)
+  const existing = loadCustomCohortCompareNames()
+  if (!existing.includes(trimmed) && !liveOptions.map((n) => n.trim()).includes(trimmed)) {
+    writeStringListToStorage(CUSTOM_COHORT_COMPARE_STORAGE_KEY, [...existing, trimmed])
+  }
+  return loadCohortCompareOptions(liveOptions)
+}
+
+/**
+ * 从对比下拉中删除/隐藏班级选项（不物理删除归档数据）：
+ * - 自定义项：从自定义列表移除
+ * - 来自归档的幽灵项：写入隐藏名单，刷新后不再出现
+ */
+export function removeCohortCompareOption(name: string, liveOptions: string[] = []): string[] {
+  const trimmed = name.trim()
+  if (!trimmed) return loadCohortCompareOptions(liveOptions)
+
+  const custom = loadCustomCohortCompareNames().filter((item) => item !== trimmed)
+  writeStringListToStorage(CUSTOM_COHORT_COMPARE_STORAGE_KEY, custom)
+
+  const hidden = loadHiddenCohortCompareNames()
+  if (!hidden.includes(trimmed)) {
+    writeStringListToStorage(HIDDEN_COHORT_COMPARE_STORAGE_KEY, [...hidden, trimmed])
+  }
+
+  return loadCohortCompareOptions(liveOptions)
 }
 
 /** 学校展示名称：现已 100% 自定义，直接返回用户填写/选择的名称，未填写时给出占位提示 */
@@ -386,15 +541,6 @@ export function generateNextKneeAngle(previousAngle: number): number {
   // 与上一帧做加权平均，模拟连续视频帧之间的运动惯性
   const next = previousAngle * 0.45 + target * 0.55
   return Math.round(Math.min(180, Math.max(100, next)))
-}
-
-/** 命中次数统计对应的教练处方文案库（按主要痛点等级挑选） */
-const PRESCRIPTION_BY_LEVEL: Record<ThresholdLevel, string> = {
-  green:
-    '教练处方：当前发力节奏已非常稳定，建议保持射门前支撑脚膝盖微屈、身体重心前倾的准备姿势，可尝试提升摆动腿加速度以进一步巩固动作自动化。',
-  yellow:
-    '教练处方：建议保持射门前支撑脚膝盖微屈，想象摆动腿像拉满的弓弦一样蓄力后再释放，减少触球瞬间的角度偏移。',
-  red: '教练处方：建议从静态分解动作开始练习，先固定支撑脚站位，反复体会"腿部像鞭子甩出"的具身感觉，待动作稳定后再逐步加入完整助跑衔接。',
 }
 
 /* ------------------------------------------------------------------ */
@@ -465,7 +611,12 @@ export function loadGlobalRecordsFromLocalStorage(): GlobalTrainingRecord[] {
     const parsed = JSON.parse(raw)
     if (!Array.isArray(parsed)) return []
     return parsed.filter(
-      (item): item is GlobalTrainingRecord => !!item && typeof item === 'object' && typeof item.id === 'string',
+      (item): item is GlobalTrainingRecord =>
+        !!item &&
+        typeof item === 'object' &&
+        typeof item.id === 'string' &&
+        !(item as GlobalTrainingRecord).is_deleted &&
+        !(item as GlobalTrainingRecord).isDeleted,
     )
   } catch {
     return []
@@ -515,22 +666,33 @@ export function buildFinalDiagnosisReport(stats: ThresholdHitStats, studentNumbe
   // 判定本次主要痛点等级：红色优先，其次黄色，否则视为整体稳定
   const dominantLevel: ThresholdLevel = stats.red >= stats.yellow && stats.red > 0 ? 'red' : stats.yellow > 0 ? 'yellow' : 'green'
 
-  const painPoint =
+  const correction_metaphor =
     dominantLevel === 'green'
-      ? '本次练习动作整体稳定，未出现显著偏离黄金区间的情况。'
+      ? '你刚才踢球时膝盖弯得刚刚好，就像弹簧压紧一样！下次试试继续保持这个动作。'
       : dominantLevel === 'yellow'
-        ? `主要痛点：后摆腿触球瞬间膝关节屈曲角偏小（触发 ${stats.yellow} 次黄色警示）。`
-        : `主要痛点：触球瞬间膝关节屈曲角显著偏离黄金区间（触发 ${stats.red} 次红色警示，${stats.yellow} 次黄色警示）。`
+        ? '你刚才踢球时膝盖有点直，就像一根冻住的冰棍一样！下次试试像弹簧一样弯一弯再弹出去。'
+        : '你刚才踢球时膝盖太直了，就像一根冻住的冰棍一样！下次试试像弹簧一样把小腿弯一弯再弹出去。'
 
-  const prescription = PRESCRIPTION_BY_LEVEL[dominantLevel]
+  const praise_encouragement =
+    dominantLevel === 'green'
+      ? '这次动作又稳又帅，你是小豹子！'
+      : dominantLevel === 'yellow'
+        ? '你助跑像小豹子一样快，特别棒！'
+        : '这次尝试非常勇敢，继续保持！'
 
-  const fullText = `学号 ${studentNumber || '未填写'} 本次综合练习诊断报告\n\n发力稳定性评分：${score} 分（共采集 ${totalAttempts} 次有效触球数据）。\n${painPoint}\n${prescription}`
+  // 兼容旧字段：painPoint=纠错，prescription=表扬
+  const painPoint = correction_metaphor
+  const prescription = praise_encouragement
+
+  const fullText = `学号 ${studentNumber || '未填写'} 本次综合练习诊断报告\n\n发力稳定性评分：${score} 分（共采集 ${totalAttempts} 次有效触球数据）。\n【魔法指令】${correction_metaphor}\n【闪光点发现】${praise_encouragement}`
 
   return {
     score,
     totalAttempts,
     painPoint,
     prescription,
+    correction_metaphor,
+    praise_encouragement,
     fullText,
     generatedAt: new Date().toLocaleString('zh-CN', { hour12: false }),
   }

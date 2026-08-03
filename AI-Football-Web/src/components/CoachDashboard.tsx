@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import {
   Users,
@@ -17,17 +17,47 @@ import {
   TrendingUp,
   Crosshair,
   MousePointerClick,
+  Search,
+  ChevronDown,
+  ChevronRight,
+  FlaskConical,
+  Filter,
+  RotateCcw,
+  Activity,
+  UsersRound,
+  GitCompareArrows,
+  X,
 } from 'lucide-react'
-import { loadGlobalRecordsFromLocalStorage, saveGlobalRecordsToLocalStorage } from '../mockData'
+import {
+  loadGlobalRecordsFromLocalStorage,
+  loadHiddenClassGroupNames,
+  loadHiddenSchoolNames,
+  removeClassGroupOption,
+  removeSchoolOption,
+  saveGlobalRecordsToLocalStorage,
+} from '../mockData'
 import LongitudinalProgressChart from './LongitudinalProgressChart'
 import BiomechanicalRadar from './BiomechanicalRadar'
 import CoachDataSanitizerGrid from './CoachDataSanitizerGrid'
+import CohortComparePanel from './CohortComparePanel'
+import ClassProfilingPanel from './ClassProfilingPanel'
+import InterventionDosageMonitor from './InterventionDosageMonitor'
 import type {
   AcademicExportResult,
   GlobalTrainingRecord,
   ProgressHistoryPoint,
   ProgressHistoryResponse,
+  Quantified5dScores,
+  RadarAverageScores,
 } from '../types'
+
+type CoachAnalysisTab = 'dosage' | 'classProfile' | 'cohortCompare'
+
+const COACH_ANALYSIS_TABS: Array<{ id: CoachAnalysisTab; label: string }> = [
+  { id: 'dosage', label: '实验干预剂量' },
+  { id: 'classProfile', label: '班级群体画像' },
+  { id: 'cohortCompare', label: '多维数据对比' },
+]
 
 const API_BASE_URL = 'http://localhost:8000'
 const SCHOOL_FALLBACK = '未设置学校'
@@ -49,17 +79,68 @@ let dashboardToastSeq = 0
 
 type LoadState = 'loading' | 'ready'
 
+type ExperimentGroupId = 'GROUP_A' | 'GROUP_B' | 'OTHER'
+
+/** CTMS 级全局实验过滤器（学校 / 班级 / 组别 / 日期区间） */
+interface GlobalFilter {
+  school: string
+  class: string
+  group: string
+  dateRange: [string | null, string | null]
+}
+
+const DEFAULT_GLOBAL_FILTER: GlobalFilter = {
+  school: 'all',
+  class: 'all',
+  group: 'all',
+  dateRange: [null, null],
+}
+
+function isDateInRange(dateStr: string, range: [string | null, string | null]): boolean {
+  const [start, end] = range
+  if (!start && !end) return true
+  if (dateStr === '未知日期') return false
+  if (start && dateStr < start) return false
+  if (end && dateStr > end) return false
+  return true
+}
+
 /** 花名册条目：按被试聚合 */
 interface StudentAggregate {
   key: string
   studentId: string
   school: string
   classGroup: string
-  group: 'GROUP_A' | 'GROUP_B' | 'OTHER'
+  group: ExperimentGroupId
   records: GlobalTrainingRecord[]
 }
 
-function resolveGroup(record: GlobalTrainingRecord): StudentAggregate['group'] {
+/** 树状花名册：班级 → 实验组 → 学生 */
+interface RosterGroupNode {
+  group: ExperimentGroupId
+  label: string
+  badge: string
+  students: StudentAggregate[]
+}
+
+interface RosterClassNode {
+  classGroup: string
+  groups: RosterGroupNode[]
+  studentCount: number
+}
+
+const GROUP_META: Record<
+  ExperimentGroupId,
+  { label: string; badge: string; shortLabel: string }
+> = {
+  GROUP_A: { label: 'A组 · 实时反馈', badge: 'A', shortLabel: 'A组' },
+  GROUP_B: { label: 'B组 · 延时反馈', badge: 'B', shortLabel: 'B组' },
+  OTHER: { label: '未归组', badge: '?', shortLabel: '未归组' },
+}
+
+const GROUP_ORDER: ExperimentGroupId[] = ['GROUP_A', 'GROUP_B', 'OTHER']
+
+function resolveGroup(record: GlobalTrainingRecord): ExperimentGroupId {
   if (record.type === 'realtime' || record.groupTypeCode === 1) return 'GROUP_A'
   if (record.type === 'delayed' || record.groupTypeCode === 2) return 'GROUP_B'
   const label = (record.classGroup || '').toUpperCase()
@@ -68,11 +149,25 @@ function resolveGroup(record: GlobalTrainingRecord): StudentAggregate['group'] {
   return 'OTHER'
 }
 
+function isActiveRecord(record: GlobalTrainingRecord | null | undefined): record is GlobalTrainingRecord {
+  return Boolean(record && typeof record.id === 'string' && !(record.is_deleted || record.isDeleted))
+}
+
+function normalizeSchool(value: string | undefined | null): string {
+  const trimmed = (value || '').trim()
+  return trimmed || SCHOOL_FALLBACK
+}
+
+function normalizeClassGroup(value: string | undefined | null): string {
+  const trimmed = (value || '').trim()
+  return trimmed || CLASS_FALLBACK
+}
+
 /**
  * 教练端科研指挥中心（Catapult / Hudl 宏观→微观三层下钻）
  *
  * 左栏花名册（剂量） → 中栏个人图谱（时序+雷达） → 右栏清道夫尝试日志
- * 三栏各自 `h-[calc(100vh-80px)] overflow-y-auto` 局部滚动，互不干扰。
+ * 三栏填满顶栏以下剩余高度，各自 overflow-y 局部滚动，互不干扰。
  */
 export default function CoachDashboard() {
   const [records, setRecords] = useState<GlobalTrainingRecord[]>([])
@@ -80,9 +175,10 @@ export default function CoachDashboard() {
   const [isRefreshing, setIsRefreshing] = useState(false)
   const [toast, setToast] = useState<DashboardToastState | null>(null)
 
-  const [selectedSchool, setSelectedSchool] = useState<string>('all')
-  const [selectedClassGroup, setSelectedClassGroup] = useState<string>('all')
-  const [selectedTestDate, setSelectedTestDate] = useState<string>('all')
+  const [globalFilter, setGlobalFilter] = useState<GlobalFilter>(DEFAULT_GLOBAL_FILTER)
+  const [activeTab, setActiveTab] = useState<CoachAnalysisTab>('dosage')
+  /** 学校/班级选项被删除（隐藏）后递增，驱动下拉列表重算 */
+  const [filterOptionsEpoch, setFilterOptionsEpoch] = useState(0)
 
   const [isExportingMatrix, setIsExportingMatrix] = useState(false)
   const [selectedStudent, setSelectedStudent] = useState<StudentAggregate | null>(null)
@@ -90,6 +186,7 @@ export default function CoachDashboard() {
   /** 软删除后递增：驱动中栏曲线 / 雷达 / 右栏列表 re-fetch */
   const [dataEpoch, setDataEpoch] = useState(0)
   const [progressHistory, setProgressHistory] = useState<ProgressHistoryPoint[] | null>(null)
+  const [radarAverage, setRadarAverage] = useState<RadarAverageScores | null>(null)
 
   function showToast(message: string, success: boolean) {
     const id = ++dashboardToastSeq
@@ -101,26 +198,22 @@ export default function CoachDashboard() {
 
   async function fetchAllRecords(isManualRefresh = false) {
     if (isManualRefresh) setIsRefreshing(true)
-    const localRecords = loadGlobalRecordsFromLocalStorage()
+    const localRecords = loadGlobalRecordsFromLocalStorage().filter(isActiveRecord)
     try {
       const response = await fetch(`${API_BASE_URL}/api/get_all_records`)
       if (!response.ok) throw new Error(`接口返回状态码 ${response.status}`)
       const data = (await response.json()) as { success: boolean; records?: GlobalTrainingRecord[] }
-      const backendRecords = Array.isArray(data.records) ? data.records : []
+      // 后端在线时以后端为唯一真相源，禁止用 localStorage 幽灵记录复活已删除数据
+      const backendRecords = (Array.isArray(data.records) ? data.records : []).filter(isActiveRecord)
 
-      const backendIds = new Set(backendRecords.map((r) => r.id))
-      const mergedMap = new Map<string, GlobalTrainingRecord>()
-      for (const record of backendRecords) mergedMap.set(record.id, record)
-      for (const record of localRecords) {
-        if (backendIds.has(record.id)) continue
-        if (record.is_deleted || record.isDeleted) continue
-        mergedMap.set(record.id, record)
+      setRecords(backendRecords)
+      saveGlobalRecordsToLocalStorage(backendRecords)
+      if (!backendRecords.length) {
+        setSelectedStudent(null)
+        setProgressHistory(null)
+        setRadarAverage(null)
       }
-      const merged = Array.from(mergedMap.values())
-
-      setRecords(merged)
-      saveGlobalRecordsToLocalStorage(merged)
-      if (isManualRefresh) showToast(`✅ 已刷新，共加载 ${merged.length} 条历史归档记录`, true)
+      if (isManualRefresh) showToast(`✅ 已刷新，共加载 ${backendRecords.length} 条历史归档记录`, true)
     } catch {
       setRecords(localRecords)
       if (isManualRefresh) {
@@ -141,50 +234,97 @@ export default function CoachDashboard() {
     void fetchAllRecords()
   }, [])
 
+  /** 唯一真相源：当前未删除的完整尝试记录（已剔除软删除） */
+  const activeRecords = useMemo(() => records.filter(isActiveRecord), [records])
+
+  /** 从最新活跃数据动态提取学校列表，并剔除教师主动隐藏的幽灵项 */
   const schoolOptions = useMemo(() => {
+    const hidden = new Set(loadHiddenSchoolNames())
     const set = new Set<string>()
-    records.forEach((record) => set.add(record.school || SCHOOL_FALLBACK))
-    return Array.from(set).sort()
-  }, [records])
+    activeRecords.forEach((record) => {
+      const name = normalizeSchool(record.school)
+      if (!hidden.has(name)) set.add(name)
+    })
+    return Array.from(set).sort((a, b) => a.localeCompare(b, 'zh-CN'))
+    // filterOptionsEpoch：删除选项后强制重读 localStorage 隐藏名单
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeRecords, filterOptionsEpoch])
 
+  /** 班级列表：随所选学校级联，剔除已隐藏项 */
   const classGroupOptions = useMemo(() => {
+    const hidden = new Set(loadHiddenClassGroupNames())
     const set = new Set<string>()
-    records
-      .filter((record) => selectedSchool === 'all' || (record.school || SCHOOL_FALLBACK) === selectedSchool)
-      .forEach((record) => set.add(record.classGroup || CLASS_FALLBACK))
-    return Array.from(set).sort()
-  }, [records, selectedSchool])
-
-  useEffect(() => {
-    if (selectedClassGroup !== 'all' && !classGroupOptions.includes(selectedClassGroup)) {
-      setSelectedClassGroup('all')
-    }
+    activeRecords
+      .filter((record) => globalFilter.school === 'all' || normalizeSchool(record.school) === globalFilter.school)
+      .forEach((record) => {
+        const name = normalizeClassGroup(record.classGroup)
+        if (!hidden.has(name)) set.add(name)
+      })
+    return Array.from(set).sort((a, b) => a.localeCompare(b, 'zh-CN'))
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedSchool, classGroupOptions])
+  }, [activeRecords, globalFilter.school, filterOptionsEpoch])
 
-  const dateOptions = useMemo(() => {
-    const set = new Set<string>()
-    records.forEach((record) => set.add(getRecordTestDate(record)))
-    return Array.from(set).sort((a, b) => (a < b ? 1 : -1))
-  }, [records])
+  /** 实验组别列表：随学校/班级级联，仅含 A/B/未归组中实际存在的项 */
+  const groupOptions = useMemo(() => {
+    const set = new Set<ExperimentGroupId>()
+    activeRecords
+      .filter((record) => globalFilter.school === 'all' || normalizeSchool(record.school) === globalFilter.school)
+      .filter(
+        (record) =>
+          globalFilter.class === 'all' || normalizeClassGroup(record.classGroup) === globalFilter.class,
+      )
+      .forEach((record) => set.add(resolveGroup(record)))
+    return GROUP_ORDER.filter((g) => set.has(g))
+  }, [activeRecords, globalFilter.school, globalFilter.class])
 
-  useEffect(() => {
-    if (selectedTestDate === 'all') return
-    const stillExists = records
-      .filter((record) => selectedSchool === 'all' || (record.school || SCHOOL_FALLBACK) === selectedSchool)
-      .filter((record) => selectedClassGroup === 'all' || (record.classGroup || CLASS_FALLBACK) === selectedClassGroup)
-      .some((record) => getRecordTestDate(record) === selectedTestDate)
-    if (!stillExists) setSelectedTestDate('all')
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedSchool, selectedClassGroup, records])
-
-  const filteredRecords = useMemo(() => {
-    return records
-      .filter((record) => selectedSchool === 'all' || (record.school || SCHOOL_FALLBACK) === selectedSchool)
-      .filter((record) => selectedClassGroup === 'all' || (record.classGroup || CLASS_FALLBACK) === selectedClassGroup)
-      .filter((record) => selectedTestDate === 'all' || getRecordTestDate(record) === selectedTestDate)
+  /**
+   * 核心数据过滤管道：全量活跃记录 → school → class → group → dateRange 漏斗。
+   * 下游花名册 / 进度图 / 对比雷达均只消费此数据集。
+   */
+  const filteredDataset = useMemo(() => {
+    return activeRecords
+      .filter((record) => globalFilter.school === 'all' || normalizeSchool(record.school) === globalFilter.school)
+      .filter(
+        (record) =>
+          globalFilter.class === 'all' || normalizeClassGroup(record.classGroup) === globalFilter.class,
+      )
+      .filter((record) => globalFilter.group === 'all' || resolveGroup(record) === globalFilter.group)
+      .filter((record) => isDateInRange(getRecordTestDate(record), globalFilter.dateRange))
       .sort((a, b) => (a.timestamp < b.timestamp ? 1 : -1))
-  }, [records, selectedSchool, selectedClassGroup, selectedTestDate])
+  }, [activeRecords, globalFilter])
+
+  /** 科研对比模块：仅从过滤后数据集提取班级选项，保证与全局过滤器联动 */
+  const cohortOptions = useMemo(() => {
+    const set = new Set<string>()
+    filteredDataset.forEach((record) => set.add(normalizeClassGroup(record.classGroup)))
+    return Array.from(set).sort((a, b) => a.localeCompare(b, 'zh-CN'))
+  }, [filteredDataset])
+
+  const hasActiveDateRange = Boolean(globalFilter.dateRange[0] || globalFilter.dateRange[1])
+  const hasActiveFilter =
+    globalFilter.school !== 'all' ||
+    globalFilter.class !== 'all' ||
+    globalFilter.group !== 'all' ||
+    hasActiveDateRange
+
+  // 筛选值一旦不再存在于动态选项中，立即回退，避免幽灵选中态
+  useEffect(() => {
+    if (globalFilter.school !== 'all' && !schoolOptions.includes(globalFilter.school)) {
+      setGlobalFilter((prev) => ({ ...prev, school: 'all', class: 'all', group: 'all' }))
+    }
+  }, [globalFilter.school, schoolOptions])
+
+  useEffect(() => {
+    if (globalFilter.class !== 'all' && !classGroupOptions.includes(globalFilter.class)) {
+      setGlobalFilter((prev) => ({ ...prev, class: 'all', group: 'all' }))
+    }
+  }, [globalFilter.class, classGroupOptions])
+
+  useEffect(() => {
+    if (globalFilter.group !== 'all' && !groupOptions.includes(globalFilter.group as ExperimentGroupId)) {
+      setGlobalFilter((prev) => ({ ...prev, group: 'all' }))
+    }
+  }, [globalFilter.group, groupOptions])
 
   async function handleExportAcademicMatrix() {
     if (isExportingMatrix) return
@@ -230,15 +370,24 @@ export default function CoachDashboard() {
     }
   }
 
+  /** KPI 与花名册同源：仅反映全局过滤器穿透后的数据集 */
   const kpi = useMemo(() => {
-    const uniqueStudents = new Set(records.map((r) => `${r.school}__${r.classGroup}__${r.studentId}`))
+    const uniqueStudents = new Set(
+      filteredDataset.map((r) => `${normalizeSchool(r.school)}__${normalizeClassGroup(r.classGroup)}__${r.studentId}`),
+    )
     const realtimeStudents = new Set(
-      records.filter((r) => r.type === 'realtime').map((r) => `${r.school}__${r.classGroup}__${r.studentId}`),
+      filteredDataset
+        .filter((r) => resolveGroup(r) === 'GROUP_A')
+        .map((r) => `${normalizeSchool(r.school)}__${normalizeClassGroup(r.classGroup)}__${r.studentId}`),
     )
     const delayedStudents = new Set(
-      records.filter((r) => r.type === 'delayed').map((r) => `${r.school}__${r.classGroup}__${r.studentId}`),
+      filteredDataset
+        .filter((r) => resolveGroup(r) === 'GROUP_B')
+        .map((r) => `${normalizeSchool(r.school)}__${normalizeClassGroup(r.classGroup)}__${r.studentId}`),
     )
-    const validScores = records.filter((r) => typeof r.score === 'number') as (GlobalTrainingRecord & { score: number })[]
+    const validScores = filteredDataset.filter((r) => typeof r.score === 'number') as (GlobalTrainingRecord & {
+      score: number
+    })[]
     const avgScore =
       validScores.length > 0
         ? Math.round(validScores.reduce((sum, r) => sum + r.score, 0) / validScores.length)
@@ -250,14 +399,14 @@ export default function CoachDashboard() {
       delayedStudents: delayedStudents.size,
       avgScore,
     }
-  }, [records])
+  }, [filteredDataset])
 
   const studentAggregates: StudentAggregate[] = useMemo(() => {
     const map = new Map<string, StudentAggregate>()
-    filteredRecords.forEach((record) => {
-      const school = record.school || SCHOOL_FALLBACK
-      const classGroup = record.classGroup || CLASS_FALLBACK
-      const studentId = record.studentId || '未填写编号'
+    filteredDataset.forEach((record) => {
+      const school = normalizeSchool(record.school)
+      const classGroup = normalizeClassGroup(record.classGroup)
+      const studentId = (record.studentId || '').trim() || '未填写编号'
       const key = `${school}__${classGroup}__${studentId}`
       if (!map.has(key)) {
         map.set(key, {
@@ -277,14 +426,36 @@ export default function CoachDashboard() {
         aggregate.group = resolveGroup(aggregate.records[aggregate.records.length - 1])
       }
     })
-    return Array.from(map.values()).sort((a, b) => a.studentId.localeCompare(b.studentId))
-  }, [filteredRecords])
+    return Array.from(map.values()).sort((a, b) => a.studentId.localeCompare(b.studentId, 'zh-CN'))
+  }, [filteredDataset])
 
-  const rosterGroups = useMemo(() => {
-    const groupA = studentAggregates.filter((s) => s.group === 'GROUP_A')
-    const groupB = studentAggregates.filter((s) => s.group === 'GROUP_B')
-    const other = studentAggregates.filter((s) => s.group === 'OTHER')
-    return { groupA, groupB, other }
+  /** 班级 → 实验组 (A/B) 树状分组，供左侧手风琴花名册消费 */
+  const rosterTree: RosterClassNode[] = useMemo(() => {
+    const byClass = new Map<string, Map<ExperimentGroupId, StudentAggregate[]>>()
+    studentAggregates.forEach((student) => {
+      if (!byClass.has(student.classGroup)) {
+        byClass.set(student.classGroup, new Map())
+      }
+      const groupMap = byClass.get(student.classGroup)!
+      if (!groupMap.has(student.group)) groupMap.set(student.group, [])
+      groupMap.get(student.group)!.push(student)
+    })
+
+    return Array.from(byClass.entries())
+      .sort(([a], [b]) => a.localeCompare(b, 'zh-CN'))
+      .map(([classGroup, groupMap]) => {
+        const groups: RosterGroupNode[] = GROUP_ORDER.filter((g) => groupMap.has(g)).map((group) => ({
+          group,
+          label: GROUP_META[group].label,
+          badge: GROUP_META[group].badge,
+          students: (groupMap.get(group) || []).slice().sort((a, b) => a.studentId.localeCompare(b.studentId, 'zh-CN')),
+        }))
+        return {
+          classGroup,
+          groups,
+          studentCount: groups.reduce((sum, g) => sum + g.students.length, 0),
+        }
+      })
   }, [studentAggregates])
 
   // 筛选变化或数据洗净后，同步刷新当前选中被试的 records 引用
@@ -308,20 +479,11 @@ export default function CoachDashboard() {
     ? Math.min(Math.max(0, selectedAttemptIndex), Math.max(0, selectedStudent.records.length - 1))
     : 0
 
-  const selectedAttempt: GlobalTrainingRecord | null =
-    selectedStudent && selectedStudent.records.length > 0
-      ? selectedStudent.records[clampedAttemptIndex]
-      : null
-
-  const radarScores =
-    selectedAttempt?.quantified5dScores ??
-    selectedStudent?.records[selectedStudent.records.length - 1]?.quantified5dScores ??
-    null
-
   // 拉取纵向科研节点历史；dataEpoch 变化时强制重拉（洗净后曲线自愈）
   useEffect(() => {
     if (!selectedStudent) {
       setProgressHistory(null)
+      setRadarAverage(null)
       return
     }
     let cancelled = false
@@ -357,14 +519,50 @@ export default function CoachDashboard() {
       return next
     })
     setDataEpoch((n) => n + 1)
+    // 强制与后端对齐，避免 localStorage / 花名册残留幽灵学员
+    void fetchAllRecords()
   }
 
+  function handleRecordsBatchDeleted(recordIds: string[]) {
+    if (!Array.isArray(recordIds) || recordIds.length === 0) return
+    const idSet = new Set(recordIds)
+    setRecords((prev) => {
+      const next = prev.filter((r) => !idSet.has(r.id))
+      saveGlobalRecordsToLocalStorage(next)
+      return next
+    })
+    setDataEpoch((n) => n + 1)
+    void fetchAllRecords()
+  }
+
+  /** 将后端 radar_average 安全转为雷达组件可用结构 */
+  const portraitRadarScores: Quantified5dScores | null = (() => {
+    if (!radarAverage || typeof radarAverage !== 'object') return null
+    const keys = [
+      'approach_rhythm',
+      'support_stability',
+      'backswing_folding',
+      'ankle_rigidity',
+      'whipping_velocity',
+    ] as const
+    const out: Quantified5dScores = {}
+    let hit = 0
+    for (const key of keys) {
+      const v = radarAverage[key]
+      if (typeof v === 'number' && Number.isFinite(v)) {
+        out[key] = v
+        hit += 1
+      }
+    }
+    return hit > 0 ? out : null
+  })()
+
   const panelScrollClass =
-    'coach-panel-scroll h-[calc(100vh-80px)] overflow-y-auto overflow-x-hidden scrollbar-thin scrollbar-thumb-slate-700 scrollbar-track-transparent'
+    'coach-panel-scroll h-full min-h-0 overflow-y-auto overflow-x-hidden scrollbar-thin scrollbar-thumb-slate-700 scrollbar-track-transparent'
 
   return (
     <div className="coach-dashboard-shell flex h-full min-h-0 flex-col overflow-hidden">
-      {/* ============================ 顶栏：KPI + 筛选（紧凑，不锁死页面滚动） ============================ */}
+      {/* ============================ 顶栏：KPI + 全局控制台（固定高度，不参与三栏滚动） ============================ */}
       <div className="flex-shrink-0 space-y-3 border-b border-white/5 px-3 py-3 sm:px-4">
         <div className="flex flex-wrap items-center gap-2">
           <MiniKpi icon={Users} label="总人数" value={kpi.totalStudents} accent="emerald" />
@@ -399,76 +597,210 @@ export default function CoachDashboard() {
           </div>
         </div>
 
-        <div className="flex flex-wrap items-center gap-2">
-          <label className="flex items-center gap-2 rounded-2xl bg-black/25 px-3 py-1.5 text-xs text-white/50">
-            <SchoolIcon className="h-3.5 w-3.5 text-emerald-400" />
-            <select
-              value={selectedSchool}
-              onChange={(e) => setSelectedSchool(e.target.value)}
-              className="bg-transparent text-sm font-medium text-white outline-none [&>option]:bg-zinc-900"
-            >
-              <option value="all">全部学校</option>
-              {schoolOptions.map((option) => (
-                <option key={option} value={option}>
-                  {option}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label className="flex items-center gap-2 rounded-2xl bg-black/25 px-3 py-1.5 text-xs text-white/50">
-            <Layers className="h-3.5 w-3.5 text-sky-400" />
-            <select
-              value={selectedClassGroup}
-              onChange={(e) => setSelectedClassGroup(e.target.value)}
-              className="bg-transparent text-sm font-medium text-white outline-none [&>option]:bg-zinc-900"
-            >
-              <option value="all">全部班级/组别</option>
-              {classGroupOptions.map((option) => (
-                <option key={option} value={option}>
-                  {option}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label className="flex items-center gap-2 rounded-2xl bg-black/25 px-3 py-1.5 text-xs text-white/50">
-            <CalendarDays className="h-3.5 w-3.5 text-amber-400" />
-            <select
-              value={selectedTestDate}
-              onChange={(e) => setSelectedTestDate(e.target.value)}
-              className="bg-transparent text-sm font-medium text-white outline-none [&>option]:bg-zinc-900"
-            >
-              <option value="all">全部日期</option>
-              {dateOptions.map((option) => (
-                <option key={option} value={option}>
-                  {option}
-                </option>
-              ))}
-            </select>
-          </label>
-          <span className="text-[11px] text-white/30">
-            花名册 {studentAggregates.length} 人 · 三栏局部滚动
+        {/* CTMS 全局控制台：悬浮条带，统管 school / class / group / dateRange */}
+        <div className="coach-global-control-panel sticky top-0 z-20 flex flex-wrap items-center gap-2 rounded-2xl border border-white/10 bg-slate-950/80 px-3 py-2.5 shadow-[0_8px_32px_rgba(0,0,0,0.35)] backdrop-blur-xl">
+          <span className="mr-1 inline-flex items-center gap-1.5 text-[11px] font-semibold tracking-wide text-emerald-300/90">
+            <Filter className="h-3.5 w-3.5" />
+            全局控制台
           </span>
+
+          <FilterOptionPicker
+            icon={SchoolIcon}
+            iconClassName="text-emerald-400"
+            allLabel="全部学校"
+            value={globalFilter.school}
+            options={schoolOptions}
+            onSelect={(school) => {
+              setGlobalFilter((prev) => ({
+                ...prev,
+                school,
+                class: 'all',
+                group: 'all',
+              }))
+            }}
+            onDelete={(school, event) => {
+              event.preventDefault()
+              event.stopPropagation()
+              removeSchoolOption(school)
+              setFilterOptionsEpoch((n) => n + 1)
+              setGlobalFilter((prev) =>
+                prev.school === school
+                  ? { ...prev, school: 'all', class: 'all', group: 'all' }
+                  : prev,
+              )
+            }}
+          />
+
+          <FilterOptionPicker
+            icon={Layers}
+            iconClassName="text-sky-400"
+            allLabel="全部班级"
+            value={globalFilter.class}
+            options={classGroupOptions}
+            onSelect={(classGroup) => {
+              setGlobalFilter((prev) => ({
+                ...prev,
+                class: classGroup,
+                group: 'all',
+              }))
+            }}
+            onDelete={(classGroup, event) => {
+              event.preventDefault()
+              event.stopPropagation()
+              removeClassGroupOption(classGroup)
+              setFilterOptionsEpoch((n) => n + 1)
+              setGlobalFilter((prev) =>
+                prev.class === classGroup ? { ...prev, class: 'all', group: 'all' } : prev,
+              )
+            }}
+          />
+
+          <label className="flex items-center gap-2 rounded-2xl bg-black/35 px-3 py-1.5 text-xs text-white/50">
+            <FlaskConical className="h-3.5 w-3.5 text-violet-300" />
+            <select
+              value={globalFilter.group}
+              onChange={(e) =>
+                setGlobalFilter((prev) => ({
+                  ...prev,
+                  group: e.target.value,
+                }))
+              }
+              className="bg-transparent text-sm font-medium text-white outline-none [&>option]:bg-zinc-900"
+            >
+              <option value="all">全部组别</option>
+              {groupOptions.map((option) => (
+                <option key={option} value={option}>
+                  {GROUP_META[option].shortLabel}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <label className="flex items-center gap-2 rounded-2xl bg-black/35 px-3 py-1.5 text-xs text-white/50">
+            <CalendarDays className="h-3.5 w-3.5 text-amber-400" />
+            <span className="whitespace-nowrap text-white/40">起</span>
+            <input
+              type="date"
+              value={globalFilter.dateRange[0] ?? ''}
+              onChange={(e) => {
+                const start = e.target.value || null
+                setGlobalFilter((prev) => {
+                  const end = prev.dateRange[1]
+                  const nextEnd = start && end && end < start ? start : end
+                  return { ...prev, dateRange: [start, nextEnd] }
+                })
+              }}
+              className="bg-transparent text-sm font-medium text-white outline-none [color-scheme:dark]"
+            />
+            <span className="text-white/30">→</span>
+            <span className="whitespace-nowrap text-white/40">止</span>
+            <input
+              type="date"
+              value={globalFilter.dateRange[1] ?? ''}
+              min={globalFilter.dateRange[0] ?? undefined}
+              onChange={(e) => {
+                const end = e.target.value || null
+                setGlobalFilter((prev) => ({
+                  ...prev,
+                  dateRange: [prev.dateRange[0], end],
+                }))
+              }}
+              className="bg-transparent text-sm font-medium text-white outline-none [color-scheme:dark]"
+            />
+          </label>
+
+          {hasActiveFilter && (
+            <button
+              type="button"
+              onClick={() => setGlobalFilter(DEFAULT_GLOBAL_FILTER)}
+              className="inline-flex items-center gap-1 rounded-full border border-white/10 bg-white/5 px-2.5 py-1 text-[11px] text-white/55 transition hover:bg-white/10 hover:text-white/80"
+              title="重置全局过滤器"
+            >
+              <RotateCcw className="h-3 w-3" />
+              重置
+            </button>
+          )}
+
+          <span className="ml-auto text-[11px] text-white/30">
+            有效样本 {filteredDataset.length} 条 · 花名册 {studentAggregates.length} 人 · {rosterTree.length} 个班级
+          </span>
+        </div>
+
+        {/* 分析 Tab：剂量热力图 / 班级群体画像 / 多维对比 */}
+        <div className="coach-analysis-tabs space-y-2.5">
+          <div
+            className="flex flex-wrap items-center gap-1 rounded-2xl border border-white/10 bg-black/30 p-1"
+            role="tablist"
+            aria-label="教练端分析视图"
+          >
+            {COACH_ANALYSIS_TABS.map((tab) => {
+              const isActive = activeTab === tab.id
+              const Icon =
+                tab.id === 'dosage' ? Activity : tab.id === 'classProfile' ? UsersRound : GitCompareArrows
+              return (
+                <button
+                  key={tab.id}
+                  type="button"
+                  role="tab"
+                  aria-selected={isActive}
+                  onClick={() => setActiveTab(tab.id)}
+                  className={`inline-flex items-center gap-1.5 rounded-xl px-3 py-2 text-[11px] font-semibold transition ${
+                    isActive
+                      ? 'bg-emerald-500/20 text-emerald-100 shadow-[0_0_18px_rgba(16,185,129,0.15)] ring-1 ring-emerald-400/35'
+                      : 'text-white/45 hover:bg-white/5 hover:text-white/75'
+                  }`}
+                >
+                  <Icon className="h-3.5 w-3.5" />
+                  {tab.label}
+                </button>
+              )
+            })}
+          </div>
+
+          <div className="max-h-[min(48vh,520px)] overflow-y-auto overscroll-contain scrollbar-thin scrollbar-thumb-slate-700 scrollbar-track-transparent">
+            {activeTab === 'dosage' && (
+              <InterventionDosageMonitor filteredDataset={filteredDataset} />
+            )}
+            {activeTab === 'classProfile' && (
+              <ClassProfilingPanel
+                filteredDataset={filteredDataset}
+                filterSchool={globalFilter.school}
+                filterClass={globalFilter.class}
+              />
+            )}
+            {activeTab === 'cohortCompare' && (
+              <CohortComparePanel
+                cohortOptions={cohortOptions}
+                filteredDataset={filteredDataset}
+              />
+            )}
+          </div>
         </div>
       </div>
 
-      {/* ============================ 三栏主工作区 ============================ */}
+      {/* ============================ 三栏主工作区（占满剩余高度，各栏独立滚动） ============================ */}
       {loadState === 'loading' ? (
-        <div className="flex flex-1 items-center justify-center gap-3 text-white/40">
+        <div className="flex min-h-0 flex-1 items-center justify-center gap-3 text-white/40">
           <Loader2 className="h-7 w-7 animate-spin text-emerald-400" />
           <p className="text-sm">正在加载全量历史归档数据……</p>
         </div>
-      ) : records.length === 0 ? (
-        <div className="flex flex-1 items-center justify-center p-6">
+      ) : activeRecords.length === 0 ? (
+        <div className="flex min-h-0 flex-1 items-center justify-center p-6">
           <EmptyStateCard />
+        </div>
+      ) : filteredDataset.length === 0 ? (
+        <div className="flex min-h-0 flex-1 items-center justify-center p-6">
+          <FilterEmptyState onReset={() => setGlobalFilter(DEFAULT_GLOBAL_FILTER)} />
         </div>
       ) : (
         <div className="flex min-h-0 flex-1 gap-3 overflow-hidden px-3 pb-3 pt-2 sm:px-4">
           {/* -------- 左栏：花名册与剂量监控 -------- */}
           <aside
-            className={`w-[320px] flex-shrink-0 rounded-2xl border border-white/10 bg-slate-900/40 p-3 ${panelScrollClass}`}
+            className={`w-[300px] flex-shrink-0 rounded-2xl border border-white/10 bg-slate-900/40 p-3 ${panelScrollClass}`}
           >
             <LeftSidebar
-              rosterGroups={rosterGroups}
+              rosterTree={rosterTree}
+              filteredDataset={filteredDataset}
               selectedKey={selectedStudent?.key ?? null}
               onSelect={(student) => setSelectedStudent(student)}
             />
@@ -480,23 +812,24 @@ export default function CoachDashboard() {
           >
             <MainCanvas
               selectedStudent={selectedStudent}
+              filteredDataset={filteredDataset}
               selectedAttemptIndex={clampedAttemptIndex}
               onSelectAttemptIndex={setSelectedAttemptIndex}
               progressHistory={progressHistory}
-              radarScores={radarScores}
+              radarScores={portraitRadarScores}
               dataEpoch={dataEpoch}
             />
           </main>
 
           {/* -------- 右栏：清道夫尝试日志 -------- */}
-          <aside
-            className={`flex w-[400px] flex-shrink-0 flex-col rounded-2xl border border-white/10 bg-slate-900/40 p-2 ${panelScrollClass}`}
-          >
+          <aside className="flex h-full min-h-0 w-[380px] flex-shrink-0 flex-col overflow-hidden rounded-2xl border border-white/10 bg-slate-900/40 p-2">
             <CoachDataSanitizerGrid
               compact
               studentId={selectedStudent?.studentId ?? null}
               refreshKey={dataEpoch}
               onRecordSoftDeleted={handleRecordSoftDeleted}
+              onRecordsBatchDeleted={handleRecordsBatchDeleted}
+              onRadarAverageChange={setRadarAverage}
               showToast={showToast}
               className="min-h-0 flex-1"
             />
@@ -568,6 +901,119 @@ function MiniKpi({
   )
 }
 
+/** 全局控制台学校/班级下拉：支持选中 + 右侧删除（隐藏）幽灵选项 */
+function FilterOptionPicker({
+  icon: Icon,
+  iconClassName,
+  allLabel,
+  value,
+  options,
+  onSelect,
+  onDelete,
+}: {
+  icon: typeof SchoolIcon
+  iconClassName: string
+  allLabel: string
+  value: string
+  options: string[]
+  onSelect: (value: string) => void
+  onDelete: (name: string, event: ReactMouseEvent) => void
+}) {
+  const [open, setOpen] = useState(false)
+  const rootRef = useRef<HTMLDivElement>(null)
+  const displayLabel = value === 'all' ? allLabel : value
+
+  useEffect(() => {
+    if (!open) return
+    function handleOutside(event: MouseEvent) {
+      if (rootRef.current && !rootRef.current.contains(event.target as Node)) {
+        setOpen(false)
+      }
+    }
+    document.addEventListener('mousedown', handleOutside)
+    return () => document.removeEventListener('mousedown', handleOutside)
+  }, [open])
+
+  return (
+    <div
+      ref={rootRef}
+      className="relative flex min-w-[140px] items-center gap-2 rounded-2xl bg-black/35 px-3 py-1.5 text-xs text-white/50"
+    >
+      <Icon className={`h-3.5 w-3.5 flex-shrink-0 ${iconClassName}`} />
+      <button
+        type="button"
+        onClick={() => setOpen((prev) => !prev)}
+        className="flex min-w-0 flex-1 items-center justify-between gap-1 bg-transparent text-left text-sm font-medium text-white outline-none"
+        aria-haspopup="listbox"
+        aria-expanded={open}
+      >
+        <span className="truncate">{displayLabel}</span>
+        <ChevronDown
+          className={`h-3.5 w-3.5 flex-shrink-0 text-white/35 transition-transform ${open ? 'rotate-180' : ''}`}
+        />
+      </button>
+
+      <AnimatePresence>
+        {open && (
+          <motion.ul
+            initial={{ opacity: 0, y: -6, scale: 0.98 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: -6, scale: 0.98 }}
+            transition={{ type: 'spring', stiffness: 420, damping: 32 }}
+            className="absolute left-0 right-0 top-[calc(100%+6px)] z-40 max-h-52 min-w-[180px] overflow-y-auto rounded-2xl border border-white/10 bg-zinc-900/95 py-1 shadow-xl backdrop-blur-xl"
+            role="listbox"
+          >
+            <li
+              role="option"
+              aria-selected={value === 'all'}
+              className={`cursor-pointer px-3 py-2 text-sm transition hover:bg-white/10 ${
+                value === 'all' ? 'text-emerald-300' : 'text-white/40'
+              }`}
+              onClick={() => {
+                onSelect('all')
+                setOpen(false)
+              }}
+            >
+              {allLabel}
+            </li>
+            {options.map((option) => {
+              const selected = option === value
+              return (
+                <li
+                  key={option}
+                  role="option"
+                  aria-selected={selected}
+                  className={`group flex items-center justify-between gap-2 px-3 py-2 text-sm transition hover:bg-white/10 ${
+                    selected ? 'text-emerald-300' : 'text-white/85'
+                  }`}
+                  onClick={() => {
+                    onSelect(option)
+                    setOpen(false)
+                  }}
+                >
+                  <span className="min-w-0 truncate">{option}</span>
+                  <button
+                    type="button"
+                    title={`删除「${option}」选项`}
+                    aria-label={`删除 ${option}`}
+                    onClick={(e) => onDelete(option, e)}
+                    className="inline-flex h-6 w-6 flex-shrink-0 items-center justify-center rounded-md text-white/35 opacity-70 transition hover:bg-rose-500/20 hover:text-rose-300 group-hover:opacity-100"
+                  >
+                    <X className="h-3.5 w-3.5" strokeWidth={2.25} />
+                  </button>
+                </li>
+              )
+            })}
+            {options.length === 0 && (
+              <li className="px-3 py-2 text-xs text-white/35">暂无可选项</li>
+            )}
+          </motion.ul>
+        )}
+      </AnimatePresence>
+    </div>
+  )
+}
+
 function EmptyStateCard() {
   return (
     <motion.div
@@ -586,102 +1032,296 @@ function EmptyStateCard() {
   )
 }
 
+function FilterEmptyState({ onReset }: { onReset: () => void }) {
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 12 }}
+      animate={{ opacity: 1, y: 0 }}
+      className="flex max-w-lg flex-col items-center gap-4 rounded-3xl border border-dashed border-amber-400/25 bg-gradient-to-br from-amber-500/10 via-white/[0.02] to-transparent p-10 text-center"
+    >
+      <div className="flex h-16 w-16 items-center justify-center rounded-[24px] bg-gradient-to-br from-amber-400/20 to-emerald-500/15 ring-1 ring-white/10">
+        <Filter className="h-8 w-8 text-amber-300" />
+      </div>
+      <h3 className="text-lg font-semibold text-white/90">该筛选条件下暂无有效测试数据</h3>
+      <p className="text-sm leading-relaxed text-white/40">
+        请调整右上角的全局过滤器（学校 / 班级 / 组别 / 日期区间），或重置后重新查看全量样本。
+      </p>
+      <button
+        type="button"
+        onClick={onReset}
+        className="inline-flex items-center gap-1.5 rounded-full border border-amber-400/35 bg-amber-500/15 px-4 py-2 text-xs font-semibold text-amber-100 transition hover:bg-amber-500/25"
+      >
+        <RotateCcw className="h-3.5 w-3.5" />
+        重置全局过滤器
+      </button>
+    </motion.div>
+  )
+}
+
+function matchesRosterQuery(student: StudentAggregate, query: string): boolean {
+  if (!query) return true
+  const haystack = `${student.studentId} ${student.school} ${student.classGroup}`.toLowerCase()
+  return haystack.includes(query)
+}
+
 function LeftSidebar({
-  rosterGroups,
+  rosterTree,
+  filteredDataset,
   selectedKey,
   onSelect,
 }: {
-  rosterGroups: {
-    groupA: StudentAggregate[]
-    groupB: StudentAggregate[]
-    other: StudentAggregate[]
-  }
+  rosterTree: RosterClassNode[]
+  /** 全局过滤后的唯一数据源（剂量统计与花名册树均由此衍生） */
+  filteredDataset: GlobalTrainingRecord[]
   selectedKey: string | null
   onSelect: (student: StudentAggregate) => void
 }) {
-  const sections: Array<{ id: string; title: string; badge: string; students: StudentAggregate[] }> = [
-    { id: 'GROUP_A', title: 'GROUP_A · 实时反馈', badge: 'A', students: rosterGroups.groupA },
-    { id: 'GROUP_B', title: 'GROUP_B · 延时反馈', badge: 'B', students: rosterGroups.groupB },
-  ]
-  if (rosterGroups.other.length > 0) {
-    sections.push({ id: 'OTHER', title: '未归组', badge: '?', students: rosterGroups.other })
+  const [searchQuery, setSearchQuery] = useState('')
+  const [expandedClasses, setExpandedClasses] = useState<Set<string>>(new Set())
+  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set())
+
+  const normalizedQuery = searchQuery.trim().toLowerCase()
+  const isSearching = normalizedQuery.length > 0
+  const attemptCount = filteredDataset.length
+
+  const filteredTree = useMemo(() => {
+    if (!isSearching) return rosterTree
+    return rosterTree
+      .map((classNode) => {
+        const groups = classNode.groups
+          .map((groupNode) => ({
+            ...groupNode,
+            students: groupNode.students.filter((s) => matchesRosterQuery(s, normalizedQuery)),
+          }))
+          .filter((g) => g.students.length > 0)
+        return {
+          ...classNode,
+          groups,
+          studentCount: groups.reduce((sum, g) => sum + g.students.length, 0),
+        }
+      })
+      .filter((c) => c.studentCount > 0)
+  }, [rosterTree, isSearching, normalizedQuery])
+
+  // 树结构变化时：默认展开首个班级；搜索时自动展开全部命中节点
+  useEffect(() => {
+    if (isSearching) {
+      setExpandedClasses(new Set(filteredTree.map((c) => c.classGroup)))
+      setExpandedGroups(
+        new Set(filteredTree.flatMap((c) => c.groups.map((g) => `${c.classGroup}__${g.group}`))),
+      )
+      return
+    }
+    setExpandedClasses((prev) => {
+      const valid = new Set(rosterTree.map((c) => c.classGroup))
+      const next = new Set([...prev].filter((key) => valid.has(key)))
+      if (next.size === 0 && rosterTree[0]) next.add(rosterTree[0].classGroup)
+      return next
+    })
+    setExpandedGroups((prev) => {
+      const valid = new Set(rosterTree.flatMap((c) => c.groups.map((g) => `${c.classGroup}__${g.group}`)))
+      return new Set([...prev].filter((key) => valid.has(key)))
+    })
+  }, [rosterTree, filteredTree, isSearching])
+
+  // 选中被试所属班级/组别自动展开，便于回看定位
+  useEffect(() => {
+    if (!selectedKey) return
+    for (const classNode of rosterTree) {
+      for (const groupNode of classNode.groups) {
+        if (groupNode.students.some((s) => s.key === selectedKey)) {
+          setExpandedClasses((prev) => new Set(prev).add(classNode.classGroup))
+          setExpandedGroups((prev) => new Set(prev).add(`${classNode.classGroup}__${groupNode.group}`))
+          return
+        }
+      }
+    }
+  }, [selectedKey, rosterTree])
+
+  const total = filteredTree.reduce((sum, c) => sum + c.studentCount, 0)
+
+  function toggleClass(classGroup: string) {
+    if (isSearching) return
+    setExpandedClasses((prev) => {
+      const next = new Set(prev)
+      if (next.has(classGroup)) next.delete(classGroup)
+      else next.add(classGroup)
+      return next
+    })
   }
 
-  const total =
-    rosterGroups.groupA.length + rosterGroups.groupB.length + rosterGroups.other.length
+  function toggleGroup(classGroup: string, group: ExperimentGroupId) {
+    if (isSearching) return
+    const key = `${classGroup}__${group}`
+    setExpandedGroups((prev) => {
+      const next = new Set(prev)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return next
+    })
+  }
 
   return (
-    <div className="flex flex-col gap-4">
+    <div className="花名册列表 flex flex-col gap-3">
       <div className="flex items-center justify-between">
         <h3 className="flex items-center gap-2 text-sm font-semibold text-white/85">
           <Users className="h-4 w-4 text-emerald-300" />
           花名册 · 剂量监控
         </h3>
-        <span className="rounded-full bg-black/30 px-2 py-0.5 text-[10px] text-white/40">{total} 人</span>
+        <span className="rounded-full bg-black/30 px-2 py-0.5 text-[10px] text-white/40">
+          {total} 人 · {attemptCount} 次
+        </span>
       </div>
+
+      <label className="flex items-center gap-2 rounded-xl border border-white/10 bg-black/30 px-2.5 py-2">
+        <Search className="h-3.5 w-3.5 flex-shrink-0 text-white/35" />
+        <input
+          type="search"
+          value={searchQuery}
+          onChange={(e) => setSearchQuery(e.target.value)}
+          placeholder="搜索学号 / 姓名 / 班级…"
+          className="min-w-0 flex-1 bg-transparent text-xs text-white/85 outline-none placeholder:text-white/30"
+        />
+      </label>
 
       {total === 0 ? (
         <p className="rounded-2xl border border-dashed border-white/10 bg-black/20 px-3 py-8 text-center text-xs text-white/35">
-          当前筛选条件下暂无被试
+          {isSearching ? '未找到匹配的学号或班级' : '当前筛选条件下暂无被试'}
         </p>
       ) : (
-        sections.map((section) =>
-          section.students.length === 0 ? null : (
-            <div key={section.id} className="flex flex-col gap-2">
-              <div className="flex items-center gap-2 px-1">
-                <span
-                  className={`flex h-5 w-5 items-center justify-center rounded-md text-[10px] font-bold ${
-                    section.id === 'GROUP_A'
-                      ? 'bg-sky-500/20 text-sky-300'
-                      : section.id === 'GROUP_B'
-                        ? 'bg-teal-500/20 text-teal-300'
-                        : 'bg-white/10 text-white/50'
-                  }`}
+        <div className="flex flex-col gap-1.5">
+          {filteredTree.map((classNode) => {
+            const classOpen = expandedClasses.has(classNode.classGroup)
+            return (
+              <div
+                key={classNode.classGroup}
+                className="overflow-hidden rounded-xl border border-white/8 bg-black/20"
+              >
+                <button
+                  type="button"
+                  onClick={() => toggleClass(classNode.classGroup)}
+                  className="flex w-full items-center gap-2 px-2.5 py-2.5 text-left transition hover:bg-white/5"
                 >
-                  {section.badge}
-                </span>
-                <p className="text-[11px] font-semibold tracking-wide text-white/45">{section.title}</p>
-                <span className="text-[10px] text-white/25">{section.students.length}</span>
-              </div>
-              <div className="flex flex-col gap-1.5">
-                {section.students.map((student) => {
-                  const dose = student.records.length
-                  const underdosed = dose < DOSE_WARNING_THRESHOLD
-                  const isActive = student.key === selectedKey
-                  return (
-                    <button
-                      key={student.key}
-                      type="button"
-                      onClick={() => onSelect(student)}
-                      className={`flex items-center justify-between rounded-xl border px-3 py-2.5 text-left transition ${
-                        isActive
-                          ? 'border-emerald-400/45 bg-emerald-400/15 text-white shadow-[0_0_20px_rgba(16,185,129,0.12)]'
-                          : 'border-white/5 bg-black/25 text-white/65 hover:border-white/15 hover:bg-white/8'
-                      }`}
+                  {classOpen ? (
+                    <ChevronDown className="h-3.5 w-3.5 flex-shrink-0 text-emerald-300/80" />
+                  ) : (
+                    <ChevronRight className="h-3.5 w-3.5 flex-shrink-0 text-white/35" />
+                  )}
+                  <span className="min-w-0 flex-1 truncate text-sm font-semibold text-white/85">
+                    {classNode.classGroup}
+                  </span>
+                  <span className="flex-shrink-0 rounded-md bg-white/8 px-1.5 py-0.5 text-[10px] tabular-nums text-white/40">
+                    {classNode.studentCount}人
+                  </span>
+                </button>
+
+                <AnimatePresence initial={false}>
+                  {classOpen && (
+                    <motion.div
+                      initial={{ height: 0, opacity: 0 }}
+                      animate={{ height: 'auto', opacity: 1 }}
+                      exit={{ height: 0, opacity: 0 }}
+                      transition={{ duration: 0.18 }}
+                      className="overflow-hidden border-t border-white/5"
                     >
-                      <span className="min-w-0">
-                        <span className="block truncate text-sm font-medium">{student.studentId}</span>
-                        <span className="block truncate text-[10px] text-white/30">
-                          {student.school} · {student.classGroup}
-                        </span>
-                      </span>
-                      <span
-                        className={`ml-2 flex-shrink-0 rounded-md px-1.5 py-0.5 text-[10px] font-bold tabular-nums ${
-                          underdosed
-                            ? 'bg-rose-500/90 text-white shadow-[0_0_10px_rgba(239,68,68,0.35)]'
-                            : 'bg-emerald-500/20 text-emerald-300 ring-1 ring-emerald-400/30'
-                        }`}
-                        title={underdosed ? `已练 ${dose} 次，未达 10 次剂量` : `已练 ${dose} 次`}
-                      >
-                        {dose}次
-                      </span>
-                    </button>
-                  )
-                })}
+                      <div className="flex flex-col gap-1 p-1.5">
+                        {classNode.groups.map((groupNode) => {
+                          const groupKey = `${classNode.classGroup}__${groupNode.group}`
+                          const groupOpen = expandedGroups.has(groupKey)
+                          return (
+                            <div key={groupKey} className="rounded-lg bg-white/[0.02]">
+                              <button
+                                type="button"
+                                onClick={() => toggleGroup(classNode.classGroup, groupNode.group)}
+                                className="flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left transition hover:bg-white/5"
+                              >
+                                {groupOpen ? (
+                                  <ChevronDown className="h-3 w-3 flex-shrink-0 text-white/40" />
+                                ) : (
+                                  <ChevronRight className="h-3 w-3 flex-shrink-0 text-white/25" />
+                                )}
+                                <span
+                                  className={`flex h-5 w-5 items-center justify-center rounded-md text-[10px] font-bold ${
+                                    groupNode.group === 'GROUP_A'
+                                      ? 'bg-sky-500/20 text-sky-300'
+                                      : groupNode.group === 'GROUP_B'
+                                        ? 'bg-teal-500/20 text-teal-300'
+                                        : 'bg-white/10 text-white/50'
+                                  }`}
+                                >
+                                  {groupNode.badge}
+                                </span>
+                                <span className="min-w-0 flex-1 truncate text-[11px] font-medium text-white/55">
+                                  {groupNode.label}
+                                </span>
+                                <span className="text-[10px] text-white/25">{groupNode.students.length}</span>
+                              </button>
+
+                              <AnimatePresence initial={false}>
+                                {groupOpen && (
+                                  <motion.div
+                                    initial={{ height: 0, opacity: 0 }}
+                                    animate={{ height: 'auto', opacity: 1 }}
+                                    exit={{ height: 0, opacity: 0 }}
+                                    transition={{ duration: 0.16 }}
+                                    className="overflow-hidden"
+                                  >
+                                    <div className="flex flex-col gap-1 px-1.5 pb-1.5">
+                                      {groupNode.students.map((student) => {
+                                        const dose = student.records.length
+                                        const underdosed = dose < DOSE_WARNING_THRESHOLD
+                                        const isActive = student.key === selectedKey
+                                        return (
+                                          <button
+                                            key={student.key}
+                                            type="button"
+                                            onClick={() => onSelect(student)}
+                                            className={`flex items-center justify-between rounded-lg border px-2.5 py-2 text-left transition ${
+                                              isActive
+                                                ? 'border-emerald-400/45 bg-emerald-400/15 text-white shadow-[0_0_20px_rgba(16,185,129,0.12)]'
+                                                : 'border-white/5 bg-black/25 text-white/65 hover:border-white/15 hover:bg-white/8'
+                                            }`}
+                                          >
+                                            <span className="min-w-0">
+                                              <span className="block truncate text-sm font-medium">
+                                                {student.studentId}
+                                              </span>
+                                              <span className="block truncate text-[10px] text-white/30">
+                                                {student.school}
+                                              </span>
+                                            </span>
+                                            <span
+                                              className={`ml-2 flex-shrink-0 rounded-md px-1.5 py-0.5 text-[10px] font-bold tabular-nums ${
+                                                underdosed
+                                                  ? 'bg-rose-500/90 text-white shadow-[0_0_10px_rgba(239,68,68,0.35)]'
+                                                  : 'bg-emerald-500/20 text-emerald-300 ring-1 ring-emerald-400/30'
+                                              }`}
+                                              title={
+                                                underdosed
+                                                  ? `已练 ${dose} 次，未达 10 次剂量`
+                                                  : `已练 ${dose} 次`
+                                              }
+                                            >
+                                              {dose}次
+                                            </span>
+                                          </button>
+                                        )
+                                      })}
+                                    </div>
+                                  </motion.div>
+                                )}
+                              </AnimatePresence>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
               </div>
-            </div>
-          ),
-        )
+            )
+          })}
+        </div>
       )}
     </div>
   )
@@ -689,6 +1329,7 @@ function LeftSidebar({
 
 function MainCanvas({
   selectedStudent,
+  filteredDataset,
   selectedAttemptIndex,
   onSelectAttemptIndex,
   progressHistory,
@@ -696,12 +1337,21 @@ function MainCanvas({
   dataEpoch,
 }: {
   selectedStudent: StudentAggregate | null
+  /** 全局过滤后的唯一数据源；进度图与雷达仅消费其子集 */
+  filteredDataset: GlobalTrainingRecord[]
   selectedAttemptIndex: number
   onSelectAttemptIndex: (index: number) => void
   progressHistory: ProgressHistoryPoint[] | null
   radarScores: GlobalTrainingRecord['quantified5dScores']
   dataEpoch: number
 }) {
+  // 强制联动：个人图谱只展示落在 filteredDataset 内的尝试
+  const scopedRecords = useMemo(() => {
+    if (!selectedStudent) return [] as GlobalTrainingRecord[]
+    const allow = new Set(filteredDataset.map((r) => r.id))
+    return selectedStudent.records.filter((r) => allow.has(r.id))
+  }, [selectedStudent, filteredDataset])
+
   if (!selectedStudent) {
     return (
       <div className="flex h-full min-h-[420px] flex-col items-center justify-center gap-5 px-6 text-center">
@@ -721,11 +1371,15 @@ function MainCanvas({
     )
   }
 
-  const latest = selectedStudent.records[selectedStudent.records.length - 1]
+  const latest = scopedRecords[scopedRecords.length - 1]
   const latestScore = latest?.score ?? '--'
+  const clampedIndex =
+    scopedRecords.length > 0
+      ? Math.min(Math.max(0, selectedAttemptIndex), scopedRecords.length - 1)
+      : 0
 
   return (
-    <div className="flex flex-col gap-5">
+    <div className="flex flex-col gap-5 pb-10">
       <section className="rounded-2xl border border-white/8 bg-white/[0.03] p-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-center gap-3">
@@ -741,7 +1395,7 @@ function MainCanvas({
             </div>
           </div>
           <p className="text-xs text-white/35">
-            全周期 {selectedStudent.records.length} 次 · Attempt #1 → #{selectedStudent.records.length}
+            筛选内 {scopedRecords.length} 次 · Attempt #1 → #{Math.max(scopedRecords.length, 1)}
           </p>
         </div>
       </section>
@@ -751,16 +1405,19 @@ function MainCanvas({
           <TrendingUp className="h-4 w-4 text-sky-300" />
           个人进步趋势图 · 真实日期 × 科研节点
         </h4>
-        {selectedStudent.records.length === 0 ? (
-          <div className="flex h-56 items-center justify-center rounded-2xl bg-black/20 text-xs text-white/25">
-            暂无尝试数据
+        {scopedRecords.length === 0 ? (
+          <div className="flex h-56 flex-col items-center justify-center gap-2 rounded-2xl border border-dashed border-white/10 bg-black/20 px-4 text-center">
+            <Filter className="h-6 w-6 text-white/25" />
+            <p className="text-xs text-white/35">
+              该筛选条件下暂无有效测试数据，请调整右上角的全局过滤器
+            </p>
           </div>
         ) : (
           <LongitudinalProgressChart
-            key={`chart-${selectedStudent.key}-${dataEpoch}`}
-            records={selectedStudent.records}
+            key={`chart-${selectedStudent.key}-${dataEpoch}-${scopedRecords.length}`}
+            records={scopedRecords}
             historyPoints={progressHistory}
-            selectedIndex={selectedAttemptIndex}
+            selectedIndex={clampedIndex}
             onSelectIndex={onSelectAttemptIndex}
             studentId={selectedStudent.studentId}
           />
@@ -770,12 +1427,12 @@ function MainCanvas({
       <section className="rounded-2xl border border-white/8 bg-white/[0.03] p-4">
         <h4 className="mb-3 flex items-center gap-2 text-sm font-semibold text-white/80">
           <Crosshair className="h-4 w-4 text-emerald-300" />
-          五维生物力学雷达 · Attempt #{selectedAttemptIndex + 1}
+          综合均值能力画像
         </h4>
         <BiomechanicalRadar
-          key={`radar-${selectedStudent.key}-${dataEpoch}-${selectedAttemptIndex}`}
+          key={`radar-${selectedStudent.key}-${dataEpoch}`}
           scores={radarScores}
-          primaryLabel={`Attempt #${selectedAttemptIndex + 1}`}
+          primaryLabel="综合均值"
         />
       </section>
     </div>

@@ -12,9 +12,21 @@ import {
 import { CanvasRenderer } from 'echarts/renderers'
 import type { EChartsType } from 'echarts/core'
 import { Camera, Clapperboard, Loader2, Pause, PenLine, Play, Trash2 } from 'lucide-react'
+import type { JointHighlight } from '../types'
+import JointHighlightOverlay, { pickFocusHighlight } from './JointHighlightOverlay'
 import TelestrationCanvas, { type TelestrationCanvasHandle } from './TelestrationCanvas'
 
+/** 子弹时间：触及错误绝对秒的触发阈值 */
+const BULLET_TIME_THRESHOLD_SEC = 0.1
+/** 子弹时间定格驻留（毫秒）：呼吸圈 + Emoji 展示后继续慢放 */
+const BULLET_TIME_HOLD_MS = 3000
+/** 离开错误窗多远后允许下一轮循环再触发（防止阈值内反复 pause） */
+const BULLET_TIME_REARM_GAP_SEC = 0.5
+
 const API_BASE_URL = 'http://localhost:8000'
+
+/** 实验 A 组干预规程：强制 0.5x，延长错误动作视觉驻留 */
+const INTERVENTION_PLAYBACK_RATE = 0.5
 
 function loadImage(src: string): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
@@ -46,10 +58,12 @@ echarts.use([
   CanvasRenderer,
 ])
 
-/** 单帧角速度采样：frame_index 与视频 30fps 时间轴一一对应 */
+/** 单帧角速度采样：优先用 absolute_timestamp（秒）与视频 currentTime 对齐 */
 export interface SyncVelocityPoint {
   frame_index: number
   omega: number
+  /** 原视频绝对秒；缺省时由 (seriesFrameOffset + frame_index) / fps 推导 */
+  absolute_timestamp?: number
 }
 
 /** 五段动作切片（图表 markArea 色块） */
@@ -66,6 +80,11 @@ export interface SynchronizedVideoWorkspaceProps {
   videoSrc?: string | null
   /** 摆动腿小腿角速度时序（deg/s）；窗口模式下 frame_index 为 0..N-1 */
   velocitySeries?: SyncVelocityPoint[] | null
+  /**
+   * 后端返回的 Action ROI 绝对秒数组，与 velocitySeries 等长。
+   * ECharts X 轴绑定此数组；点击 `params.dataIndex` → video.currentTime。
+   */
+  absoluteTimestamps?: number[] | null
   /** 触球锁帧索引（绝对帧）；缺省时取 |ω| 峰值帧 */
   tImpact?: number | null
   /**
@@ -75,14 +94,15 @@ export interface SynchronizedVideoWorkspaceProps {
   impactIndexInWindow?: number | null
   /**
    * velocitySeries[0] 对应的绝对视频帧号 = action_roi.start。
-   * 窗口模式（0..60）下：absolute_frame = seriesFrameOffset + localIndex；
-   * currentTime = absolute_frame / 30.0。切勿用局部 x_index 直接跳视频。
+   * 仅在缺少 absoluteTimestamps 时作为回退：currentTime = (offset + i) / fps。
    */
   seriesFrameOffset?: number
   /** 自定义阶段切片；缺省时按 t_impact 自动切分五段 */
   phases?: ActionPhaseSlice[] | null
-  /** 视频帧率，默认 30（currentTime = absoluteFrame / fps） */
+  /** 视频帧率，默认 30（无 absoluteTimestamps 时的回退换算） */
   fps?: number
+  /** 点击波形跳转后，若视频暂停则自动 play（默认 true） */
+  autoPlayOnSeek?: boolean
   /** 视频视口内叠层（实时推理帧 / HUD） */
   children?: ReactNode
   overlay?: ReactNode
@@ -107,6 +127,11 @@ export interface SynchronizedVideoWorkspaceProps {
   /** 学号（可选），用于后端归档命名 */
   studentNumber?: string | null
   onTelestrationSaved?: (ok: boolean, message: string) => void
+  /**
+   * 具身隐喻：后端 scoreDetail.joint_highlights（T0 关节像素/归一化坐标 + 红绿灯）。
+   * 在诊断帧附近或暂停回放时由透明 Canvas 叠层渲染。
+   */
+  jointHighlights?: JointHighlight[] | null
 }
 
 const DEFAULT_FPS = 30
@@ -168,8 +193,27 @@ export function buildDefaultPhases(frameCount: number, tImpact: number): ActionP
   ]
 }
 
-function sanitizeSeries(raw: SyncVelocityPoint[] | null | undefined): SyncVelocityPoint[] {
+function sanitizeTimestamps(raw: number[] | null | undefined, length: number): number[] {
+  if (!Array.isArray(raw) || length <= 0) return []
+  const out: number[] = []
+  for (let i = 0; i < length; i += 1) {
+    const v = Number(raw[i])
+    if (!Number.isFinite(v)) return []
+    out.push(v)
+  }
+  return out.length === length ? out : []
+}
+
+function sanitizeSeries(
+  raw: SyncVelocityPoint[] | null | undefined,
+  absoluteTimestamps?: number[] | null,
+  seriesFrameOffset = 0,
+  fps = DEFAULT_FPS,
+): SyncVelocityPoint[] {
   if (!Array.isArray(raw) || raw.length === 0) return []
+  const externalTs = sanitizeTimestamps(absoluteTimestamps, raw.length)
+  const rate = fps > 0 ? fps : DEFAULT_FPS
+  const offset = Number.isFinite(seriesFrameOffset) ? Math.max(0, Math.round(seriesFrameOffset)) : 0
   const out: SyncVelocityPoint[] = []
   for (let i = 0; i < raw.length; i += 1) {
     const row = raw[i]
@@ -179,10 +223,44 @@ function sanitizeSeries(raw: SyncVelocityPoint[] | null | undefined): SyncVeloci
         ? Math.max(0, Math.round(row.frame_index))
         : i
     const omega = Number(row.omega)
-    out.push({ frame_index: frame, omega: Number.isFinite(omega) ? omega : 0 })
+    const fromPoint = Number(row.absolute_timestamp)
+    const fromArray = externalTs[i]
+    const absolute_timestamp = Number.isFinite(fromPoint)
+      ? fromPoint
+      : Number.isFinite(fromArray)
+        ? fromArray
+        : (offset + frame) / rate
+    out.push({
+      frame_index: frame,
+      omega: Number.isFinite(omega) ? omega : 0,
+      absolute_timestamp,
+    })
   }
   out.sort((a, b) => a.frame_index - b.frame_index)
   return out
+}
+
+/** 将 video.currentTime 映射到最近的波形点 dataIndex；越界返回 null */
+function nearestDataIndexByTime(
+  series: SyncVelocityPoint[],
+  currentTimeSec: number,
+): number | null {
+  if (!series.length || !Number.isFinite(currentTimeSec)) return null
+  const first = series[0].absolute_timestamp ?? 0
+  const last = series[series.length - 1].absolute_timestamp ?? first
+  if (currentTimeSec < first - 1e-3 || currentTimeSec > last + 1e-3) return null
+  let bestIdx = 0
+  let bestDist = Infinity
+  for (let i = 0; i < series.length; i += 1) {
+    const t = series[i].absolute_timestamp
+    if (typeof t !== 'number' || !Number.isFinite(t)) continue
+    const dist = Math.abs(t - currentTimeSec)
+    if (dist < bestDist) {
+      bestDist = dist
+      bestIdx = i
+    }
+  }
+  return bestIdx
 }
 
 function resolveTImpact(series: SyncVelocityPoint[], tImpact: number | null | undefined): number {
@@ -200,18 +278,20 @@ function resolveTImpact(series: SyncVelocityPoint[], tImpact: number | null | un
 
 /**
  * Kinovea 风格：视频 ↔ ECharts 角速度时序毫秒级双向联动工作区。
- * - 波形图下方五段动作色块 + t_impact 红色锚线
- * - 图表 highlight/click → video.currentTime = frame_index / fps
- * - video timeupdate → 游标随播放平滑右移
+ * - X 轴绑定后端 absolute_timestamps（原视频绝对秒）
+ * - 图表 click → video.currentTime = absolute_timestamps[dataIndex]
+ * - video timeupdate → 按绝对秒就近对齐游标
  */
 export default function SynchronizedVideoWorkspace({
   videoSrc = null,
   velocitySeries = null,
+  absoluteTimestamps = null,
   tImpact = null,
   impactIndexInWindow = null,
   seriesFrameOffset = 0,
   phases = null,
   fps = DEFAULT_FPS,
+  autoPlayOnSeek = true,
   children,
   overlay,
   preferLiveOverlay = false,
@@ -223,6 +303,7 @@ export default function SynchronizedVideoWorkspace({
   attemptId = null,
   studentNumber = null,
   onTelestrationSaved,
+  jointHighlights = null,
 }: SynchronizedVideoWorkspaceProps) {
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const stageRef = useRef<HTMLDivElement | null>(null)
@@ -234,32 +315,59 @@ export default function SynchronizedVideoWorkspace({
   const seriesRef = useRef<SyncVelocityPoint[]>([])
   const fpsRef = useRef(DEFAULT_FPS)
   const offsetRef = useRef(0)
+  const autoPlayOnSeekRef = useRef(autoPlayOnSeek)
+  /** 子弹时间：本轮循环内是否已对错误点 pause 过（防阈值内无限暂停卡死） */
+  const hasPausedForErrorRef = useRef(false)
+  const bulletTimeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const bulletFreezeActiveRef = useRef(false)
+  const focusHighlightRef = useRef<JointHighlight | null>(null)
+  const showNativeVideoRef = useRef(false)
+
+  /** React 无法用 HTML 属性设倍速；在 metadata/canplay 等时机强制劫持 */
+  const forceInterventionPlaybackRate = () => {
+    const video = videoRef.current
+    if (!video) return
+    video.playbackRate = INTERVENTION_PLAYBACK_RATE
+    video.defaultPlaybackRate = INTERVENTION_PLAYBACK_RATE
+  }
 
   const [isPlaying, setIsPlaying] = useState(false)
   const [playheadFrame, setPlayheadFrame] = useState(0)
-  /** 游标仅在 Action ROI 窗口内（0~60）显示；越界隐藏 */
+  /** 游标仅在 Action ROI 时间窗内显示；越界隐藏 */
   const [playheadVisible, setPlayheadVisible] = useState(true)
   const playheadVisibleRef = useRef(true)
+  /** 子弹时间定格中：驱动 Canvas 呼吸圈 + Emoji */
+  const [bulletFreezeActive, setBulletFreezeActive] = useState(false)
   const [seekBadge, setSeekBadge] = useState<string | null>(null)
   const [penActive, setPenActive] = useState(false)
   const [isSavingAnnotation, setIsSavingAnnotation] = useState(false)
   const [annotationHint, setAnnotationHint] = useState<string | null>(null)
 
-  const series = useMemo(() => sanitizeSeries(velocitySeries), [velocitySeries])
   const safeOffset = Number.isFinite(seriesFrameOffset) ? Math.max(0, Math.round(seriesFrameOffset)) : 0
+  const safeFps = fps > 0 ? fps : DEFAULT_FPS
+  const series = useMemo(
+    () => sanitizeSeries(velocitySeries, absoluteTimestamps, safeOffset, safeFps),
+    [velocitySeries, absoluteTimestamps, safeOffset, safeFps],
+  )
   const impactFrame = useMemo(() => {
     if (typeof impactIndexInWindow === 'number' && Number.isFinite(impactIndexInWindow)) {
-      const maxIdx = series.length > 0 ? series[series.length - 1].frame_index : 0
+      const maxIdx = series.length > 0 ? series.length - 1 : 0
       return Math.max(0, Math.min(maxIdx, Math.round(impactIndexInWindow)))
     }
-    return resolveTImpact(series, tImpact)
+    // resolveTImpact 返回 frame_index；窗口模式下通常等于 dataIndex
+    const resolved = resolveTImpact(series, tImpact)
+    const byFrame = series.findIndex((p) => p.frame_index === resolved)
+    return byFrame >= 0 ? byFrame : resolved
   }, [series, tImpact, impactIndexInWindow])
-  const frameCount = series.length > 0 ? series[series.length - 1].frame_index + 1 : 0
-  const safeFps = fps > 0 ? fps : DEFAULT_FPS
+  const frameCount = series.length
+  const impactTimestamp =
+    series[impactFrame]?.absolute_timestamp ??
+    (safeOffset + impactFrame) / safeFps
 
   seriesRef.current = series
   fpsRef.current = safeFps
   offsetRef.current = safeOffset
+  autoPlayOnSeekRef.current = autoPlayOnSeek
 
   const resolvedPhases = useMemo(() => {
     if (Array.isArray(phases) && phases.length > 0) return phases
@@ -267,34 +375,72 @@ export default function SynchronizedVideoWorkspace({
     return buildDefaultPhases(frameCount, impactFrame)
   }, [phases, frameCount, impactFrame])
 
-  /** localIndex：波形 X 轴 0~60；映射绝对帧后再 seek，绝不用局部索引直接当视频帧 */
-  const seekToLocalFrame = (localIndex: number) => {
+  /** 强制跳转视频到绝对秒；可选自动播放 */
+  const seekToTimestamp = (targetTimestamp: number, opts?: { autoPlay?: boolean }) => {
     const video = videoRef.current
-    const rate = fpsRef.current
-    if (!Number.isFinite(localIndex)) return
-    const clampedLocal = Math.max(0, Math.round(localIndex))
-    // absolute_frame = action_roi.start + x_index
-    const absoluteFrame = clampedLocal + offsetRef.current
+    if (!Number.isFinite(targetTimestamp)) return
+    const nextTime = Math.max(0, targetTimestamp)
     if (video) {
-      video.pause()
-      // 假定 30fps：currentTime = absolute_frame / 30.0
-      const nextTime = absoluteFrame / rate
       if (Number.isFinite(video.duration) && video.duration > 0) {
-        video.currentTime = Math.max(0, Math.min(video.duration, nextTime))
+        video.currentTime = Math.min(video.duration, nextTime)
       } else {
-        video.currentTime = Math.max(0, nextTime)
+        video.currentTime = nextTime
+      }
+      video.playbackRate = INTERVENTION_PLAYBACK_RATE
+      video.defaultPlaybackRate = INTERVENTION_PLAYBACK_RATE
+      const shouldPlay = opts?.autoPlay ?? autoPlayOnSeekRef.current
+      if (shouldPlay && video.paused) {
+        void video.play().catch(() => {
+          /* 自动播放被策略拦截时忽略 */
+        })
       }
     }
-    playheadFrameRef.current = clampedLocal
-    setPlayheadFrame(clampedLocal)
-    playheadVisibleRef.current = true
-    setPlayheadVisible(true)
-    setIsPlaying(false)
+    const idx = nearestDataIndexByTime(seriesRef.current, nextTime)
+    if (idx != null) {
+      playheadFrameRef.current = idx
+      setPlayheadFrame(idx)
+      playheadVisibleRef.current = true
+      setPlayheadVisible(true)
+    }
   }
 
-  /** 外部传入绝对帧 → 转成窗口内 localIndex 再定格 */
+  /** dataIndex → absolute_timestamps[i] → video.currentTime */
+  const seekToDataIndex = (dataIndex: number, opts?: { autoPlay?: boolean }) => {
+    const current = seriesRef.current
+    if (!current.length || !Number.isFinite(dataIndex)) return
+    const idx = Math.max(0, Math.min(current.length - 1, Math.round(dataIndex)))
+    const ts =
+      current[idx]?.absolute_timestamp ??
+      (offsetRef.current + (current[idx]?.frame_index ?? idx)) / fpsRef.current
+    playheadFrameRef.current = idx
+    setPlayheadFrame(idx)
+    playheadVisibleRef.current = true
+    setPlayheadVisible(true)
+    seekToTimestamp(ts, opts)
+  }
+
+  /** 兼容旧调用：localIndex 视为 dataIndex */
+  const seekToLocalFrame = (localIndex: number) => {
+    seekToDataIndex(localIndex, { autoPlay: false })
+    setIsPlaying(false)
+    videoRef.current?.pause()
+  }
+
+  /** 外部传入绝对帧 → 绝对秒再 seek */
   const seekToAbsoluteFrame = (absoluteFrame: number) => {
-    seekToLocalFrame(Math.round(absoluteFrame) - offsetRef.current)
+    const rate = fpsRef.current
+    const abs = Math.round(absoluteFrame)
+    // 优先在序列中找匹配帧，否则用 fps 换算
+    const hit = seriesRef.current.findIndex(
+      (p) => p.frame_index + offsetRef.current === abs || p.frame_index === abs,
+    )
+    if (hit >= 0) {
+      seekToDataIndex(hit, { autoPlay: false })
+    } else {
+      seekToTimestamp(abs / rate, { autoPlay: false })
+    }
+    videoRef.current?.pause()
+    setIsPlaying(false)
   }
 
   // MetricCardList → 物理极值帧 Seek；报告完成后定格触球瞬间
@@ -306,49 +452,61 @@ export default function SynchronizedVideoWorkspace({
     }
   }, [externalSeek])
 
-  // 报告带回触球索引后，自动把波形游标对齐到射门瞬间（仅在索引就绪时触发）
+  // 报告带回触球索引后，对齐射门瞬间并以 0.5x 自动循环（A 组干预驻留）
   useEffect(() => {
     if (series.length < 2) return
     if (typeof impactIndexInWindow === 'number' && Number.isFinite(impactIndexInWindow)) {
-      seekToLocalFrame(impactIndexInWindow)
+      seekToDataIndex(impactIndexInWindow, { autoPlay: true })
+      setIsPlaying(true)
       setSeekBadge(`射门瞬间 · 窗内 #${Math.round(impactIndexInWindow)}`)
       return
     }
     if (typeof tImpact === 'number' && Number.isFinite(tImpact)) {
-      seekToAbsoluteFrame(tImpact)
+      const rate = fpsRef.current
+      const abs = Math.round(tImpact)
+      const hit = seriesRef.current.findIndex(
+        (p) => p.frame_index + offsetRef.current === abs || p.frame_index === abs,
+      )
+      if (hit >= 0) {
+        seekToDataIndex(hit, { autoPlay: true })
+      } else {
+        seekToTimestamp(abs / rate, { autoPlay: true })
+      }
+      setIsPlaying(true)
       setSeekBadge(`射门瞬间 · F#${Math.round(tImpact)}`)
     }
   }, [tImpact, impactIndexInWindow, series.length])
 
-  // 视频 loadeddata：强制 seek 到真正的触球帧（红色虚线），避免停在第 0 帧助跑
+  // 视频 loadeddata：强制 seek 到触球绝对秒（红色虚线），避免停在第 0 帧助跑
   useEffect(() => {
     const video = videoRef.current
     if (!video || !videoSrc) return
 
     const seekImpactOnReady = () => {
-      const rate = fpsRef.current
-      let absolute: number | null = null
-      if (typeof tImpact === 'number' && Number.isFinite(tImpact)) {
-        absolute = Math.round(tImpact)
-      } else if (
+      const current = seriesRef.current
+      let targetTs: number | null = null
+      let badge = '射门瞬间'
+      if (
         typeof impactIndexInWindow === 'number' &&
-        Number.isFinite(impactIndexInWindow)
+        Number.isFinite(impactIndexInWindow) &&
+        current[Math.round(impactIndexInWindow)]
       ) {
-        absolute = Math.round(impactIndexInWindow) + offsetRef.current
+        const idx = Math.round(impactIndexInWindow)
+        targetTs = current[idx].absolute_timestamp ?? null
+        badge = `射门瞬间 · ${targetTs != null ? `${targetTs.toFixed(3)}s` : `窗内 #${idx}`}`
+      } else if (typeof tImpact === 'number' && Number.isFinite(tImpact)) {
+        targetTs = Math.round(tImpact) / fpsRef.current
+        badge = `射门瞬间 · F#${Math.round(tImpact)}`
       }
-      if (absolute == null) return
-      video.pause()
-      const nextTime = absolute / rate
-      if (Number.isFinite(video.duration) && video.duration > 0) {
-        video.currentTime = Math.max(0, Math.min(video.duration, nextTime))
-      } else {
-        video.currentTime = Math.max(0, nextTime)
-      }
-      const local = absolute - offsetRef.current
-      playheadFrameRef.current = local
-      setPlayheadFrame(local)
-      setIsPlaying(false)
-      setSeekBadge(`射门瞬间 · F#${absolute}`)
+      if (targetTs == null || !Number.isFinite(targetTs)) return
+      // A 组干预：对齐触球瞬间后以 0.5x 自动循环，而非定格暂停
+      forceInterventionPlaybackRate()
+      seekToTimestamp(targetTs, { autoPlay: true })
+      void video.play().catch(() => {
+        /* muted + autoPlay 仍可能被策略拦截 */
+      })
+      setIsPlaying(true)
+      setSeekBadge(badge)
     }
 
     if (video.readyState >= 2) {
@@ -358,10 +516,12 @@ export default function SynchronizedVideoWorkspace({
     return () => {
       video.removeEventListener('loadeddata', seekImpactOnReady)
     }
-  }, [videoSrc, tImpact, impactIndexInWindow, safeOffset, safeFps])
+  }, [videoSrc, tImpact, impactIndexInWindow, series])
 
-  const frameFromChartEvent = (params: unknown): number | null => {
+  /** 从 ECharts 事件提取 dataIndex（优先），供 absolute_timestamps 查表 */
+  const dataIndexFromChartEvent = (params: unknown): number | null => {
     const current = seriesRef.current
+    if (!current.length) return null
     const p = params as {
       dataIndex?: number
       data?: unknown
@@ -370,24 +530,23 @@ export default function SynchronizedVideoWorkspace({
     }
     if (Array.isArray(p?.batch) && p.batch.length > 0) {
       const idx = p.batch[0]?.dataIndex
-      if (typeof idx === 'number' && current[idx]) return current[idx].frame_index
+      if (typeof idx === 'number' && current[idx]) return idx
     }
     if (typeof p?.dataIndex === 'number' && current[p.dataIndex]) {
-      return current[p.dataIndex].frame_index
+      return p.dataIndex
     }
+    // 回退：data[0] 为绝对秒时，就近映射 dataIndex
     const data = p?.data
-    if (Array.isArray(data) && typeof data[0] === 'number') return Math.round(data[0])
-    if (data && typeof data === 'object' && 'frame_index' in data) {
-      const fi = Number((data as { frame_index: number }).frame_index)
-      if (Number.isFinite(fi)) return Math.round(fi)
+    if (Array.isArray(data) && typeof data[0] === 'number') {
+      return nearestDataIndexByTime(current, data[0])
     }
     if (typeof p?.value === 'number' && Number.isFinite(p.value)) {
-      return Math.round(p.value)
+      return nearestDataIndexByTime(current, p.value)
     }
     return null
   }
 
-  // 初始化 / 销毁 ECharts 实例（事件经 ref 读取最新 series / fps）
+  // 初始化 / 销毁 ECharts 实例；cleanup 中 off('click') 防止泄漏
   useEffect(() => {
     const host = chartHostRef.current
     if (!host) return
@@ -395,16 +554,19 @@ export default function SynchronizedVideoWorkspace({
     chartRef.current = chart
 
     const onHighlight = (params: unknown) => {
-      const frame = frameFromChartEvent(params)
-      if (frame === null) return
+      const dataIndex = dataIndexFromChartEvent(params)
+      if (dataIndex === null) return
       scrubbingRef.current = true
-      seekToLocalFrame(frame)
+      seekToDataIndex(dataIndex, { autoPlay: false })
+      videoRef.current?.pause()
+      setIsPlaying(false)
     }
     const onClick = (params: unknown) => {
-      const frame = frameFromChartEvent(params)
-      if (frame === null) return
+      const dataIndex = dataIndexFromChartEvent(params)
+      if (dataIndex === null) return
       scrubbingRef.current = true
-      seekToLocalFrame(frame)
+      // 精准穿透：absolute_timestamps[dataIndex] → video.currentTime
+      seekToDataIndex(dataIndex, { autoPlay: autoPlayOnSeekRef.current })
       window.setTimeout(() => {
         scrubbingRef.current = false
       }, 120)
@@ -431,7 +593,12 @@ export default function SynchronizedVideoWorkspace({
       if (!chart.containPixel('grid', pointInPixel)) return
       const pointInGrid = chart.convertFromPixel({ seriesIndex: 0 }, pointInPixel)
       if (!pointInGrid || !Number.isFinite(pointInGrid[0])) return
-      seekToLocalFrame(pointInGrid[0])
+      // X 轴已是绝对秒：就近 dataIndex 后 seek
+      const idx = nearestDataIndexByTime(seriesRef.current, pointInGrid[0])
+      if (idx == null) return
+      seekToDataIndex(idx, { autoPlay: false })
+      videoRef.current?.pause()
+      setIsPlaying(false)
     })
 
     const onResize = () => chart.resize()
@@ -441,6 +608,11 @@ export default function SynchronizedVideoWorkspace({
       window.removeEventListener('resize', onResize)
       chart.off('highlight', onHighlight)
       chart.off('click', onClick)
+      try {
+        chart.getZr().off('globalout', onGlobalOut)
+      } catch {
+        /* dispose 前 zrender 可能已释放 */
+      }
       chart.dispose()
       chartRef.current = null
     }
@@ -448,7 +620,7 @@ export default function SynchronizedVideoWorkspace({
   }, [])
 
   const impactMarkLine = {
-    xAxis: impactFrame,
+    xAxis: impactTimestamp,
     label: {
       formatter: '触球瞬间 (t_impact)',
       position: 'insideEndTop' as const,
@@ -484,10 +656,14 @@ export default function SynchronizedVideoWorkspace({
       return
     }
 
+    const timeAt = (idx: number) =>
+      series[Math.max(0, Math.min(series.length - 1, Math.round(idx)))]?.absolute_timestamp ??
+      (safeOffset + idx) / safeFps
+
     const markAreaData = resolvedPhases.map((phase) => [
       {
         name: phase.label,
-        xAxis: phase.startFrame,
+        xAxis: timeAt(phase.startFrame),
         itemStyle: { color: phase.color },
         label: {
           show: true,
@@ -497,11 +673,13 @@ export default function SynchronizedVideoWorkspace({
           formatter: phase.label,
         },
       },
-      { xAxis: phase.endFrame },
+      { xAxis: timeAt(phase.endFrame) },
     ])
 
-    const xMin = series[0].frame_index
-    const xMax = series[series.length - 1].frame_index
+    const xMin = series[0].absolute_timestamp ?? 0
+    const xMax = series[series.length - 1].absolute_timestamp ?? xMin
+    const playheadTs =
+      series[playheadFrameRef.current]?.absolute_timestamp ?? timeAt(playheadFrameRef.current)
 
     chart.setOption(
       {
@@ -516,19 +694,25 @@ export default function SynchronizedVideoWorkspace({
           textStyle: { color: '#e2e8f0', fontSize: 11 },
           formatter: (items: unknown) => {
             const arr = Array.isArray(items) ? items : [items]
-            const first = arr[0] as { data?: [number, number]; axisValue?: number | string }
-            const frame =
+            const first = arr[0] as {
+              data?: [number, number]
+              dataIndex?: number
+              axisValue?: number | string
+            }
+            const tSec =
               Array.isArray(first?.data) && typeof first.data[0] === 'number'
                 ? first.data[0]
                 : Number(first?.axisValue)
             const omega =
               Array.isArray(first?.data) && typeof first.data[1] === 'number' ? first.data[1] : NaN
-            const absFrame = Number.isFinite(frame) ? Math.round(frame) + safeOffset : NaN
-            const tMs = Number.isFinite(absFrame) ? Math.round((absFrame / safeFps) * 1000) : '—'
+            const di =
+              typeof first?.dataIndex === 'number' ? first.dataIndex : nearestDataIndexByTime(series, tSec)
+            const localIdx = di != null ? di : '—'
+            const absFrame =
+              typeof di === 'number' ? Math.round(safeOffset + (series[di]?.frame_index ?? di)) : '—'
             const omegaText = Number.isFinite(omega) ? `${omega.toFixed(1)} deg/s` : '—'
-            return `Frame ${Number.isFinite(frame) ? frame : '—'} · abs #${
-              Number.isFinite(absFrame) ? absFrame : '—'
-            } · ${tMs} ms<br/>ω = ${omegaText}`
+            const tText = Number.isFinite(tSec) ? `${tSec.toFixed(3)} s` : '—'
+            return `t = ${tText} · idx #${localIdx} · abs F#${absFrame}<br/>ω = ${omegaText}`
           },
         },
         axisPointer: {
@@ -537,11 +721,15 @@ export default function SynchronizedVideoWorkspace({
         },
         xAxis: {
           type: 'value',
-          name: 'frame',
+          name: 't (s)',
           nameTextStyle: { color: 'rgba(148,163,184,0.45)', fontSize: 10 },
           min: xMin,
           max: xMax,
-          axisLabel: { color: 'rgba(148,163,184,0.45)', fontSize: 10 },
+          axisLabel: {
+            color: 'rgba(148,163,184,0.45)',
+            fontSize: 10,
+            formatter: (v: number) => (Number.isFinite(v) ? v.toFixed(2) : ''),
+          },
           splitLine: { show: false },
           axisLine: { lineStyle: { color: 'rgba(51,65,85,0.9)' } },
         },
@@ -590,7 +778,8 @@ export default function SynchronizedVideoWorkspace({
               },
             },
             emphasis: { focus: 'series' },
-            data: series.map((p) => [p.frame_index, p.omega]),
+            // X = absolute_timestamps（秒），与 video.currentTime 同源
+            data: series.map((p) => [p.absolute_timestamp ?? 0, p.omega]),
             markArea: {
               silent: true,
               data: markAreaData,
@@ -601,7 +790,7 @@ export default function SynchronizedVideoWorkspace({
               data: [
                 impactMarkLine,
                 {
-                  xAxis: playheadFrameRef.current,
+                  xAxis: playheadTs,
                   label: { show: false },
                   lineStyle: {
                     color: 'rgba(125,211,252,0.95)',
@@ -616,17 +805,20 @@ export default function SynchronizedVideoWorkspace({
       },
       { notMerge: true },
     )
-  }, [series, resolvedPhases, impactFrame, safeFps, safeOffset])
+  }, [series, resolvedPhases, impactFrame, impactTimestamp, safeFps, safeOffset])
 
   // 播放游标：仅更新 markLine，避免整表重绘；越界时只保留触球锚线
   useEffect(() => {
     const chart = chartRef.current
     if (!chart || series.length < 2) return
+    const playheadTs =
+      series[playheadFrame]?.absolute_timestamp ??
+      (safeOffset + playheadFrame) / safeFps
     const markData = playheadVisible
       ? [
           impactMarkLine,
           {
-            xAxis: playheadFrame,
+            xAxis: playheadTs,
             label: { show: false },
             lineStyle: {
               color: 'rgba(125,211,252,0.95)',
@@ -646,52 +838,153 @@ export default function SynchronizedVideoWorkspace({
         },
       ],
     })
-  }, [playheadFrame, playheadVisible, impactFrame, series.length])
+  }, [playheadFrame, playheadVisible, impactTimestamp, series, safeOffset, safeFps])
 
-  // 视频 → 图表：timeupdate 驱动游标
-  // x_index = floor(currentTime * 30) - action_roi.start；越出 0~60 则隐藏高亮游标
+  const showNativeVideo = Boolean(videoSrc) && !preferLiveOverlay
+  const focusHighlight = useMemo(
+    () => pickFocusHighlight(jointHighlights),
+    [jointHighlights],
+  )
+  showNativeVideoRef.current = showNativeVideo
+  focusHighlightRef.current = focusHighlight
+  bulletFreezeActiveRef.current = bulletFreezeActive
+
+  const clearBulletTimeTimer = () => {
+    if (bulletTimeTimerRef.current != null) {
+      clearTimeout(bulletTimeTimerRef.current)
+      bulletTimeTimerRef.current = null
+    }
+  }
+
+  const resetBulletTimeCycle = () => {
+    clearBulletTimeTimer()
+    hasPausedForErrorRef.current = false
+    bulletFreezeActiveRef.current = false
+    setBulletFreezeActive(false)
+  }
+
+  // 视频源 / 焦点错误切换：重置子弹时间闩锁，避免沿用上一轮 hasPausedForError
+  useEffect(() => {
+    resetBulletTimeCycle()
+    return () => {
+      clearBulletTimeTimer()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- 仅在源/焦点时刻变化时重置
+  }, [videoSrc, focusHighlight?.error_timestamp_sec, focusHighlight?.joint_name])
+
+  // 切回录制/实时推理：立刻清画布并解除定格
+  useEffect(() => {
+    if (!showNativeVideo) {
+      resetBulletTimeCycle()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showNativeVideo])
+
+  // 视频 → 图表游标 + 具身隐喻「子弹时间」定格
   useEffect(() => {
     const video = videoRef.current
     if (!video) return
 
     const onTimeUpdate = () => {
       if (scrubbingRef.current) return
-      const xIndex = Math.floor(video.currentTime * safeFps) - safeOffset
-      const maxLocal =
-        seriesRef.current.length > 0
-          ? seriesRef.current[seriesRef.current.length - 1].frame_index
-          : 60
-      if (xIndex < 0 || xIndex > maxLocal) {
+      const currentTime = video.currentTime
+
+      // —— 波形游标同步 ——
+      const idx = nearestDataIndexByTime(seriesRef.current, currentTime)
+      if (idx == null) {
         if (playheadVisibleRef.current) {
           playheadVisibleRef.current = false
           setPlayheadVisible(false)
         }
-        return
+      } else {
+        if (!playheadVisibleRef.current) {
+          playheadVisibleRef.current = true
+          setPlayheadVisible(true)
+        }
+        if (idx !== playheadFrameRef.current) {
+          playheadFrameRef.current = idx
+          setPlayheadFrame(idx)
+        }
       }
-      if (!playheadVisibleRef.current) {
-        playheadVisibleRef.current = true
-        setPlayheadVisible(true)
+
+      // —— 子弹时间：触及 error_timestamp_sec 则一次性 pause + 渲染 ——
+      if (!showNativeVideoRef.current) return
+      const focus = focusHighlightRef.current
+      if (!focus) return
+      const errorTs = focus.error_timestamp_sec
+      if (typeof errorTs !== 'number' || !Number.isFinite(errorTs)) return
+
+      // 循环回到错误点之前：重新武装，允许下一轮定格
+      if (
+        hasPausedForErrorRef.current &&
+        !bulletFreezeActiveRef.current &&
+        currentTime < errorTs - BULLET_TIME_REARM_GAP_SEC
+      ) {
+        hasPausedForErrorRef.current = false
       }
-      if (xIndex !== playheadFrameRef.current) {
-        playheadFrameRef.current = xIndex
-        setPlayheadFrame(xIndex)
+
+      if (hasPausedForErrorRef.current) return
+      if (Math.abs(currentTime - errorTs) >= BULLET_TIME_THRESHOLD_SEC) return
+
+      hasPausedForErrorRef.current = true
+      try {
+        // 钉死在临床错误绝对秒，避免 timeupdate 抖动偏帧
+        if (Math.abs(video.currentTime - errorTs) > 0.02) {
+          video.currentTime = errorTs
+        }
+      } catch {
+        /* seek 中途忽略 */
       }
+      video.pause()
+      setIsPlaying(false)
+      setBulletFreezeActive(true)
+      setSeekBadge('子弹时间 · 错误定格')
+
+      clearBulletTimeTimer()
+      bulletTimeTimerRef.current = setTimeout(() => {
+        bulletTimeTimerRef.current = null
+        setBulletFreezeActive(false)
+        bulletFreezeActiveRef.current = false
+        const v = videoRef.current
+        if (!v || !showNativeVideoRef.current) return
+        forceInterventionPlaybackRate()
+        void v.play().catch(() => undefined)
+        setIsPlaying(true)
+        setSeekBadge(null)
+      }, BULLET_TIME_HOLD_MS)
     }
+
     const onPlay = () => setIsPlaying(true)
     const onPause = () => setIsPlaying(false)
     const onEnded = () => setIsPlaying(false)
+    /** loop 回绕时重新武装子弹时间 */
+    const onSeeked = () => {
+      const focus = focusHighlightRef.current
+      const errorTs = focus?.error_timestamp_sec
+      if (
+        typeof errorTs === 'number' &&
+        Number.isFinite(errorTs) &&
+        !bulletFreezeActiveRef.current &&
+        video.currentTime < errorTs - BULLET_TIME_REARM_GAP_SEC
+      ) {
+        hasPausedForErrorRef.current = false
+      }
+    }
 
     video.addEventListener('timeupdate', onTimeUpdate)
     video.addEventListener('play', onPlay)
     video.addEventListener('pause', onPause)
     video.addEventListener('ended', onEnded)
+    video.addEventListener('seeked', onSeeked)
     return () => {
       video.removeEventListener('timeupdate', onTimeUpdate)
       video.removeEventListener('play', onPlay)
       video.removeEventListener('pause', onPause)
       video.removeEventListener('ended', onEnded)
+      video.removeEventListener('seeked', onSeeked)
+      clearBulletTimeTimer()
     }
-  }, [videoSrc, safeFps, safeOffset])
+  }, [videoSrc, series])
 
   // 图表容器尺寸变化时 resize
   useEffect(() => {
@@ -703,12 +996,22 @@ export default function SynchronizedVideoWorkspace({
     return () => ro.disconnect()
   }, [])
 
-  const showNativeVideo = Boolean(videoSrc) && !preferLiveOverlay
-  const absolutePlayhead = playheadFrame + safeOffset
+  const playheadTimestamp =
+    series[playheadFrame]?.absolute_timestamp ?? (safeOffset + playheadFrame) / safeFps
+  const absolutePlayhead = safeOffset + (series[playheadFrame]?.frame_index ?? playheadFrame)
+  /** 仅在子弹时间定格窗口内渲染 Canvas（3 秒后清空） */
+  const jointHighlightActive = showNativeVideo && bulletFreezeActive && Boolean(focusHighlight)
 
   const togglePlay = () => {
     const video = videoRef.current
     if (!video || !videoSrc) return
+    // 手动播控时取消未完成的子弹时间计时，避免与用户操作打架
+    if (bulletFreezeActive) {
+      clearBulletTimeTimer()
+      setBulletFreezeActive(false)
+      bulletFreezeActiveRef.current = false
+    }
+    forceInterventionPlaybackRate()
     if (video.paused) void video.play()
     else video.pause()
   }
@@ -892,20 +1195,41 @@ export default function SynchronizedVideoWorkspace({
         </header>
 
         <div ref={stageRef} className="relative min-h-0 flex-[1.35] overflow-hidden bg-black/40">
-          {videoSrc && (
-            <video
-              ref={videoRef}
-              src={videoSrc}
-              className={`absolute inset-0 h-full w-full bg-black object-contain ${
-                showNativeVideo ? 'opacity-100' : 'pointer-events-none opacity-0'
-              }`}
-              playsInline
-              preload="auto"
+          {/* 视频 + 具身隐喻 Canvas 叠层：相对定位父容器，Canvas 与视频同尺寸 */}
+          <div className="absolute inset-0">
+            {videoSrc && (
+              <video
+                ref={videoRef}
+                src={videoSrc}
+                className={`absolute inset-0 h-full w-full bg-black object-contain ${
+                  showNativeVideo ? 'opacity-100' : 'pointer-events-none opacity-0'
+                }`}
+                playsInline
+                preload="auto"
+                autoPlay
+                muted
+                loop
+                onLoadedMetadata={forceInterventionPlaybackRate}
+                onCanPlay={forceInterventionPlaybackRate}
+                onPlay={forceInterventionPlaybackRate}
+                onRateChange={() => {
+                  const video = videoRef.current
+                  if (video && video.playbackRate !== INTERVENTION_PLAYBACK_RATE) {
+                    video.playbackRate = INTERVENTION_PLAYBACK_RATE
+                  }
+                }}
+              />
+            )}
+            <JointHighlightOverlay
+              containerRef={stageRef}
+              videoRef={videoRef}
+              highlights={focusHighlight ? [focusHighlight] : null}
+              active={jointHighlightActive}
             />
-          )}
+          </div>
           {/* 实时推理画面：分析中优先；无本地视频源时作为主视口 */}
           {(preferLiveOverlay || !videoSrc) && (
-            <div className="absolute inset-0">{children}</div>
+            <div className="absolute inset-0 z-[1]">{children}</div>
           )}
           {!preferLiveOverlay && !videoSrc && !children && (
             <div className="absolute inset-0 flex items-center justify-center text-xs text-slate-500">
@@ -935,10 +1259,11 @@ export default function SynchronizedVideoWorkspace({
               鞭打发力角速度 (deg/s)
             </p>
             <p className="text-[10px] tabular-nums text-slate-500">
-              Frame {playheadFrame}
-              {safeOffset > 0 ? ` · abs #${absolutePlayhead}` : ''}
+              t={playheadTimestamp.toFixed(3)}s
+              {` · idx #${playheadFrame}`}
+              {safeOffset > 0 ? ` · abs F#${absolutePlayhead}` : ''}
               {typeof impactIndexInWindow === 'number' || typeof tImpact === 'number' || series.length > 0
-                ? ` · 触球 @${impactFrame}`
+                ? ` · 触球 @${impactTimestamp.toFixed(3)}s`
                 : ''}
               {` · ${safeFps} fps`}
             </p>

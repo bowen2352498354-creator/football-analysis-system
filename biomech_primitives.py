@@ -7,7 +7,7 @@ error_diagnoser / pose_tracker 均应委托本模块，禁止再复制 PCR / 3D 
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 import numpy as np
 
@@ -17,7 +17,9 @@ import numpy as np
 STANDARD_BALL_DIAMETER_CM = 21.0
 DEFAULT_EMPIRICAL_PCR = STANDARD_BALL_DIAMETER_CM / 84.0
 AVERAGE_CHILD_HEIGHT_CM = 145.0
-SUPPORT_FOOT_OFFSET_MAX_CM = 60.0
+AVERAGE_CHILD_FOOT_LEN_CM = 22.0  # 基准脚长（cm），熔断降级时用于比例换算
+SUPPORT_FOOT_OFFSET_MAX_CM = 50.0
+SUPPORT_FOOT_LATERAL_FUSE_CM = 45.0  # PCR 横距超过此值时触发 3D 脚长防线熔断
 
 ANKLE_STIFFNESS_LOCKED = "LOCKED"
 ANKLE_STIFFNESS_SLIGHT_DEFORMATION = "SLIGHT_DEFORMATION"
@@ -25,6 +27,12 @@ ANKLE_STIFFNESS_YIELDING = "YIELDING"
 ANKLE_STIFFNESS_LOCKED_MAX_VAR = 2.0
 ANKLE_STIFFNESS_SLIGHT_MAX_VAR = 5.0
 ANKLE_LANDMARK_VISIBILITY_MIN = 0.5
+# 通用关节点置信度门槛（遮挡 / 出框时 MediaPipe 可能回 None 或低 visibility）
+LANDMARK_CONFIDENCE_MIN = 0.5
+# 关节点坐标 EMA 平滑系数（越大越跟随新帧；0.35 兼顾抑抖与响应）
+LANDMARK_EMA_ALPHA = 0.35
+# 突发跳变防护：单帧位移超过该像素阈值时改用上一帧缓存
+LANDMARK_JUMP_MAX_PX = 80.0
 
 # 【Phase 2 / 横距防抖】YOLO 球框：max(w,h) < 10px 严禁参与比例尺
 BALL_BBOX_MIN_DIAMETER_PX = 10.0
@@ -40,14 +48,153 @@ FOLD_ROI_MIN_VALID_FRAMES = 3
 
 
 def _as_vec3(point) -> np.ndarray:
-    arr = np.asarray(point, dtype=np.float64).reshape(-1)
+    if point is None:
+        return np.full(3, np.nan, dtype=np.float64)
+    try:
+        arr = np.asarray(point, dtype=np.float64).reshape(-1)
+    except (TypeError, ValueError):
+        return np.full(3, np.nan, dtype=np.float64)
     if arr.size >= 3:
         return arr[:3].astype(np.float64, copy=False)
     if arr.size == 2:
         return np.array([float(arr[0]), float(arr[1]), 0.0], dtype=np.float64)
     if arr.size == 1:
         return np.array([float(arr[0]), 0.0, 0.0], dtype=np.float64)
-    return np.zeros(3, dtype=np.float64)
+    return np.full(3, np.nan, dtype=np.float64)
+
+
+def is_valid_joint_point(
+    point,
+    visibility: Optional[float] = None,
+    *,
+    min_visibility: float = LANDMARK_CONFIDENCE_MIN,
+) -> bool:
+    """判空防护：关节点存在、坐标有限，且（若提供）置信度 ≥ 门槛。"""
+    if point is None:
+        return False
+    try:
+        vec = _as_vec3(point)
+    except Exception:  # noqa: BLE001
+        return False
+    if not bool(np.all(np.isfinite(vec))):
+        return False
+    if visibility is not None:
+        try:
+            vis = float(visibility)
+        except (TypeError, ValueError):
+            return False
+        if not np.isfinite(vis) or vis < float(min_visibility):
+            return False
+    return True
+
+
+class LandmarkEMASmoother:
+    """关节点坐标滑动窗口指数移动平均（EMA），抑制遮挡恢复时的突发跳变。
+
+    缺失 / 低置信度帧：返回上一帧有效缓存（若无缓存则 None）。
+    单帧跳变超过 ``jump_max_px``：拒绝采纳，继续用缓存。
+    """
+
+    def __init__(
+        self,
+        *,
+        alpha: float = LANDMARK_EMA_ALPHA,
+        jump_max_px: float = LANDMARK_JUMP_MAX_PX,
+        min_visibility: float = LANDMARK_CONFIDENCE_MIN,
+    ) -> None:
+        self.alpha = float(min(1.0, max(1e-3, alpha)))
+        self.jump_max_px = float(max(1.0, jump_max_px))
+        self.min_visibility = float(min_visibility)
+        self._state: dict[str, np.ndarray] = {}
+
+    def reset(self) -> None:
+        self._state.clear()
+
+    def update(
+        self,
+        name: str,
+        point,
+        visibility: Optional[float] = None,
+    ) -> Optional[np.ndarray]:
+        """更新并返回平滑后的 xyz；无效输入时回退上一帧缓存。"""
+        key = str(name)
+        if not is_valid_joint_point(
+            point, visibility, min_visibility=self.min_visibility
+        ):
+            cached = self._state.get(key)
+            return cached.copy() if cached is not None else None
+
+        raw = _as_vec3(point)
+        prev = self._state.get(key)
+        if prev is None:
+            self._state[key] = raw.copy()
+            return raw.copy()
+
+        # 突发跳变：平面位移过大则拒绝本帧，防 TypeError 上游噪声击穿
+        jump = float(np.linalg.norm(raw[:2] - prev[:2]))
+        if np.isfinite(jump) and jump > self.jump_max_px:
+            return prev.copy()
+
+        a = self.alpha
+        smoothed = a * raw + (1.0 - a) * prev
+        self._state[key] = smoothed
+        return smoothed.copy()
+
+    def get(self, name: str) -> Optional[np.ndarray]:
+        cached = self._state.get(str(name))
+        return cached.copy() if cached is not None else None
+
+
+def gap_fill_scalar_series(
+    values: Sequence[Optional[float]],
+    *,
+    max_gap: int = 2,
+) -> list[Optional[float]]:
+    """前后帧运动趋势补帧：单帧/短间隙缺失用线性插值填补，降低漏检率。
+
+    ``max_gap`` 控制最大可补空洞长度（默认 2，对应丢 1~2 帧）。
+    两端无邻域或空洞过长时保持 None，绝不编造长程轨迹。
+    """
+    n = len(values) if values is not None else 0
+    if n == 0:
+        return []
+    out: list[Optional[float]] = []
+    raw: list[Optional[float]] = []
+    for v in values:
+        try:
+            if v is None:
+                raw.append(None)
+            else:
+                fv = float(v)
+                raw.append(fv if np.isfinite(fv) else None)
+        except (TypeError, ValueError):
+            raw.append(None)
+
+    for i in range(n):
+        if raw[i] is not None:
+            out.append(raw[i])
+            continue
+        left = None
+        right = None
+        for j in range(i - 1, -1, -1):
+            if raw[j] is not None:
+                left = j
+                break
+        for j in range(i + 1, n):
+            if raw[j] is not None:
+                right = j
+                break
+        if left is None or right is None:
+            out.append(None)
+            continue
+        gap = right - left
+        if gap > int(max_gap) + 1:
+            out.append(None)
+            continue
+        t = (i - left) / float(right - left)
+        filled = float(raw[left]) + t * (float(raw[right]) - float(raw[left]))
+        out.append(filled)
+    return out
 
 
 def estimate_fallback_pcr(body_h_px: Optional[float] = None) -> float:
@@ -102,15 +249,92 @@ def estimate_body_height_px(
         return None
 
 
-def calculate_3d_joint_angle(p1, p2, p3, *, is_knee_extension: bool = False) -> float:
-    """基于 3D 向量点乘的真实关节夹角（度）；禁止 2D arctan2。
+def calculate_sagittal_angle(p1, p2, p3, *, signed: bool = False) -> float:
+    """矢状面（Y-Z）髋/膝关节屈伸角（度）；atan2 锁定方向，杜绝近 180° 翻转。
 
-    ``is_knee_extension=True``（触球/impact 伸展语境）：矢状面射门若点乘得到
-    ``angle < 130``，视为取成了锐角/半伸展假象，强制补角 ``180 - angle``，
-    使摆动腿膝角落在正常 140°–160° 伸展带而非满屏爆红的 50° 类内角反转。
-    后摆折叠角解算请保持默认 ``False``（需要真实内角极小值）。
+    将三点的 Y（垂直）与 Z（深度）投影到矢状面，以 p2 为顶点用
+    ``atan2(cross, dot)`` 求有符号夹角，避免纯 3D 点乘 ``arccos`` 在直腿
+    附近因 X 轴抖动把钝角翻成锐角/负角。
+
+    ``signed=False``（默认）：返回内角 ``|θ| ∈ [0, 180]``，直腿≈180°，屈曲更小。
+    ``signed=True``：返回 ``θ ∈ (-180, 180]``，符号标记屈伸侧。
+    任一关节点无效 / 投影退化 → 返回 0.0。
     """
     try:
+        if not (
+            is_valid_joint_point(p1)
+            and is_valid_joint_point(p2)
+            and is_valid_joint_point(p3)
+        ):
+            return 0.0
+        v1 = _as_vec3(p1) - _as_vec3(p2)  # p2 → p1（如膝→髋）
+        v2 = _as_vec3(p3) - _as_vec3(p2)  # p2 → p3（如膝→踝）
+        # 矢状面 Y-Z：丢弃左右横轴 X，抑制侧向抖动
+        v1_yz = np.array([float(v1[1]), float(v1[2])], dtype=np.float64)
+        v2_yz = np.array([float(v2[1]), float(v2[2])], dtype=np.float64)
+        n1 = float(np.linalg.norm(v1_yz))
+        n2 = float(np.linalg.norm(v2_yz))
+        if n1 < 1e-12 or n2 < 1e-12:
+            return 0.0
+        if not (np.isfinite(n1) and np.isfinite(n2)):
+            return 0.0
+        # atan2(y, x) 原理：x=dot、y=2D cross，符号锁定旋转方向
+        cross = float(v1_yz[0] * v2_yz[1] - v1_yz[1] * v2_yz[0])
+        dot = float(v1_yz[0] * v2_yz[0] + v1_yz[1] * v2_yz[1])
+        if not (np.isfinite(cross) and np.isfinite(dot)):
+            return 0.0
+        signed_deg = float(np.degrees(np.arctan2(cross, dot)))
+        if not np.isfinite(signed_deg):
+            return 0.0
+        if bool(signed):
+            return float(signed_deg)
+        # 内角：直腿时 |±180|≈180，噪声只会在 ±180 分支附近抖动而不会跳到锐角
+        return float(abs(signed_deg))
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def calculate_sagittal_angle_or_none(
+    p1, p2, p3, *, signed: bool = False
+) -> Optional[float]:
+    """与 ``calculate_sagittal_angle`` 同源；关节点缺失/投影退化时返回 ``None``。"""
+    if not (
+        is_valid_joint_point(p1)
+        and is_valid_joint_point(p2)
+        and is_valid_joint_point(p3)
+    ):
+        return None
+    v1 = _as_vec3(p1) - _as_vec3(p2)
+    v2 = _as_vec3(p3) - _as_vec3(p2)
+    n1 = float(np.hypot(float(v1[1]), float(v1[2])))
+    n2 = float(np.hypot(float(v2[1]), float(v2[2])))
+    if n1 < 1e-12 or n2 < 1e-12:
+        return None
+    angle = calculate_sagittal_angle(p1, p2, p3, signed=signed)
+    if not np.isfinite(angle):
+        return None
+    return float(angle)
+
+
+def calculate_3d_joint_angle(p1, p2, p3, *, is_knee_extension: bool = False) -> float:
+    """关节夹角（度）。
+
+    ``is_knee_extension=True``（髋/膝屈伸、触球伸展语境）：走矢状面 Y-Z +
+    ``atan2``（``calculate_sagittal_angle``），废弃 3D 点乘 ``arccos`` 与
+    ``180 - angle`` 补角黑客，从根上消除直腿附近锐角翻转。
+
+    ``is_knee_extension=False``：保留纯 3D 点乘 ``arccos``（踝等非矢状屈伸角）。
+    防御性：任一关节点为 None / 非有限 → 返回 0.0；``cos`` 钳制到 ``[-1, 1]``。
+    """
+    if bool(is_knee_extension):
+        return float(calculate_sagittal_angle(p1, p2, p3, signed=False))
+    try:
+        if not (
+            is_valid_joint_point(p1)
+            and is_valid_joint_point(p2)
+            and is_valid_joint_point(p3)
+        ):
+            return 0.0
         ba = _as_vec3(p1) - _as_vec3(p2)
         bc = _as_vec3(p3) - _as_vec3(p2)
         na = float(np.linalg.norm(ba))
@@ -124,12 +348,33 @@ def calculate_3d_joint_angle(p1, p2, p3, *, is_knee_extension: bool = False) -> 
             return 0.0
         cos_v = float(np.clip(cos_v, -1.0, 1.0))
         angle = float(np.degrees(np.arccos(cos_v)))
-        # 触球瞬间伸展态：angle < 130 强制补角，避免锐角误报
-        if bool(is_knee_extension) and angle < 130.0:
-            angle = 180.0 - angle
+        if not np.isfinite(angle):
+            return 0.0
         return float(angle)
     except Exception:  # noqa: BLE001
         return 0.0
+
+
+def calculate_3d_joint_angle_or_none(
+    p1, p2, p3, *, is_knee_extension: bool = False
+) -> Optional[float]:
+    """与 ``calculate_3d_joint_angle`` 同源；关节点缺失/无效时返回 ``None``。"""
+    if bool(is_knee_extension):
+        return calculate_sagittal_angle_or_none(p1, p2, p3, signed=False)
+    if not (
+        is_valid_joint_point(p1)
+        and is_valid_joint_point(p2)
+        and is_valid_joint_point(p3)
+    ):
+        return None
+    ba = _as_vec3(p1) - _as_vec3(p2)
+    bc = _as_vec3(p3) - _as_vec3(p2)
+    if float(np.linalg.norm(ba)) < 1e-12 or float(np.linalg.norm(bc)) < 1e-12:
+        return None
+    angle = calculate_3d_joint_angle(p1, p2, p3, is_knee_extension=False)
+    if not np.isfinite(angle):
+        return None
+    return float(angle)
 
 
 def evaluate_ball_bbox_for_pcr(ball_pixel_bbox) -> dict[str, Any]:
@@ -196,10 +441,16 @@ def calculate_support_foot_offset_cm(
     ankle_pixel_coords,
     ball_pixel_bbox,
     body_h_px: Optional[float] = None,
+    world_lateral_cm: Optional[float] = None,
+    world_foot_len_m: Optional[float] = None,
 ) -> float:
-    """支撑脚横距（厘米）：合格球框用 PCR；否则 fallback_PCR；结果钳制在 [0, 60] cm。"""
+    """支撑脚横距（厘米）：合格球框用 PCR；否则 fallback_PCR；结果钳制在 [0, 50] cm。"""
     detail = calculate_support_foot_offset_detailed(
-        ankle_pixel_coords, ball_pixel_bbox, body_h_px=body_h_px
+        ankle_pixel_coords,
+        ball_pixel_bbox,
+        body_h_px=body_h_px,
+        world_lateral_cm=world_lateral_cm,
+        world_foot_len_m=world_foot_len_m,
     )
     return float(detail.get("offset_cm") or 0.0)
 
@@ -209,13 +460,16 @@ def calculate_support_foot_offset_detailed(
     ball_pixel_bbox,
     *,
     body_h_px: Optional[float] = None,
+    world_lateral_cm: Optional[float] = None,
+    world_foot_len_m: Optional[float] = None,
 ) -> dict[str, Any]:
     """PCR 横距详单：含 QA / ok，供 Scorer 写 provenance。
 
-    - ``max(ball_w, ball_h) < 10``：严禁用球框算比例尺，改走 ``fallback_PCR``
-      （``145 / body_h_px``，缺省经验 PCR）。
-    - 最终 ``offset_cm = min(max(offset, 0), 60)``，防止横距爆炸。
-    - 仅合格球框 PCR 时 ``ok=True``（AIGC measured）；fallback 仍给出数值但 ok=False。
+    - ``max(ball_w, ball_h) < 10``：严禁用球框算比例尺，改走 ``fallback_PCR``。
+    - 熔断逻辑：PCR 结果 > 45 cm 且有效 world_lateral_cm / world_foot_len_m 时，
+      降级为 ``(world_lateral_cm / foot_len_cm) * AVERAGE_CHILD_FOOT_LEN_CM``，
+      method 写 "world_foot_ratio_fuse"。
+    - 极值截断：最终 ``offset_cm`` 钳制在 [0, 50] cm。
     """
     qa = evaluate_ball_bbox_for_pcr(ball_pixel_bbox)
     out: dict[str, Any] = {
@@ -235,7 +489,6 @@ def calculate_support_foot_offset_detailed(
 
         ball_center_x = qa.get("ball_center_x")
         if ball_center_x is None or not np.isfinite(float(ball_center_x)):
-            # 完全无球心：无法定义横距
             return out
 
         ball_w = float(qa.get("width") or 0.0)
@@ -249,7 +502,6 @@ def calculate_support_foot_offset_detailed(
             measured_ok = True
             fallback_pcr = None
         else:
-            # 遮挡/误识别：绝对不用坏球框比例尺
             fallback_pcr = float(estimate_fallback_pcr(body_h_px))
             pcr = fallback_pcr
             method = (
@@ -267,7 +519,26 @@ def calculate_support_foot_offset_detailed(
             out["fallback_pcr"] = fallback_pcr
             return out
 
-        offset_cm = float(min(max(float(offset), 0.0), float(SUPPORT_FOOT_OFFSET_MAX_CM)))
+        calc_dist = float(offset)
+
+        # 熔断：PCR 结果爆炸时降级到 3D 脚长比例换算
+        if calc_dist > float(SUPPORT_FOOT_LATERAL_FUSE_CM):
+            wl = world_lateral_cm if world_lateral_cm is not None else None
+            wf = world_foot_len_m if world_foot_len_m is not None else None
+            if (
+                wl is not None
+                and wf is not None
+                and np.isfinite(float(wl))
+                and np.isfinite(float(wf))
+                and float(wf) > 1e-9
+            ):
+                foot_len_cm = float(wf) * 100.0
+                fused = (float(wl) / foot_len_cm) * float(AVERAGE_CHILD_FOOT_LEN_CM)
+                calc_dist = float(fused)
+                method = "world_foot_ratio_fuse"
+                measured_ok = False
+
+        offset_cm = float(max(0.0, min(calc_dist, float(SUPPORT_FOOT_OFFSET_MAX_CM))))
         out["offset_cm"] = offset_cm
         out["ok"] = bool(measured_ok)
         out["method"] = method
@@ -432,6 +703,43 @@ def _ankle_window_validity(
     return valid
 
 
+def _median_filter_kernel3(values: Sequence[float]) -> list[float]:
+    """滑动中值滤波（kernel_size=3），剔除单帧飞点后再算方差。
+
+    优先 ``scipy.signal.medfilt``（边缘复制填充，避免默认零填充拉歪边界）；
+    scipy 不可用时手写窗口=3 的一维中值。空输入 → ``[]``。
+    """
+    try:
+        if values is None:
+            return []
+        arr = np.asarray(list(values), dtype=np.float64).reshape(-1)
+        n = int(arr.size)
+        if n <= 0:
+            return []
+        if n < 3:
+            return [float(x) for x in arr.tolist()]
+        try:
+            from scipy.signal import medfilt
+
+            # medfilt 默认零填充会把边缘角拉向 0°；先 edge-pad 再截回
+            padded = np.pad(arr, (1, 1), mode="edge")
+            filtered = medfilt(padded, kernel_size=3)
+            return [float(x) for x in np.asarray(filtered[1:-1], dtype=np.float64).tolist()]
+        except Exception:  # noqa: BLE001
+            out: list[float] = [0.0] * n
+            raw = [float(x) for x in arr.tolist()]
+            for i in range(n):
+                lo = max(0, i - 1)
+                hi = min(n - 1, i + 1)
+                out[i] = float(np.median(raw[lo : hi + 1]))
+            return out
+    except Exception:  # noqa: BLE001
+        try:
+            return [float(x) for x in list(values)]
+        except Exception:  # noqa: BLE001
+            return []
+
+
 def calculate_ankle_stiffness_variance(
     ankle_angles_time_series,
     t_impact_index,
@@ -447,10 +755,13 @@ def calculate_ankle_stiffness_variance(
     【Phase 2】窗长由帧率与毫秒半窗决定（默认 ~100ms）；
     30fps 时 half=1，行为与旧 t±1 三帧一致。
 
-    【可见度门控】冲击窗内 visibility 极低或角度空值跳变的帧严禁计入方差；
-    先线性插值，再用剩余有效点 ``np.var``，结果 ``round(..., 2)``。
+    【防飞点】冲击窗（含两侧各扩 1 帧作邻域）先可见度门控 + 线性插值，
+    再 ``kernel_size=3`` 中值滤波；**仅平滑后的冲击窗**参与 ``np.var``。
+    空数组 / 异常 → ``(0.0, LOCKED)``；方差 ``round(..., 2)``。
     """
     try:
+        if ankle_angles_time_series is None:
+            return 0.0, ANKLE_STIFFNESS_LOCKED
         series = np.asarray(ankle_angles_time_series, dtype=np.float64).reshape(-1)
         n = int(series.size)
         if n <= 0:
@@ -465,32 +776,46 @@ def calculate_ankle_stiffness_variance(
         )
         if hi < lo:
             return 0.0, ANKLE_STIFFNESS_LOCKED
-        window = series[lo : hi + 1]
 
-        vis_window = None
+        # 两侧各扩 1 帧，让中值核能吃到窗外邻域以干掉冲击帧尖峰
+        ctx_lo = max(0, int(lo) - 1)
+        ctx_hi = min(n - 1, int(hi) + 1)
+        context = series[ctx_lo : ctx_hi + 1]
+
+        vis_context = None
         if landmark_visibility_series is not None:
             vis_arr = np.asarray(landmark_visibility_series, dtype=np.float64).reshape(-1)
             if int(vis_arr.size) == n:
-                vis_window = vis_arr[lo : hi + 1]
-            elif int(vis_arr.size) == int(window.size):
-                vis_window = vis_arr
+                vis_context = vis_arr[ctx_lo : ctx_hi + 1]
+            elif int(vis_arr.size) == int(context.size):
+                vis_context = vis_arr
 
         valid = _ankle_window_validity(
-            window, vis_window, min_visibility=float(min_visibility)
+            context, vis_context, min_visibility=float(min_visibility)
         )
-        raw_vals = [float(v) for v in window.tolist()]
+        raw_vals = [float(v) for v in context.tolist()]
         cleaned = _interp_invalid_ankle_angles(raw_vals, valid)
         if not cleaned:
-            # 插值失败：仅用剩余有效帧差值/方差
             cleaned = [raw_vals[i] for i, ok in enumerate(valid) if ok]
         cleaned = [float(v) for v in cleaned if np.isfinite(float(v))]
         if not cleaned:
             return 0.0, ANKLE_STIFFNESS_LOCKED
 
-        vals = list(cleaned)
+        # 必须先中值去噪，禁止原始飞点直接进 np.var
+        smoothed = _median_filter_kernel3(cleaned)
+        if not smoothed:
+            return 0.0, ANKLE_STIFFNESS_LOCKED
+
+        off = int(lo) - int(ctx_lo)
+        win_len = int(hi) - int(lo) + 1
+        vals = [float(v) for v in smoothed[off : off + win_len] if np.isfinite(float(v))]
+        if not vals:
+            return 0.0, ANKLE_STIFFNESS_LOCKED
+
         # 与旧语义对齐：至少用 3 点估计 var（短窗端点复制）
         while len(vals) < 3 and vals:
             vals.append(vals[-1])
+
         variance = float(np.var(np.asarray(vals, dtype=np.float64)))
         if not np.isfinite(variance):
             variance = 0.0

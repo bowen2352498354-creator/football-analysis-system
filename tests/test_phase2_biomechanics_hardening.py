@@ -149,17 +149,18 @@ def test_ankle_half_window_scales_with_fps():
 
 def test_ankle_variance_60fps_uses_wider_window():
     """60fps 半窗 3 帧：更多点参与方差，与强制 t±1 不同。"""
-    # 构造：中心附近平稳，远端扰动；仅宽窗能吃到扰动
+    # 中心平稳；远端用「持续两帧」扰动（单帧尖峰会被中值滤波剔除）
     series = [100.0] * 10
-    series[5] = 100.0
-    series[2] = 160.0
-    series[8] = 160.0
+    series[2] = 130.0
+    series[3] = 131.0
+    series[7] = 129.0
+    series[8] = 130.0
     v_narrow, _ = calculate_ankle_stiffness_variance(
         series, 5, fps=30.0, half_window_ms=50.0
     )  # half=1 → idx 4,5,6 全 100
     v_wide, _ = calculate_ankle_stiffness_variance(
         series, 5, fps=60.0, half_window_ms=50.0
-    )  # half=3 → 含 2 与 8
+    )  # half=3 → 含 2–3 与 7–8
     assert v_narrow < 1e-9
     assert v_wide > 5.0
 

@@ -347,16 +347,30 @@ from biomech_primitives import (  # noqa: E402
     ANKLE_STIFFNESS_SLIGHT_MAX_VAR,
     ANKLE_STIFFNESS_YIELDING,
     DEFAULT_EMPIRICAL_PCR,
+    LANDMARK_CONFIDENCE_MIN,
+    LANDMARK_EMA_ALPHA,
+    LandmarkEMASmoother,
     STANDARD_BALL_DIAMETER_CM,
-    calculate_3d_joint_angle,
+    calculate_3d_joint_angle,  # re-export：单测 parity / 旧调用方
     calculate_ankle_stiffness_variance,
+    calculate_sagittal_angle,
+    calculate_sagittal_angle_or_none,
     calculate_support_foot_offset_cm,
+    is_valid_joint_point,
 )
+
+# 膝角诊断：遮挡丢帧时回退上一帧有效结果 + EMA 平滑关节点
+_KNEE_LANDMARK_SMOOTHER = LandmarkEMASmoother(alpha=LANDMARK_EMA_ALPHA)
+_LAST_VALID_KNEE_DIAGNOSIS: dict[str, tuple] = {}
 
 
 def calculate_angle(a, b, c, *, is_knee_extension: bool = False):
-    """通用空间夹角（度）。V3.1 起委托 ``calculate_3d_joint_angle``。"""
-    return calculate_3d_joint_angle(a, b, c, is_knee_extension=is_knee_extension)
+    """髋/膝关节屈伸角（度）：矢状面 Y-Z + atan2，废弃 3D arccos。
+
+    ``is_knee_extension`` 保留兼容旧调用方；算法统一走 ``calculate_sagittal_angle``。
+    """
+    _ = is_knee_extension
+    return calculate_sagittal_angle(a, b, c, signed=False)
 
 
 def judge_knee_status(angle):
@@ -370,9 +384,15 @@ def judge_knee_status(angle):
     返回：
         (status_text, status_color)：状态文字与对应的 BGR 颜色元组。
     """
-    if 140 <= angle <= 160:
+    try:
+        angle_v = float(angle)
+    except (TypeError, ValueError):
+        return "Red", COLOR_RED
+    if not np.isfinite(angle_v):
+        return "Red", COLOR_RED
+    if 140 <= angle_v <= 160:
         return "Green", COLOR_GREEN
-    elif (130 <= angle < 140) or (160 < angle <= 170):
+    elif (130 <= angle_v < 140) or (160 < angle_v <= 170):
         return "Yellow", COLOR_YELLOW
     else:
         return "Red", COLOR_RED
@@ -403,28 +423,111 @@ def _side_landmark_indices(side: str) -> tuple[int, int, int]:
     return RIGHT_HIP_IDX, RIGHT_KNEE_IDX, RIGHT_ANKLE_IDX
 
 
+def _landmark_xyz_visibility(lm) -> tuple[Optional[tuple], float]:
+    """安全提取关节点 (x,y,z) 与 visibility；缺失返回 (None, 0.0)。"""
+    if lm is None:
+        return None, 0.0
+    try:
+        x = float(getattr(lm, "x", None))
+        y = float(getattr(lm, "y", None))
+        z = float(getattr(lm, "z", 0.0) or 0.0)
+        if not (np.isfinite(x) and np.isfinite(y) and np.isfinite(z)):
+            return None, 0.0
+        try:
+            vis = float(getattr(lm, "visibility", 1.0) or 0.0)
+        except (TypeError, ValueError):
+            vis = 0.0
+        if not np.isfinite(vis):
+            vis = 0.0
+        return (x, y, z), vis
+    except (TypeError, ValueError, AttributeError):
+        return None, 0.0
+
+
+def reset_knee_diagnosis_caches() -> None:
+    """分析任务重启时清空 EMA / 上一帧膝角缓存。"""
+    _KNEE_LANDMARK_SMOOTHER.reset()
+    _LAST_VALID_KNEE_DIAGNOSIS.clear()
+
+
 def compute_knee_diagnosis_for_side(frame, single_person_landmarks, side: str = "right"):
-    """按摆动腿侧提取髋-膝-踝，计算膝关节内角（大小腿夹角的互补内角）。"""
-    height, width = frame.shape[:2]
-    hip_i, knee_i, ankle_i = _side_landmark_indices(side)
-    hip = single_person_landmarks[hip_i]
-    knee = single_person_landmarks[knee_i]
-    ankle = single_person_landmarks[ankle_i]
+    """按摆动腿侧提取髋-膝-踝，计算膝关节内角（大小腿夹角的互补内角）。
 
-    hip_point = (hip.x, hip.y, hip.z)
-    knee_point = (knee.x, knee.y, knee.z)
-    ankle_point = (ankle.x, ankle.y, ankle.z)
+    防御性：髋/膝/踝缺失或 visibility < 0.5 时不抛 TypeError；
+    优先用 EMA 平滑坐标；仍失败则回退上一帧有效诊断（三色阈值不变）。
+    """
+    side_key = "left" if str(side).lower().startswith("l") else "right"
+    try:
+        height, width = frame.shape[:2]
+    except Exception:  # noqa: BLE001
+        height, width = 1, 1
+    width = max(1, int(width))
+    height = max(1, int(height))
 
-    knee_angle = calculate_angle(
-        hip_point, knee_point, ankle_point, is_knee_extension=True
+    hip_i, knee_i, ankle_i = _side_landmark_indices(side_key)
+    cached = _LAST_VALID_KNEE_DIAGNOSIS.get(side_key)
+
+    def _fallback():
+        if cached is not None:
+            return cached
+        # 无历史时给中性黄带中心角，避免 None 击穿调用方
+        status_text, status_color = judge_knee_status(150.0)
+        mid = (width // 2, height // 2)
+        return 150.0, status_text, status_color, mid, mid, mid
+
+    if single_person_landmarks is None:
+        return _fallback()
+
+    try:
+        hip_lm = single_person_landmarks[hip_i]
+        knee_lm = single_person_landmarks[knee_i]
+        ankle_lm = single_person_landmarks[ankle_i]
+    except (IndexError, TypeError, KeyError):
+        return _fallback()
+
+    hip_raw, hip_vis = _landmark_xyz_visibility(hip_lm)
+    knee_raw, knee_vis = _landmark_xyz_visibility(knee_lm)
+    ankle_raw, ankle_vis = _landmark_xyz_visibility(ankle_lm)
+
+    hip_s = _KNEE_LANDMARK_SMOOTHER.update(f"{side_key}_hip", hip_raw, hip_vis)
+    knee_s = _KNEE_LANDMARK_SMOOTHER.update(f"{side_key}_knee", knee_raw, knee_vis)
+    ankle_s = _KNEE_LANDMARK_SMOOTHER.update(f"{side_key}_ankle", ankle_raw, ankle_vis)
+
+    if not (
+        is_valid_joint_point(hip_s)
+        and is_valid_joint_point(knee_s)
+        and is_valid_joint_point(ankle_s)
+    ):
+        return _fallback()
+
+    # 三点均需达到置信度门槛（EMA 回退后仍要求本帧或缓存可信）
+    if min(hip_vis, knee_vis, ankle_vis) < float(LANDMARK_CONFIDENCE_MIN):
+        # 本帧低置信：若 EMA 有缓存则用平滑点继续；否则回退
+        if cached is not None and (
+            hip_raw is None or knee_raw is None or ankle_raw is None
+        ):
+            return cached
+
+    hip_point = (float(hip_s[0]), float(hip_s[1]), float(hip_s[2]))
+    knee_point = (float(knee_s[0]), float(knee_s[1]), float(knee_s[2]))
+    ankle_point = (float(ankle_s[0]), float(ankle_s[1]), float(ankle_s[2]))
+
+    knee_angle_opt = calculate_sagittal_angle_or_none(
+        hip_point, knee_point, ankle_point
     )
+    if knee_angle_opt is None:
+        return _fallback()
+
+    knee_angle = float(knee_angle_opt)
     status_text, status_color = judge_knee_status(knee_angle)
 
-    hip_px = (int(hip.x * width), int(hip.y * height))
-    knee_px = (int(knee.x * width), int(knee.y * height))
-    ankle_px = (int(ankle.x * width), int(ankle.y * height))
+    hip_px = (int(hip_point[0] * width), int(hip_point[1] * height))
+    knee_px = (int(knee_point[0] * width), int(knee_point[1] * height))
+    ankle_px = (int(ankle_point[0] * width), int(ankle_point[1] * height))
 
-    return knee_angle, status_text, status_color, hip_px, knee_px, ankle_px
+    result = (knee_angle, status_text, status_color, hip_px, knee_px, ankle_px)
+    _LAST_VALID_KNEE_DIAGNOSIS[side_key] = result
+    return result
 
 
 def evaluate_leg_overlay_geometry(
@@ -535,14 +638,10 @@ def build_annotation_metrics_from_pose_record(
         and world.get(ankle_k) is not None
     ):
         angle = float(
-            calculate_3d_joint_angle(
-                world[hip_k], world[knee_k], world[ankle_k], is_knee_extension=True
-            )
+            calculate_sagittal_angle(world[hip_k], world[knee_k], world[ankle_k])
         )
     else:
-        angle = float(
-            calculate_3d_joint_angle(hip, knee, ankle, is_knee_extension=True)
-        )
+        angle = float(calculate_sagittal_angle(hip, knee, ankle))
 
     vis = pose_record.get("visibility") or {}
     qa = evaluate_leg_overlay_geometry(
@@ -1331,6 +1430,7 @@ def start_analysis_task(
         destroy_pose_landmarker()
         if reset_yolo:
             destroy_yolo_tracker()
+        reset_knee_diagnosis_caches()
         landmarker = create_fresh_pose_landmarker()
         yolo_model = None
         if reset_yolo and yolo_weights is not None:
@@ -1379,6 +1479,63 @@ def open_video_capture_deterministic(
         fps = 30.0
     reported = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     return cap, float(fps), reported
+
+
+# 波形图 / Action ROI 缺省帧率（与前端 VideoWorkspace 默认 30fps 对齐）
+DEFAULT_WAVEFORM_FPS: float = 30.0
+
+
+def build_absolute_timestamps(
+    start_frame_index: int,
+    frame_count: int,
+    fps: float = DEFAULT_WAVEFORM_FPS,
+) -> List[float]:
+    """由 Action ROI 切片起点与视频帧率生成原视频绝对秒时间戳数组。
+
+    切片内第 ``i`` 帧对应原视频物理时间：
+        ``timestamp = (start_frame_index + i) / fps``
+
+    用于消除波形图相对帧索引（0~60）与视频 ``currentTime`` 的时空脱节。
+    """
+    n = int(max(0, frame_count))
+    if n <= 0:
+        return []
+    start = int(max(0, start_frame_index))
+    try:
+        fps_v = float(fps)
+    except (TypeError, ValueError):
+        fps_v = DEFAULT_WAVEFORM_FPS
+    if not np.isfinite(fps_v) or fps_v <= 1e-6:
+        fps_v = DEFAULT_WAVEFORM_FPS
+    return [round((start + i) / fps_v, 6) for i in range(n)]
+
+
+def pack_action_roi_series(
+    values: Sequence[float],
+    start_frame_index: int,
+    fps: float = DEFAULT_WAVEFORM_FPS,
+) -> dict[str, Any]:
+    """将 Action ROI 内一维角度/速度数组与绝对时间戳一并打包。
+
+    返回结构可直接并入 ``generate_report`` / 科研 DTO：
+        ``{"values": [...], "absolute_timestamps": [2.15, 2.18, ...],
+           "start_frame_index": int, "fps": float}``
+    """
+    series = [float(v) for v in (values or [])]
+    start = int(max(0, start_frame_index))
+    try:
+        fps_v = float(fps)
+    except (TypeError, ValueError):
+        fps_v = DEFAULT_WAVEFORM_FPS
+    if not np.isfinite(fps_v) or fps_v <= 1e-6:
+        fps_v = DEFAULT_WAVEFORM_FPS
+    timestamps = build_absolute_timestamps(start, len(series), fps_v)
+    return {
+        "values": series,
+        "absolute_timestamps": timestamps,
+        "start_frame_index": start,
+        "fps": float(fps_v),
+    }
 
 
 def iter_video_frames_sync(

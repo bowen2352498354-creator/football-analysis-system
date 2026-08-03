@@ -42,14 +42,17 @@ import {
 } from '../mockData'
 import type {
   AggregateDiagnosisReport,
+  ComparisonFrames,
   FinalDiagnosisReport,
   GlobalSettings,
   GlobalTrainingRecord,
+  StudentReviewSummary,
   VideoSourceMode,
   ZenAttemptRecord,
   ZenSessionRecord,
   ZenViewMode,
 } from '../types'
+import ActionMirrorCompare from './ActionMirrorCompare'
 import MetricCardList from './MetricCardList'
 
 interface ZenWorkspaceProps {
@@ -119,6 +122,80 @@ function getScoreBucket(score: number | null | undefined): ScoreBucket {
   return 'red'
 }
 
+const LOCAL_MAIN_ERROR_BY_INDICATOR: Record<string, string> = {
+  distance_cm: '支撑脚过宽',
+  toe_angle: '脚尖捅球',
+  max_folding_angle: '后摆折叠不足',
+  whipping_velocity: '随摆转髋不足',
+  impact_knee_angle: '膝关节过度屈曲',
+  ankle_rigidity: '踝关节松弛',
+  support_knee_angle: '膝关节过度屈曲',
+  hip_torsion_angle: '身体重心偏移',
+}
+
+/** 从单次尝试推导待改进短标签（本地回退，与后端口径对齐） */
+function deriveLocalMainError(attempt: ZenAttemptRecord): string | null {
+  const indicators = attempt.reportData?.scoreDetail?.indicators
+  if (indicators && typeof indicators === 'object') {
+    const red: string[] = []
+    const yellow: string[] = []
+    for (const [key, entry] of Object.entries(indicators)) {
+      const status = String((entry as { status?: string } | null)?.status || '').toUpperCase()
+      const label = LOCAL_MAIN_ERROR_BY_INDICATOR[key]
+      if (!label) continue
+      if (status.includes('RED')) red.push(label)
+      else if (status.includes('YELLOW')) yellow.push(label)
+    }
+    if (red[0]) return red[0]
+    if (yellow[0]) return yellow[0]
+  }
+  const pain = attempt.reportData?.painPoint?.trim()
+  if (pain) return pain.length > 24 ? `${pain.slice(0, 24)}…` : pain
+  return null
+}
+
+/**
+ * 前端本地极值筛选：本节 attempts ≥ 2 时组装 comparison_frames，
+ * 作为后端 /api/review/student_summary 的即时回退，避免看板空白。
+ */
+function buildLocalComparisonFrames(attempts: ZenAttemptRecord[]): ComparisonFrames | null {
+  const scored = attempts
+    .map((attempt, index) => ({
+      attempt,
+      index,
+      score: attempt.reportData?.score,
+    }))
+    .filter((row): row is { attempt: ZenAttemptRecord; index: number; score: number } => typeof row.score === 'number')
+
+  if (scored.length < 2) return null
+
+  const best = scored.reduce((acc, row) =>
+    row.score > acc.score || (row.score === acc.score && row.index > acc.index) ? row : acc,
+  )
+  const improve = scored.reduce((acc, row) =>
+    row.score < acc.score || (row.score === acc.score && row.index < acc.index) ? row : acc,
+  )
+
+  const bestImage =
+    best.attempt.impactFrameBase64 ?? best.attempt.reportData?.impactFrameImage ?? null
+  const improveImage =
+    improve.attempt.impactFrameBase64 ?? improve.attempt.reportData?.impactFrameImage ?? null
+
+  return {
+    best: {
+      score: best.score,
+      image_url: bestImage,
+      attempt_id: best.attempt.attemptNumber,
+    },
+    improve: {
+      score: improve.score,
+      image_url: improveImage,
+      attempt_id: improve.attempt.attemptNumber,
+      main_error: deriveLocalMainError(improve.attempt),
+    },
+  }
+}
+
 const SCORE_BUCKET_STYLE: Record<ScoreBucket, { text: string; bg: string; ring: string; dot: string; label: string }> = {
   green: { text: 'text-emerald-300', bg: 'bg-emerald-500/15', ring: 'ring-emerald-400/40', dot: 'bg-emerald-400', label: '合格区间' },
   yellow: { text: 'text-amber-300', bg: 'bg-amber-500/15', ring: 'ring-amber-400/40', dot: 'bg-amber-400', label: '接近合格' },
@@ -140,6 +217,107 @@ function computeClientStabilityScore(scores: number[]): number {
   const variance = scores.reduce((sum, s) => sum + (s - mean) ** 2, 0) / scores.length
   const stdDev = Math.sqrt(variance)
   return Math.max(0, Math.min(100, Math.round(100 - stdDev * 1.5)))
+}
+
+/** 非核心 ID 业务数值：parseFloat(toFixed(2))，消除 JS 精度噪声并统一两位小数 */
+function toFixedFloat(value: unknown): number | null {
+  if (value == null || value === '') return null
+  const n = Number(value)
+  if (!Number.isFinite(n)) return null
+  return parseFloat(n.toFixed(2))
+}
+
+/** 核心计数/序号：强制整数，避免 2.0 触发后端 int 校验 */
+function toIntId(value: unknown, fallback = 0): number {
+  const n = Number(value)
+  if (!Number.isFinite(n)) return fallback
+  return Math.floor(n)
+}
+
+type AggregateAttemptPayload = {
+  attemptNumber: number
+  score: number | null
+  hitStats: FinalDiagnosisReport['hitStats'] | null
+}
+
+/**
+ * 深度清洗聚合诊断 payload：叶子数值全部 toFixed(2)；序号/次数走整数。
+ */
+function sanitizeAggregateAttemptsPayload(attempts: AggregateAttemptPayload[]): AggregateAttemptPayload[] {
+  return attempts.map((item, index) => {
+    const hit = item.hitStats
+    const green = toFixedFloat(hit?.green)
+    const yellow = toFixedFloat(hit?.yellow)
+    const red = toFixedFloat(hit?.red)
+    return {
+      attemptNumber: toIntId(item.attemptNumber, index + 1),
+      score: toFixedFloat(item.score),
+      hitStats:
+        hit == null
+          ? null
+          : {
+              green: green ?? 0,
+              yellow: yellow ?? 0,
+              red: red ?? 0,
+            },
+    }
+  })
+}
+
+/**
+ * 跨课时聚合：汇总同一学号在归档池中的全部历史尝试（不限同一天），
+ * 仅保留带有效评分的样本，并按时间顺序重新编号，供 DeepSeek 趋势分析使用。
+ * 阈值放宽：有效样本 ≥ 2 即可触发聚合诊断。
+ */
+function collectCrossSessionAttempts(
+  queue: ZenSessionRecord[],
+  studentId: string,
+): AggregateAttemptPayload[] {
+  const records = queue
+    .filter((record) => record.studentId === studentId)
+    .slice()
+    .sort((a, b) => a.timestamp - b.timestamp)
+
+  const payload: AggregateAttemptPayload[] = []
+
+  for (const record of records) {
+    const sortedAttempts = record.attempts
+      .slice()
+      .sort((a, b) => a.timestamp - b.timestamp)
+    for (const attempt of sortedAttempts) {
+      const score = toFixedFloat(attempt.reportData?.score)
+      if (score == null) continue
+      const hit = attempt.reportData?.hitStats ?? null
+      payload.push({
+        attemptNumber: payload.length + 1,
+        score,
+        hitStats: hit
+          ? {
+              green: toFixedFloat(hit.green) ?? 0,
+              yellow: toFixedFloat(hit.yellow) ?? 0,
+              red: toFixedFloat(hit.red) ?? 0,
+            }
+          : null,
+      })
+    }
+  }
+  return payload
+}
+
+/** 从后端错误响应中尽量提取可读 detail，避免一律显示「后端未启动」 */
+async function extractApiErrorMessage(response: Response, fallback: string): Promise<string> {
+  try {
+    const data = (await response.json()) as { detail?: unknown; message?: unknown }
+    if (typeof data.detail === 'string' && data.detail.trim()) return data.detail.trim()
+    if (Array.isArray(data.detail) && data.detail.length > 0) {
+      const first = data.detail[0] as { msg?: string }
+      if (typeof first?.msg === 'string') return first.msg
+    }
+    if (typeof data.message === 'string' && data.message.trim()) return data.message.trim()
+  } catch {
+    /* 非 JSON 响应时走 fallback */
+  }
+  return fallback
 }
 
 /**
@@ -197,6 +375,12 @@ export default function ZenWorkspace({ globalSettings }: ZenWorkspaceProps) {
   const [selectedRecordId, setSelectedRecordId] = useState<string | null>(null)
   const [bestAttemptOverride, setBestAttemptOverride] = useState<Record<string, number>>({})
   const [aggregateLoadingId, setAggregateLoadingId] = useState<string | null>(null)
+  /** 聚合诊断失败时的具体错误文案（按学生记录 id 缓存，避免模糊「后端未启动」） */
+  const [aggregateErrorById, setAggregateErrorById] = useState<Record<string, string>>({})
+  /** 后端复盘摘要缓存：student session id → comparison_frames */
+  const [reviewSummaryById, setReviewSummaryById] = useState<
+    Record<string, StudentReviewSummary | null>
+  >({})
 
   /* ---------------------------- 批量导出全班 Word 报告单 ---------------------------- */
   const [isBatchExportingWord, setIsBatchExportingWord] = useState(false)
@@ -249,6 +433,8 @@ export default function ZenWorkspace({ globalSettings }: ZenWorkspaceProps) {
   async function saveAttemptToWord(studentIdForReport: string, attempt: ZenAttemptRecord): Promise<boolean> {
     const report = attempt.reportData
     try {
+      const hit = report?.hitStats ?? null
+      const radar = report?.scoreDetail?.radar_scores ?? null
       const response = await fetch(`${API_BASE_URL}/api/save_word_report`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -257,10 +443,12 @@ export default function ZenWorkspace({ globalSettings }: ZenWorkspaceProps) {
           school: getSchoolDisplayName(globalSettings),
           classGroup: getClassGroupDisplayName(globalSettings),
           studentNumber: studentIdForReport || '未填写编号',
-          score: report?.score ?? null,
-          totalAttempts: report?.totalAttempts ?? null,
-          painPoint: report?.painPoint ?? '',
-          prescription: report?.prescription ?? '',
+          score: toFixedFloat(report?.score),
+          totalAttempts: toFixedFloat(report?.totalAttempts),
+          painPoint: report?.correction_metaphor || report?.painPoint || '',
+          prescription: report?.praise_encouragement || report?.prescription || '',
+          correction_metaphor: report?.correction_metaphor || report?.painPoint || '',
+          praise_encouragement: report?.praise_encouragement || report?.prescription || '',
           generatedAt: report?.generatedAt ?? null,
           impactFrameImage: attempt.impactFrameBase64 ?? report?.impactFrameImage ?? null,
           heatmapBase64:
@@ -273,10 +461,20 @@ export default function ZenWorkspace({ globalSettings }: ZenWorkspaceProps) {
             report?.heatmapBase64 ??
             report?.scoreDetail?.heatmap_base64 ??
             null,
-          hitStats: report?.hitStats ?? null,
-          kneeFlexionAngle: report?.avgKneeAngle ?? null,
+          hitStats: hit
+            ? {
+                green: toFixedFloat(hit.green) ?? 0,
+                yellow: toFixedFloat(hit.yellow) ?? 0,
+                red: toFixedFloat(hit.red) ?? 0,
+              }
+            : null,
+          kneeFlexionAngle: toFixedFloat(report?.avgKneeAngle),
           scoreDetail: report?.scoreDetail ?? null,
-          radar_scores: report?.scoreDetail?.radar_scores ?? null,
+          radar_scores: radar
+            ? Object.fromEntries(
+                Object.entries(radar).map(([k, v]) => [k, toFixedFloat(v) ?? 0]),
+              )
+            : null,
           spatial_trajectory:
             report?.spatial_trajectory ??
             report?.spatialTrajectory ??
@@ -297,27 +495,74 @@ export default function ZenWorkspace({ globalSettings }: ZenWorkspaceProps) {
     }
   }
 
+  /** 本地视频上传/分析前的学号锁定拦截：无锁定学号时绝对不发起网络请求 */
+  function guardStudentIdLocked(): boolean {
+    if (isLocked && studentId.trim()) return true
+    showToast('请先输入并锁定学号，系统才能为您记录实验数据！')
+    return false
+  }
+
   function handleSelectVideoFile(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0]
     if (!file) return
+    // 学号未锁定时拦截：清空 input，绝不进入上传网络请求
+    if (!guardStudentIdLocked()) {
+      event.target.value = ''
+      return
+    }
     setLocalVideoFile(file)
     setUploadedVideoPath(null)
     void uploadVideoFile(file)
   }
 
-  /** 把用户选择的本地 MP4 文件上传到后端 /api/upload_video，换回后端文件路径 */
+  /** 把用户选择的本地视频文件上传到后端 /api/upload_video，换回后端文件路径 */
   async function uploadVideoFile(file: File) {
+    // 双重保险（静默）：调用方应已 Toast 拦截；此处只阻断网络请求，避免重复弹 Toast
+    if (!isLocked || !studentId.trim()) return
+
     setIsUploading(true)
     setConnectionError(null)
     try {
       const formData = new FormData()
       formData.append('file', file)
       const response = await fetch(`${API_BASE_URL}/api/upload_video`, { method: 'POST', body: formData })
-      if (!response.ok) throw new Error(`上传接口返回状态码 ${response.status}`)
-      const data = (await response.json()) as { video_path: string }
+
+      let data: { video_path?: string; status?: string; message?: string } = {}
+      try {
+        data = (await response.json()) as typeof data
+      } catch {
+        // 响应体非 JSON（例如服务进程已崩溃）时保持空对象，走下方统一错误文案
+      }
+
+      if (!response.ok) {
+        // 优先展示后端 JSON 500 的明确原因（如“请使用 mp4 格式”），避免含糊的 Failed to fetch
+        const backendMessage =
+          typeof data.message === 'string' && data.message.trim()
+            ? data.message.trim()
+            : `上传接口返回状态码 ${response.status}`
+        showToast(backendMessage)
+        window.alert(backendMessage)
+        throw new Error(backendMessage)
+      }
+
+      if (!data.video_path) {
+        throw new Error('上传成功但未返回 video_path，请重试或改用标准 .mp4 格式。')
+      }
       setUploadedVideoPath(data.video_path)
     } catch (error) {
-      setConnectionError(error instanceof Error ? error.message : '视频上传失败，请检查后端服务是否已启动。')
+      const isNetworkFail =
+        error instanceof TypeError && /fetch|network/i.test(error.message || 'Failed to fetch')
+      const errorMessage = isNetworkFail
+        ? '无法连接后台服务或服务异常中断。请确认 api_server.py 已启动，并尽量使用标准的 .mp4 格式。'
+        : error instanceof Error
+          ? error.message
+          : '视频上传失败，请检查后端服务是否已启动。'
+      setConnectionError(errorMessage)
+      // 网络层 Failed to fetch 也弹窗提示，避免用户只看到控制台报错
+      if (isNetworkFail) {
+        showToast(errorMessage)
+        window.alert(errorMessage)
+      }
     } finally {
       setIsUploading(false)
     }
@@ -405,7 +650,7 @@ export default function ZenWorkspace({ globalSettings }: ZenWorkspaceProps) {
 
   /** 点击「记录本次尝试」：建立本次单趟采集的 WebSocket 会话 */
   function handleStartAttemptRecording() {
-    if (!isLocked) return
+    if (!guardStudentIdLocked()) return
     setConnectionError(null)
     setFrameImage(null)
     setCameraLostHint(null)
@@ -569,6 +814,15 @@ export default function ZenWorkspace({ globalSettings }: ZenWorkspaceProps) {
   const validScores = useMemo(() => attemptScores.filter((s): s is number => typeof s === 'number'), [attemptScores])
   const clientStabilityScore = useMemo(() => computeClientStabilityScore(validScores), [validScores])
 
+  /** 跨课时历史有效样本数（≥2 即可触发 DeepSeek 聚合） */
+  const crossSessionHistoryCount = useMemo(() => {
+    if (!selectedRecord) return 0
+    return collectCrossSessionAttempts(sessionQueue, selectedRecord.studentId).length
+  }, [selectedRecord, sessionQueue])
+  const canGenerateAggregate = crossSessionHistoryCount >= 2
+  const selectedAggregateError = selectedRecord ? aggregateErrorById[selectedRecord.id] : undefined
+  const isAggregateLoading = Boolean(selectedRecord && aggregateLoadingId === selectedRecord.id)
+
   // 自动挑选"最标准/合规"的那一次尝试（评分最高者）；教师也可在下方缩略图手动点选覆盖
   const autoBestAttemptIndex = useMemo(() => {
     if (selectedAttempts.length === 0) return 0
@@ -589,6 +843,71 @@ export default function ZenWorkspace({ globalSettings }: ZenWorkspaceProps) {
     : 0
   const bestAttempt = selectedAttempts[effectiveBestAttemptIndex] ?? null
 
+  /** 本地即时双关键帧（不依赖后端），保证复盘区始终可渲染 */
+  const localComparisonFrames = useMemo(
+    () => buildLocalComparisonFrames(selectedAttempts),
+    [selectedAttempts],
+  )
+
+  /** 优先后端 comparison_frames；缺图时用本地同 attempt 图片补齐 */
+  const comparisonFrames = useMemo((): ComparisonFrames | null => {
+    const remote = selectedRecord ? reviewSummaryById[selectedRecord.id]?.comparison_frames : null
+    if (remote?.best && remote?.improve) {
+      const local = localComparisonFrames
+      return {
+        best: {
+          ...remote.best,
+          image_url: remote.best.image_url || local?.best.image_url || null,
+        },
+        improve: {
+          ...remote.improve,
+          image_url: remote.improve.image_url || local?.improve.image_url || null,
+          main_error: remote.improve.main_error || local?.improve.main_error || null,
+        },
+      }
+    }
+    return localComparisonFrames
+  }, [selectedRecord, reviewSummaryById, localComparisonFrames])
+
+  const comparisonAttemptCount = useMemo(() => {
+    const remoteCount = selectedRecord
+      ? reviewSummaryById[selectedRecord.id]?.attempt_count
+      : undefined
+    if (typeof remoteCount === 'number') return remoteCount
+    return selectedAttempts.filter((a) => typeof a.reportData?.score === 'number').length
+  }, [selectedRecord, reviewSummaryById, selectedAttempts])
+
+  // 选中学生后拉取 /api/review/student_summary（含 comparison_frames）
+  useEffect(() => {
+    if (viewMode !== 'review' || !selectedRecord) return
+    const recordId = selectedRecord.id
+    const studentId = selectedRecord.studentId
+    const sessionId = selectedRecord.id
+    let cancelled = false
+
+    void (async () => {
+      try {
+        const params = new URLSearchParams({
+          student_id: studentId,
+          session_id: sessionId,
+        })
+        const response = await fetch(`${API_BASE_URL}/api/review/student_summary?${params}`)
+        if (!response.ok) throw new Error(`summary ${response.status}`)
+        const data = (await response.json()) as StudentReviewSummary
+        if (cancelled) return
+        setReviewSummaryById((prev) => ({ ...prev, [recordId]: data }))
+      } catch {
+        if (cancelled) return
+        // 后端不可达时保留本地极值回退，不打断复盘
+        setReviewSummaryById((prev) => ({ ...prev, [recordId]: prev[recordId] ?? null }))
+      }
+    })()
+
+    return () => {
+      cancelled = true
+    }
+  }, [viewMode, selectedRecord?.id, selectedRecord?.studentId, selectedAttempts.length])
+
   function handleSelectRecord(id: string) {
     setSelectedRecordId(id)
   }
@@ -597,22 +916,40 @@ export default function ZenWorkspace({ globalSettings }: ZenWorkspaceProps) {
     setBestAttemptOverride((prev) => ({ ...prev, [recordId]: attemptIndex }))
   }
 
-  /** 懒加载调用后端生成「跨次尝试聚合诊断报告」，结果缓存进该学生的归档记录里 */
+  /**
+   * 调用后端生成「跨课时聚合诊断报告」。
+   * 阈值放宽：汇总该学号全部历史有效评分，≥ 2 次即可（可不在同一天）。
+   */
   async function handleGenerateAggregateReport(record: ZenSessionRecord) {
-    if (record.attempts.length === 0) return
+    const attemptsPayload = collectCrossSessionAttempts(sessionQueue, record.studentId)
+    if (attemptsPayload.length < 2) {
+      const msg = '历史有效数据不足 2 次，暂无法生成聚合诊断（可不在同一天累计）'
+      setAggregateErrorById((prev) => ({ ...prev, [record.id]: msg }))
+      showToast(`⚠️ ${msg}`)
+      return
+    }
+
     setAggregateLoadingId(record.id)
+    setAggregateErrorById((prev) => {
+      const next = { ...prev }
+      delete next[record.id]
+      return next
+    })
+
     try {
-      const attemptsPayload = record.attempts.map((attempt) => ({
-        attemptNumber: attempt.attemptNumber,
-        score: attempt.reportData?.score ?? null,
-        hitStats: attempt.reportData?.hitStats ?? null,
-      }))
+      const sanitizedAttempts = sanitizeAggregateAttemptsPayload(attemptsPayload)
       const response = await fetch(`${API_BASE_URL}/api/generate_aggregate_report`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ student_number: record.studentId, attempts: attemptsPayload }),
+        body: JSON.stringify({ student_number: record.studentId, attempts: sanitizedAttempts }),
       })
-      if (!response.ok) throw new Error(`聚合诊断接口返回状态码 ${response.status}`)
+      if (!response.ok) {
+        const detail = await extractApiErrorMessage(
+          response,
+          response.status >= 500 ? '大模型生成超时，请重试' : `聚合诊断接口返回状态码 ${response.status}`,
+        )
+        throw new Error(detail)
+      }
       const aggregate = (await response.json()) as AggregateDiagnosisReport
 
       setSessionQueue((prev) => {
@@ -620,19 +957,32 @@ export default function ZenWorkspace({ globalSettings }: ZenWorkspaceProps) {
         void persistSessionsToBackend(next)
         return next
       })
-    } catch {
-      showToast('⚠️ 生成聚合诊断报告失败，请检查后端服务是否已启动')
+
+      if (aggregate.llmError) {
+        setAggregateErrorById((prev) => ({ ...prev, [record.id]: aggregate.llmError as string }))
+        showToast(`⚠️ ${aggregate.llmError}`)
+      } else {
+        showToast('✨ 跨课时聚合诊断已生成')
+      }
+    } catch (error) {
+      const message =
+        error instanceof Error && error.message
+          ? error.message
+          : '生成聚合诊断报告失败，请稍后重试'
+      setAggregateErrorById((prev) => ({ ...prev, [record.id]: message }))
+      showToast(`⚠️ ${message}`)
     } finally {
       setAggregateLoadingId(null)
     }
   }
 
-  // 选中一位新学生、且该生尚无聚合诊断缓存时，自动懒加载调用一次生成
+  // 选中一位新学生、且该生尚无聚合诊断缓存、历史有效数据 ≥ 2 时，自动懒加载调用一次生成
   useEffect(() => {
     if (viewMode !== 'review' || !selectedRecord) return
-    if (selectedRecord.attempts.length === 0) return
     if (selectedRecord.aggregateReport) return
     if (aggregateLoadingId === selectedRecord.id) return
+    const historyCount = collectCrossSessionAttempts(sessionQueue, selectedRecord.studentId).length
+    if (historyCount < 2) return
     void handleGenerateAggregateReport(selectedRecord)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [viewMode, selectedRecordId, selectedRecord?.aggregateReport])
@@ -742,7 +1092,11 @@ export default function ZenWorkspace({ globalSettings }: ZenWorkspaceProps) {
   }, [attemptScores, validScores.length])
 
   return (
-    <div className="mx-auto flex max-w-7xl flex-col gap-6 px-4 py-6 sm:px-6 lg:px-8">
+    <div
+      className={`mx-auto flex max-w-7xl flex-col gap-6 px-4 py-6 sm:px-6 lg:px-8 ${
+        viewMode === 'review' ? 'h-full min-h-0 overflow-hidden' : 'h-full min-h-0 overflow-y-auto'
+      }`}
+    >
       <AnimatePresence mode="wait">
         {viewMode === 'capture' ? (
           <motion.div
@@ -771,7 +1125,11 @@ export default function ZenWorkspace({ globalSettings }: ZenWorkspaceProps) {
                         key={option.id}
                         type="button"
                         disabled={isRecording || isArchiving}
-                        onClick={() => setVideoSourceMode(option.id)}
+                        onClick={() => {
+                          // 切换到「本地视频分析」前必须先锁定学号，否则拦截并 Toast 提示
+                          if (option.id === 'file' && !guardStudentIdLocked()) return
+                          setVideoSourceMode(option.id)
+                        }}
                         className={`relative rounded-full px-3.5 py-2 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50 sm:text-sm ${
                           active ? 'text-white' : 'text-white/50 hover:text-white/80'
                         }`}
@@ -800,7 +1158,10 @@ export default function ZenWorkspace({ globalSettings }: ZenWorkspaceProps) {
                     <button
                       type="button"
                       disabled={isRecording || isArchiving || isUploading}
-                      onClick={() => fileInputRef.current?.click()}
+                      onClick={() => {
+                        if (!guardStudentIdLocked()) return
+                        fileInputRef.current?.click()
+                      }}
                       className="flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-4 py-2 text-xs text-white/70 backdrop-blur-xl transition hover:bg-white/10 active:scale-95 disabled:cursor-not-allowed disabled:opacity-50 sm:text-sm"
                     >
                       <span className="inline-flex flex-shrink-0">
@@ -1061,10 +1422,10 @@ export default function ZenWorkspace({ globalSettings }: ZenWorkspaceProps) {
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: -8 }}
             transition={{ duration: 0.25, ease: 'easeOut' }}
-            className="flex flex-col gap-6"
+            className="flex h-full min-h-0 flex-col gap-4 overflow-hidden"
           >
             {/* ============================ 复盘看板顶栏：返回按钮 ============================ */}
-            <section className="flex items-center justify-between rounded-3xl border border-white/10 bg-white/5 p-4 backdrop-blur-xl">
+            <section className="flex flex-shrink-0 items-center justify-between rounded-3xl border border-white/10 bg-white/5 p-4 backdrop-blur-xl">
               <button
                 type="button"
                 onClick={() => setViewMode('capture')}
@@ -1098,10 +1459,10 @@ export default function ZenWorkspace({ globalSettings }: ZenWorkspaceProps) {
             </section>
 
             {/* ============================ 便当盒主体：左25%编号池 + 右75%多趟聚合复盘 ============================ */}
-            <div className="flex flex-col gap-6 lg:flex-row lg:items-start">
-              {/* -------- 左侧便当盒：编号池导航 + 清空/重新导入历史数据（约 25% 宽度） -------- */}
-              <aside className="w-full flex-shrink-0 rounded-3xl border border-white/10 bg-white/5 p-4 backdrop-blur-xl lg:w-[25%]">
-                <div className="mb-3 flex items-center justify-between">
+            <div className="flex min-h-0 flex-1 flex-col gap-6 overflow-hidden lg:flex-row lg:items-stretch">
+              {/* -------- 左侧便当盒：花名册固定高度，内部可滚动（约 25% 宽度） -------- */}
+              <aside className="flex h-[min(40vh,320px)] w-full flex-shrink-0 flex-col overflow-hidden rounded-3xl border border-white/10 bg-white/5 p-4 backdrop-blur-xl lg:h-full lg:max-h-full lg:w-[25%] lg:overflow-y-auto">
+                <div className="mb-3 flex flex-shrink-0 items-center justify-between">
                   <h3 className="flex items-center gap-2 text-sm font-semibold text-white/80">
                     <span className="inline-flex flex-shrink-0">
                       <Users className="h-4 w-4 text-teal-300" />
@@ -1134,9 +1495,10 @@ export default function ZenWorkspace({ globalSettings }: ZenWorkspaceProps) {
                     暂无任何静默采集记录，请返回采集模式先完成至少一位同学的测试。
                   </p>
                 ) : (
-                  <div className="flex flex-col gap-2">
+                  <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto pr-1">
                     {sessionQueue.map((record, index) => {
                       const isActive = record.id === selectedRecordId
+                      const historyCount = collectCrossSessionAttempts(sessionQueue, record.studentId).length
                       return (
                         <button
                           key={record.id}
@@ -1152,7 +1514,9 @@ export default function ZenWorkspace({ globalSettings }: ZenWorkspaceProps) {
                             <span className="text-sm font-medium">
                               No.{String(index + 1).padStart(2, '0')} {record.studentId}
                             </span>
-                            <span className="text-[11px] text-white/35">共计 {record.attempts.length} 次尝试</span>
+                            <span className="text-[11px] text-white/35">
+                              本节 {record.attempts.length} 次 · 历史有效 {historyCount} 次
+                            </span>
                           </span>
                           <span className="inline-flex flex-shrink-0">
                             <ChevronRight className={`h-4 w-4 ${isActive ? 'text-teal-300' : 'text-white/20'}`} />
@@ -1164,8 +1528,8 @@ export default function ZenWorkspace({ globalSettings }: ZenWorkspaceProps) {
                 )}
               </aside>
 
-              {/* -------- 右侧主便当盒：多趟聚合诊断中心（约 75% 宽度） -------- */}
-              <div className="flex w-full flex-col gap-5 lg:w-[75%]">
+              {/* -------- 右侧主便当盒：可竖向滚动，底部留白防贴边（约 75% 宽度） -------- */}
+              <div className="flex min-h-0 w-full flex-col gap-5 overflow-y-auto pb-20 lg:w-[75%]">
                 {!selectedRecord || selectedAttempts.length === 0 ? (
                   <section className="flex min-h-[400px] flex-col items-center justify-center gap-3 rounded-3xl border border-white/10 bg-white/5 p-8 text-center backdrop-blur-xl">
                     <span className="inline-flex flex-shrink-0">
@@ -1329,27 +1693,76 @@ export default function ZenWorkspace({ globalSettings }: ZenWorkspaceProps) {
 
                       {/* 右下长立盒：DeepSeek 跨课时聚合诊断处方 */}
                       <section className="flex flex-col gap-4 rounded-3xl border border-white/10 bg-white/5 p-5 backdrop-blur-xl">
-                        <h4 className="flex items-center gap-2 text-sm font-semibold text-white/80">
-                          <span className="inline-flex flex-shrink-0">
-                            <Sparkles className="h-4 w-4 text-teal-300" />
-                          </span>
-                          DeepSeek 跨课时聚合诊断处方
-                        </h4>
-                        <div className="flex-1 whitespace-pre-line rounded-2xl bg-black/20 p-4 text-sm leading-relaxed text-white/85">
-                          {aggregateLoadingId === selectedRecord.id ? (
+                        <div className="flex items-start justify-between gap-3">
+                          <h4 className="flex items-center gap-2 text-sm font-semibold text-white/80">
+                            <span className="inline-flex flex-shrink-0">
+                              <Sparkles className="h-4 w-4 text-teal-300" />
+                            </span>
+                            DeepSeek 跨课时聚合诊断处方
+                          </h4>
+                          <button
+                            type="button"
+                            onClick={() => void handleGenerateAggregateReport(selectedRecord)}
+                            disabled={isAggregateLoading || !canGenerateAggregate}
+                            title={
+                              canGenerateAggregate
+                                ? '主动请求 DeepSeek 生成跨课时趋势聚合分析'
+                                : '需累计至少 2 次历史有效评分（可不在同一天）'
+                            }
+                            className="flex flex-shrink-0 items-center gap-1.5 rounded-full bg-gradient-to-r from-teal-400 to-sky-500 px-3 py-1.5 text-[11px] font-semibold text-black shadow-[0_0_16px_rgba(45,212,191,0.28)] transition hover:brightness-110 active:scale-95 disabled:cursor-not-allowed disabled:from-white/10 disabled:to-white/10 disabled:text-white/35 disabled:shadow-none"
+                          >
+                            {isAggregateLoading ? (
+                              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                            ) : (
+                              <Sparkles className="h-3.5 w-3.5" />
+                            )}
+                            {isAggregateLoading ? '生成中…' : '✨ AI 立即生成聚合报告'}
+                          </button>
+                        </div>
+
+                        <div className="flex min-h-[160px] flex-1 flex-col justify-center whitespace-pre-line rounded-2xl bg-black/20 p-4 text-sm leading-relaxed text-white/85">
+                          {isAggregateLoading ? (
                             <span className="flex items-center gap-2 text-white/40">
                               <Loader2 className="h-4 w-4 animate-spin" />
-                              正在基于该生本节课 {selectedAttempts.length} 次尝试生成跨课时诊断建议…
+                              正在基于该生历史 {crossSessionHistoryCount} 次有效尝试生成跨课时诊断建议…
                             </span>
+                          ) : selectedRecord.aggregateReport?.fullText ? (
+                            selectedRecord.aggregateReport.fullText
                           ) : (
-                            selectedRecord.aggregateReport?.fullText ?? '暂无聚合诊断报告（可能后端服务未启动，或该生尝试数据不足）。'
+                            <div className="flex flex-col items-center gap-3 py-4 text-center">
+                              <p className="text-sm text-white/45">
+                                {selectedAggregateError
+                                  ? selectedAggregateError
+                                  : canGenerateAggregate
+                                    ? '尚未生成聚合诊断。可点击右上角按钮主动触发 DeepSeek 趋势分析。'
+                                    : `历史有效数据仅 ${crossSessionHistoryCount} 次，需 ≥ 2 次才可生成聚合诊断（可不在同一天）。`}
+                              </p>
+                              {canGenerateAggregate && (
+                                <button
+                                  type="button"
+                                  onClick={() => void handleGenerateAggregateReport(selectedRecord)}
+                                  disabled={isAggregateLoading}
+                                  className="flex items-center gap-2 rounded-2xl bg-teal-400/20 px-4 py-2.5 text-xs font-semibold text-teal-200 ring-1 ring-teal-400/35 transition hover:bg-teal-400/30 active:scale-95 disabled:cursor-not-allowed disabled:opacity-40"
+                                >
+                                  <Sparkles className="h-3.5 w-3.5" />
+                                  ✨ AI 立即生成聚合报告
+                                </button>
+                              )}
+                            </div>
                           )}
                         </div>
+
+                        {selectedAggregateError && selectedRecord.aggregateReport && (
+                          <p className="rounded-xl bg-amber-500/10 px-3 py-2 text-[11px] text-amber-200/90 ring-1 ring-amber-400/25">
+                            ⚠️ {selectedAggregateError}（已展示规则化兜底正文，可重新生成）
+                          </p>
+                        )}
+
                         <div className="flex items-center gap-2">
                           <button
                             type="button"
                             onClick={() => void handleGenerateAggregateReport(selectedRecord)}
-                            disabled={aggregateLoadingId === selectedRecord.id}
+                            disabled={isAggregateLoading || !canGenerateAggregate}
                             className="flex flex-1 items-center justify-center gap-2 rounded-2xl border border-white/10 bg-white/5 py-2.5 text-xs font-medium text-white/70 transition hover:bg-white/10 active:scale-95 disabled:cursor-not-allowed disabled:opacity-40"
                           >
                             <RotateCcw className="h-3.5 w-3.5" />
@@ -1358,7 +1771,8 @@ export default function ZenWorkspace({ globalSettings }: ZenWorkspaceProps) {
                           <button
                             type="button"
                             onClick={handleExportAggregateReport}
-                            className="flex flex-1 items-center justify-center gap-2 rounded-2xl bg-teal-400 py-2.5 text-sm font-semibold text-black transition hover:bg-teal-300 active:scale-95"
+                            disabled={!selectedRecord.aggregateReport}
+                            className="flex flex-1 items-center justify-center gap-2 rounded-2xl bg-teal-400 py-2.5 text-sm font-semibold text-black transition hover:bg-teal-300 active:scale-95 disabled:cursor-not-allowed disabled:bg-white/10 disabled:text-white/30"
                           >
                             <span className="inline-flex flex-shrink-0">
                               <Download className="h-4 w-4" />
@@ -1368,6 +1782,13 @@ export default function ZenWorkspace({ globalSettings }: ZenWorkspaceProps) {
                         </div>
                       </section>
                     </div>
+
+                    {/* 雷达区下方：最佳 vs 待改进 双关键帧镜像对比（全宽 Twin-Card） */}
+                    <ActionMirrorCompare
+                      className="mt-5"
+                      comparisonFrames={comparisonFrames}
+                      attemptCount={comparisonAttemptCount}
+                    />
                   </>
                 )}
               </div>

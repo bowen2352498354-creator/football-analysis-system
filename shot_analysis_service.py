@@ -494,17 +494,18 @@ class ShotAnalysisPipeline:
 
     def build_time_series_velocity_window(
         self, t_impact: Optional[int] = None
-    ) -> tuple[list[float], int, int]:
+    ) -> tuple[list[float], int, int, list[float]]:
         """裁剪 Action ROI 内的摆动腿小腿连续角速度序列（KinematicSignalProcessor 平滑后）。
 
         窗口为 ``[t_impact-30, t_impact+30)``（最长约 60 帧）。返回：
-            (time_series_velocity, impact_index_in_window, roi_start)
+            (time_series_velocity, impact_index_in_window, roi_start, absolute_timestamps)
+        其中 ``absolute_timestamps[i] = (roi_start + i) / fps``，为原视频绝对秒。
         边界未截断时 ``impact_index_in_window`` 恒为 30（数组中心）。
         """
         omega_raw = list(self._trajectory_omega)
         n = len(omega_raw)
         if n <= 0:
-            return [], 0, 0
+            return [], 0, 0, []
 
         omega_smooth = pt.KinematicSignalProcessor.smooth_joint_trajectories(omega_raw)
         if t_impact is None:
@@ -515,7 +516,10 @@ class ShotAnalysisPipeline:
         roi_start, roi_end = error_diagnoser.slice_action_roi_bounds(t, n)
         window = [round(float(v), 2) for v in omega_smooth[roi_start:roi_end]]
         impact_index_in_window = int(t - roi_start)
-        return window, impact_index_in_window, int(roi_start)
+        fps = float(self._video_fps) if self._video_fps and self._video_fps > 1 else 30.0
+        packed = pt.pack_action_roi_series(window, int(roi_start), fps)
+        absolute_timestamps = list(packed.get("absolute_timestamps") or [])
+        return window, impact_index_in_window, int(roi_start), absolute_timestamps
 
     # ------------------------------------------------------------------
     # 主分析循环
