@@ -35,6 +35,7 @@ import sys
 
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -45,23 +46,41 @@ from biomech_primitives import (
     ANKLE_STIFFNESS_LOCKED,
     ANKLE_STIFFNESS_SLIGHT_DEFORMATION,
     ANKLE_STIFFNESS_YIELDING,
+    AVERAGE_CHILD_SHOULDER_WIDTH_CM as _BIO_SHOULDER_CM,
     DEFAULT_EMPIRICAL_PCR,
     DEFAULT_VIDEO_FPS,
     FOLD_ROI_MIN_VALID_FRAMES,
     STANDARD_BALL_DIAMETER_CM,
+    SUPPORT_RATIO_GREEN_HIGH as _BIO_RATIO_GH,
+    SUPPORT_RATIO_GREEN_LOW as _BIO_RATIO_GL,
+    SUPPORT_RATIO_YELLOW_HIGH as _BIO_RATIO_YH,
+    SUPPORT_RATIO_YELLOW_LOW as _BIO_RATIO_YL,
+    ANKLE_DEFLECTION_GREEN_MAX_DEG,
+    ANKLE_DEFLECTION_YELLOW_MAX_DEG,
+    TRUNK_LEAN_GREEN_HIGH_DEG,
+    TRUNK_LEAN_GREEN_LOW_DEG,
+    TRUNK_LEAN_RED_FORWARD_DEG,
+    TRUNK_LEAN_YELLOW_BACK_DEG,
     ankle_half_window_frames,
     ankle_window_dorsiflex_drop_deg,
+    calculate_2d_angle,
     calculate_3d_joint_angle,
     calculate_sagittal_angle,
+    calculate_ankle_deflection,
     calculate_ankle_stiffness_variance,
     calculate_support_foot_offset_cm,
     calculate_support_foot_offset_detailed,
+    calculate_support_offset_by_shoulder_ratio,
+    calculate_support_ratio,
+    calculate_trunk_lean,
+    classify_trunk_lean_status,
     crosscheck_pcr_vs_world_lateral,
     estimate_body_height_px,
     evaluate_ball_bbox_for_pcr,
     infer_swing_leg_side,
     slice_ankle_impact_window_bounds,
     swing_leg_joint_keys,
+    world_delta_to_shoulder_normalized_cm,
 )
 
 
@@ -80,6 +99,7 @@ ERR_B1_STRAIGHT_LEG = "ERR_B1_STRAIGHT_LEG"
 ERR_B2_SHANK_ONLY = "ERR_B2_SHANK_ONLY"
 ERR_C1_LOOSE_ANKLE = "ERR_C1_LOOSE_ANKLE"
 ERR_C2_TOE_POKE = "ERR_C2_TOE_POKE"
+ERR_D1_TRUNK_LEAN = "ERR_D1_TRUNK_LEAN"  # 躯干后仰 / 过度折腰（近端失稳）
 PASS_SUPPORT_OK = "PASS_SUPPORT_OK"
 PASS_STANDARD = "PASS_STANDARD"
 
@@ -91,6 +111,7 @@ ERROR_PRIORITY: tuple[str, ...] = (
     ERR_A1_SUPPORT_BACK,
     ERR_SUPPORT_TOO_WIDE,
     ERR_A2_SUPPORT_WIDE,
+    ERR_D1_TRUNK_LEAN,  # 支撑过远时常伴随后仰代偿；独立严重失衡亦拦截
     ERR_EARLY_DECELERATION,
     ERR_B1_STRAIGHT_LEG,
     ERR_B2_SHANK_ONLY,
@@ -99,24 +120,37 @@ ERROR_PRIORITY: tuple[str, ...] = (
     PASS_STANDARD,
 )
 
-# 阈值（厘米 / 度 / 脚长比）——与教研标准化底库判定口径一致
+# 躯干倾角阈值（与 biomech_primitives 同源）
+TRUNK_LEAN_GREEN_LOW = float(TRUNK_LEAN_GREEN_LOW_DEG)
+TRUNK_LEAN_GREEN_HIGH = float(TRUNK_LEAN_GREEN_HIGH_DEG)
+TRUNK_LEAN_YELLOW_BACK = float(TRUNK_LEAN_YELLOW_BACK_DEG)
+TRUNK_LEAN_RED_FORWARD = float(TRUNK_LEAN_RED_FORWARD_DEG)
+
+# 阈值（厘米 / 度 / 脚长比）——V3.5 儿童/业余容错，与 DeterministicScorer 同源
 SUPPORT_WARMUP_CLOSE_CM = 5.0
 SUPPORT_BACK_OFFSET_CM = 10.0  # 支撑脚尖落后球心 > 10 cm → A1
-SUPPORT_WIDE_CM = 20.0  # 横向绝对距离 > 20 cm → A2（兼容旧阈值）
+SUPPORT_WIDE_CM = 35.0  # 横向绝对距离 > 35 cm → A2 严重偏宽（20–35 黄灯区）
+SUPPORT_WIDE_YELLOW_CM = 20.0  # >20cm 起算轻微瑕疵（不单独出 ERR）
 SUPPORT_LATERAL_IDEAL_LOW_CM = 15.0
 SUPPORT_LATERAL_IDEAL_HIGH_CM = 20.0
 SUPPORT_FOOT_RATIO_LOW = 0.8  # lateral_dist / foot_len
-SUPPORT_FOOT_RATIO_HIGH = 1.3
+SUPPORT_FOOT_RATIO_HIGH = 1.6  # ≈35cm / 22cm 脚长
 APPROACH_STRAIGHT_DEG = 20.0
 APPROACH_WIDE_DEG = 55.0
 APPROACH_IDEAL_LOW_DEG = 30.0
 APPROACH_IDEAL_HIGH_DEG = 45.0
-BACKSWING_STRAIGHT_LEG_DEG = 170.0  # min(knee) > 170° → B1
-BACKSWING_FOLD_IDEAL_LOW_DEG = 140.0
-BACKSWING_FOLD_IDEAL_HIGH_DEG = 160.0
-THIGH_RETRACTION_NEAR_ZERO_DEG = 8.0  # 大腿后伸 ≈ 0° → B2
-ANKLE_VARIANCE_FAIL = 18.0  # impact 窗口踝角方差超标 → C1
-ANKLE_DORSIFLEX_DROP_DEG = 12.0  # 背屈角骤降幅度
+# 后摆膝内角（swing_fold_angle）：与 max_folding=180−内角 对齐
+# GREEN 折叠深度 70–100° ⇒ 膝内角 80–110°
+BACKSWING_STRAIGHT_LEG_DEG = 140.0  # 膝内角 > 140° → B1 几乎没折叠
+BACKSWING_OVERFOLD_DEG = 70.0  # 膝内角 < 70° → 过度折叠（评分扣分；不单出 ERR）
+BACKSWING_FOLD_IDEAL_LOW_DEG = 80.0  # 合理发力下沿（↔ fold depth 100°）
+BACKSWING_FOLD_IDEAL_HIGH_DEG = 110.0  # 合理发力上沿（↔ fold depth 70°）
+IMPACT_STRAIGHT_LEG_DEG = 165.0  # 触球膝角 > 165° → 直腿扣分
+THIGH_RETRACTION_NEAR_ZERO_DEG = 8.0  # 大腿后伸 ≈ 0° → B2（仅浅折叠时）
+# 【V3.9】最大形变落差角：>20° → C1 严重松弛（取代旧方差 / 背屈骤降双判）
+ANKLE_DEFLECTION_FAIL_DEG = ANKLE_DEFLECTION_YELLOW_MAX_DEG  # > 20° → RED / C1
+ANKLE_VARIANCE_FAIL = ANKLE_DEFLECTION_FAIL_DEG  # 兼容旧名（语义已切换为 deflection_deg）
+ANKLE_DORSIFLEX_DROP_DEG = ANKLE_DEFLECTION_FAIL_DEG  # 兼容：落差与 dorsi_drop 同构
 TOE_POKE_INSTEP_ALIGN_DEG = 35.0  # 足背外展不足阈值
 LANDMARK_VISIBILITY_MIN = 0.7
 TEMPORAL_WINDOW_HALF_FRAMES = 15
@@ -132,8 +166,16 @@ PHASE_BACKSWING_END_PRE_MS = 60.0
 PHASE_IMPACT_HALF_MS = 20.0
 PHASE_FOLLOW_START_MS = 40.0
 
-AVERAGE_CHILD_SHOULDER_WIDTH_CM = 30.0
+AVERAGE_CHILD_SHOULDER_WIDTH_CM = float(_BIO_SHOULDER_CM)
 AVERAGE_CHILD_FOOT_LEN_M = 0.22  # 世界坐标缺失时的脚长兜底（米）
+# 肩宽归一化比例黄金标准（与 biomech_primitives / empirical_thresholds 同源）
+# GREEN 0.4–0.7；YELLOW 0.25–0.4 / 0.7–0.9；RED <0.25 / >0.9
+SUPPORT_SHOULDER_RATIO_GREEN_LOW = float(_BIO_RATIO_GL)
+SUPPORT_SHOULDER_RATIO_GREEN_HIGH = float(_BIO_RATIO_GH)
+SUPPORT_SHOULDER_RATIO_YELLOW_LOW = float(_BIO_RATIO_YL)
+SUPPORT_SHOULDER_RATIO_YELLOW_HIGH = float(_BIO_RATIO_YH)
+SUPPORT_SHOULDER_RATIO_RED_HIGH = float(_BIO_RATIO_YH)  # >0.9 → ERR_A2
+SUPPORT_SHOULDER_RATIO_RED_LOW = float(_BIO_RATIO_YL)  # <0.25 → 过近严重
 
 # 【V3.1 / Phase2】球体 PCR / 踝刚度常数由 biomech_primitives 权威导出（上方 import）
 
@@ -154,22 +196,28 @@ from indicator_builder import (
     PROVENANCE_ESTIMATED,
     PROVENANCE_MEASURED,
     PROVENANCE_MISSING,
+    PROVENANCE_TIER_CALIBRATED,
+    PROVENANCE_TIER_ESTIMATED,
+    PROVENANCE_TIER_MEASURED,
+    PROVENANCE_TIERS,
     STATUS_GREEN,
     STATUS_RED,
     STATUS_YELLOW,
     _EIGHT_DIMENSION_FALLBACK_UNITS,
     _EIGHT_DIMENSION_FALLBACK_VALUES,
     _metric_value_is_dirty,
+    apply_provenance_tiers,
     indicator_scoring_number,
     is_aigc_measurable_provenance,
     pack_focus_indicator,
+    resolve_provenance_tier,
     sanitize_eight_dimension_indicators,
 )
 from deterministic_scorer import (
+    ANKLE_DEFLECTION_GREEN,
+    ANKLE_DEFLECTION_YELLOW_HIGH,
     ANKLE_VARIANCE_GREEN,
     ANKLE_VARIANCE_YELLOW_HIGH,
-    KINEMATIC_ANKLE_VARIANCE_MAX_ALLOWED,
-    KINEMATIC_ANKLE_VARIANCE_RUNAWAY,
     KINEMATIC_DISTANCE_CLAMP_CM,
     KINEMATIC_DISTANCE_RUNAWAY_CM,
     KINEMATIC_KNEE_PHYSIO_MAX_DEG,
@@ -278,9 +326,11 @@ def _as_vec3(point) -> np.ndarray:
 def calculate_angle(a, b, c, *, is_knee_extension: bool = False) -> float:
     """以 b 为顶点的关节夹角（度）。
 
-    髋/膝屈伸（``is_knee_extension=True``）走矢状面 atan2；其余仍为 3D arccos。
+    髋/膝屈伸（``is_knee_extension=True``）走 XY-2D（Z 坍缩）；其余仍为 3D arccos。
     """
-    return calculate_3d_joint_angle(a, b, c, is_knee_extension=is_knee_extension)
+    if bool(is_knee_extension):
+        return float(calculate_2d_angle(a, b, c))
+    return calculate_3d_joint_angle(a, b, c, is_knee_extension=False)
 
 
 def _time_derivative_series(values, timestamps_sec) -> list[float]:
@@ -456,6 +506,50 @@ class PhaseWindow:
         if self.end_index < self.start_index:
             return range(0, 0)
         return range(self.start_index, self.end_index + 1)
+
+
+def json_safe_number(value: Any) -> Optional[float]:
+    """把内部数值化成 JSON 合法值：±inf / NaN / 不可解析 → None。
+
+    ``PhaseWindow`` 用 ``float("-inf")`` / ``float("inf")`` 作为"动态窗（自序列
+    起点 / 到序列末尾）"的哨兵值，这在模块内部是正确语义；但 Starlette 的
+    ``JSONResponse`` 以 ``allow_nan=False`` 序列化，一旦 ±inf 混进响应体就会在
+    写响应的中途抛 ``ValueError``，连接被掐断，浏览器只能看到一个没有上下文的
+    ``Failed to fetch``。因此凡是要跨出进程边界的数值，一律先过这道闸。
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return number
+
+
+def json_safe_payload(value: Any) -> Any:
+    """递归清洗任意嵌套结构，产出可被 ``allow_nan=False`` 安全序列化的对象。
+
+    - ±inf / NaN → ``None``（语义：该边界不设限，而不是"数值为 0"）
+    - numpy 标量 / 数组 → 原生 ``float`` / ``int`` / ``list``
+    - dict / list / tuple → 逐元素递归
+    """
+    if value is None or isinstance(value, (bool, str)):
+        return value
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, np.ndarray):
+        return [json_safe_payload(item) for item in value.tolist()]
+    if isinstance(value, int):
+        return int(value)
+    if isinstance(value, float):
+        return json_safe_number(value)
+    if isinstance(value, dict):
+        return {str(key): json_safe_payload(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [json_safe_payload(item) for item in value]
+    return value
 
 
 @dataclass
@@ -718,11 +812,10 @@ def lock_absolute_t0(
 # 相位内指标（严禁跨阶段）
 # --------------------------------------------------------------------------
 def _support_metrics(frames, phase: PhaseWindow, ball_center, cm_per_pixel) -> dict[str, Any]:
-    """支撑站位：优先世界坐标（米）；像素路径改用 V3.1 球体 PCR 标定。
+    """支撑站位：全面肩宽归一化比例（废除 PCR 绝对厘米主路径）。
 
-    【V3.1】当帧内存在 ``ball_bbox`` / ``ball_pixel_bbox`` 时，以
-    ``calculate_support_foot_offset_cm`` 输出横距（cm），替代肩宽估算比例尺。
-    lateral_dist / foot_len > 1.3 → ERR_A2_SUPPORT_WIDE。
+    优先级：world 肩宽比 → 图像平面 ``calculate_support_ratio`` → 脚长比兜底。
+    判定带：GREEN 0.4–0.7；YELLOW 0.25–0.4 / 0.7–0.9；RED <0.25 / >0.9。
     """
     del cm_per_pixel  # 肩宽经验比例尺不再作为主路径
     n = len(frames)
@@ -764,18 +857,15 @@ def _support_metrics(frames, phase: PhaseWindow, ball_center, cm_per_pixel) -> d
     # 球心必须与关节同坐标系：优先世界系右足尖锚点
     ball_w = _world_joint(rec, "right_foot_index")
     if ball_w is None:
-        # 回退到序列中 T0 邻域：调用方传入的 ball 若为世界系则直接用
         if use_world and float(np.linalg.norm(ball)) > 5.0:
             ball_w = _world_joint(rec, "right_ankle")
     if ball_w is not None:
         ball = ball_w
 
-    # 强制右脚 3D 脚长
     foot_len_m = _compute_foot_len_m(rec, side="right")
     if foot_len_m < 0.05:
         foot_len_m = float(AVERAGE_CHILD_FOOT_LEN_M)
 
-    # 左踝—球心 3D 横向距离（同坐标系比值）
     lateral_raw = abs(float(ankle[0] - ball[0]))
     ap_raw = float(toe[2] - ball[2])
     dist_xz_raw = float(
@@ -786,72 +876,110 @@ def _support_metrics(frames, phase: PhaseWindow, ball_center, cm_per_pixel) -> d
     if lateral_raw < 1e-9 and dist_xz_raw > 1e-9:
         lateral_raw = dist_xz_raw
 
-    ratio = float(lateral_raw / foot_len_m) if foot_len_m > 1e-9 else 0.0
+    foot_ratio = float(lateral_raw / foot_len_m) if foot_len_m > 1e-9 else 0.0
 
-    # 【V3.1 PCR】像素横距：支撑外踝 × 足球 bbox 物理直径标定
-    ball_bbox = (
-        rec.get("ball_pixel_bbox")
-        or rec.get("ball_bbox")
-        or (ball_center if isinstance(ball_center, (list, tuple, np.ndarray)) and len(np.asarray(ball_center).reshape(-1)) >= 4 else None)
-    )
-    ankle_px = None
-    try:
-        # 图像平面踝：优先显式像素字段，否则用 landmark 的 x,y
-        if rec.get("left_ankle_px") is not None:
-            ankle_px = rec["left_ankle_px"]
-        else:
-            ankle_img = rec.get("left_ankle")
-            if ankle_img is not None:
-                ankle_px = (_as_vec3(ankle_img)[0], _as_vec3(ankle_img)[1])
-    except Exception:
-        ankle_px = None
+    support_ratio_shoulder = None
+    distance_method = "unknown"
+    lateral = 0.0
+    ap = 0.0
+    dist_xz = 0.0
+    coord_space = "unknown"
 
-    pcr_offset_cm = None
-    if ankle_px is not None:
-        body_h_px = estimate_body_height_px(landmarks=rec)
-        pcr_offset_cm = float(
-            calculate_support_foot_offset_cm(
-                ankle_px,
-                ball_bbox,
-                body_h_px=body_h_px,
-                world_lateral_cm=float(lateral_raw * 100.0),
-                world_foot_len_m=float(foot_len_m),
-            )
+    # 【V3.8】肩宽归一化优先：world 体侧投影 → 图像平面 calculate_support_ratio
+    if use_world or (foot_len_m < 1.0 and _has_world_landmarks(rec)):
+        shoulder_detail = calculate_support_offset_by_shoulder_ratio(
+            ankle,
+            ball,
+            _joint_prefer_world(rec, "left_shoulder"),
+            _joint_prefer_world(rec, "right_shoulder"),
+            coord_space="world_m",
+            distance_mode="lateral",
         )
+        if shoulder_detail.get("ok"):
+            support_ratio_shoulder = float(shoulder_detail["support_ratio"])
+            lateral = float(shoulder_detail["distance_cm_estimate"])
+            sw = float(shoulder_detail["shoulder_width"] or 1.0)
+            ap = float((ap_raw / sw) * AVERAGE_CHILD_SHOULDER_WIDTH_CM) if sw > 1e-9 else 0.0
+            dist_xz = (
+                float((dist_xz_raw / sw) * AVERAGE_CHILD_SHOULDER_WIDTH_CM)
+                if sw > 1e-9
+                else lateral
+            )
+            coord_space = "shoulder_width_ratio"
+            distance_method = "shoulder_width_ratio"
 
-    if use_world:
-        # 米制输出 cm（世界坐标主路径）
-        lateral = float(lateral_raw * 100.0)
-        ap = float(ap_raw * 100.0)
-        dist_xz = float(dist_xz_raw * 100.0)
-        coord_space = "world_m"
-    elif pcr_offset_cm is not None and ball_bbox is not None:
-        # 【V3.1】无世界坐标：球体 PCR 横距为权威物理量
-        lateral = float(pcr_offset_cm)
-        ap = float((ap_raw / foot_len_m) * AVERAGE_CHILD_FOOT_LEN_M * 100.0) if foot_len_m > 1e-9 else 0.0
-        dist_xz = float(max(lateral, abs(ap)))
-        coord_space = "ball_pcr"
-        foot_len_cm = float(AVERAGE_CHILD_FOOT_LEN_M * 100.0)
-        ratio = float(lateral / foot_len_cm) if foot_len_cm > 1e-9 else ratio
-    elif foot_len_m < 1.0:
-        # 关节已是米制但缺 world 标记：按米→cm
-        lateral = float(lateral_raw * 100.0)
-        ap = float(ap_raw * 100.0)
-        dist_xz = float(dist_xz_raw * 100.0)
-        coord_space = "world_m"
-    else:
-        # 无可靠世界坐标且无球框：脚长归一化反推等效 cm
-        lateral = float(ratio * AVERAGE_CHILD_FOOT_LEN_M * 100.0)
-        ap = float((ap_raw / foot_len_m) * AVERAGE_CHILD_FOOT_LEN_M * 100.0) if foot_len_m > 1e-9 else 0.0
-        dist_xz = float((dist_xz_raw / foot_len_m) * AVERAGE_CHILD_FOOT_LEN_M * 100.0) if foot_len_m > 1e-9 else lateral
+    if support_ratio_shoulder is None:
+        # 图像平面：支撑踝 X 距球心 / 肩宽像素
+        ball_px = None
+        try:
+            if rec.get("left_ankle") is not None or rec.get("left_ankle_px") is not None:
+                # 优先帧内球框中心；否则用调用方 ball 的 x,y
+                bbox = rec.get("ball_pixel_bbox") or rec.get("ball_bbox")
+                if bbox is not None:
+                    qa = evaluate_ball_bbox_for_pcr(bbox)
+                    if qa.get("ball_center_x") is not None:
+                        ball_px = (
+                            float(qa["ball_center_x"]),
+                            float(qa.get("ball_center_y") or 0.0),
+                        )
+                if ball_px is None and ball_center is not None:
+                    bc = _as_vec3(ball_center)
+                    ball_px = (float(bc[0]), float(bc[1]))
+                ratio_detail = calculate_support_ratio(
+                    rec, ball_px, support_ankle_key="left_ankle"
+                )
+                if ratio_detail.get("ok"):
+                    support_ratio_shoulder = float(ratio_detail["support_ratio"])
+                    lateral = float(
+                        support_ratio_shoulder * AVERAGE_CHILD_SHOULDER_WIDTH_CM
+                    )
+                    ap = (
+                        float((ap_raw / foot_len_m) * AVERAGE_CHILD_FOOT_LEN_M * 100.0)
+                        if foot_len_m > 1e-9
+                        else 0.0
+                    )
+                    dist_xz = float(max(lateral, abs(ap)))
+                    coord_space = "shoulder_width_ratio"
+                    distance_method = "shoulder_width_ratio"
+        except Exception:
+            pass
+
+    if support_ratio_shoulder is None:
+        # 最后兜底：脚长归一化（仅估计展示 cm，站位码仍走脚长比）
+        lateral = float(foot_ratio * AVERAGE_CHILD_FOOT_LEN_M * 100.0)
+        ap = (
+            float((ap_raw / foot_len_m) * AVERAGE_CHILD_FOOT_LEN_M * 100.0)
+            if foot_len_m > 1e-9
+            else 0.0
+        )
+        dist_xz = (
+            float((dist_xz_raw / foot_len_m) * AVERAGE_CHILD_FOOT_LEN_M * 100.0)
+            if foot_len_m > 1e-9
+            else lateral
+        )
         coord_space = "foot_len_normalized"
+        distance_method = "foot_len_normalized"
 
-    if SUPPORT_FOOT_RATIO_LOW <= ratio <= SUPPORT_FOOT_RATIO_HIGH:
+    # 站位码：肩宽比例优先
+    if support_ratio_shoulder is not None:
+        if (
+            SUPPORT_SHOULDER_RATIO_GREEN_LOW
+            <= support_ratio_shoulder
+            <= SUPPORT_SHOULDER_RATIO_GREEN_HIGH
+        ):
+            support_code = PASS_SUPPORT_OK
+        elif support_ratio_shoulder < SUPPORT_SHOULDER_RATIO_RED_LOW:
+            support_code = ERR_SUPPORT_TOO_CLOSE
+        elif support_ratio_shoulder > SUPPORT_SHOULDER_RATIO_RED_HIGH:
+            support_code = ERR_A2_SUPPORT_WIDE
+        else:
+            # 黄灯区：不单出严重 ERR
+            support_code = PASS_SUPPORT_OK
+    elif SUPPORT_FOOT_RATIO_LOW <= foot_ratio <= SUPPORT_FOOT_RATIO_HIGH:
         support_code = PASS_SUPPORT_OK
-    elif ratio < SUPPORT_FOOT_RATIO_LOW:
+    elif foot_ratio < SUPPORT_FOOT_RATIO_LOW:
         support_code = ERR_SUPPORT_TOO_CLOSE
     else:
-        # 严格：脚长比 > 1.3 → ERR_A2_SUPPORT_WIDE
         support_code = ERR_A2_SUPPORT_WIDE
 
     try:
@@ -868,12 +996,13 @@ def _support_metrics(frames, phase: PhaseWindow, ball_center, cm_per_pixel) -> d
         "support_ball_dist_cm": round(dist_xz, 1),
         "support_knee_angle": round(float(support_knee), 1),
         "foot_len_m": round(float(foot_len_m), 4),
-        "support_foot_ratio": round(ratio, 3),
+        "support_foot_ratio": round(foot_ratio, 3),
         "support_stance_code": support_code,
         "support_coord_space": coord_space,
+        "support_distance_method": distance_method,
     }
-    if pcr_offset_cm is not None:
-        out["support_pcr_offset_cm"] = round(float(pcr_offset_cm), 2)
+    if support_ratio_shoulder is not None:
+        out["support_ratio"] = round(float(support_ratio_shoulder), 4)
     return out
 
 
@@ -901,8 +1030,9 @@ def _backswing_metrics(frames, plan: TemporalIsolationPlan) -> dict[str, Any]:
         if i > plan.t0_index:
             continue
         rec = frames[i]
+        # XY-2D / Z 坍缩：抗 MediaPipe 侧向深度畸变毛刺
         knee_angles.append(
-            calculate_sagittal_angle(rec[hip_k], rec[knee_k], rec[ankle_k])
+            calculate_2d_angle(rec[hip_k], rec[knee_k], rec[ankle_k])
         )
         thigh_angles.append(_thigh_retraction_deg(rec))
 
@@ -913,7 +1043,7 @@ def _backswing_metrics(frames, plan: TemporalIsolationPlan) -> dict[str, Any]:
         for i in range(safe_start, safe_end + 1):
             rec = frames[i]
             knee_angles.append(
-                calculate_sagittal_angle(rec[hip_k], rec[knee_k], rec[ankle_k])
+                calculate_2d_angle(rec[hip_k], rec[knee_k], rec[ankle_k])
             )
             thigh_angles.append(_thigh_retraction_deg(rec))
         start_i, end_i = safe_start, safe_end
@@ -949,6 +1079,79 @@ def _backswing_metrics(frames, plan: TemporalIsolationPlan) -> dict[str, Any]:
     }
 
 
+def _trunk_lean_metrics(frames, plan: TemporalIsolationPlan, support: dict) -> dict[str, Any]:
+    """准备期 T₋₁ 与击球期 T₀ 的躯干倾角（纯 2D）。
+
+    T₋₁：优先支撑落地帧，否则 ``t0 - 1``；T₀：触球绝对零点帧。
+    最终评价取两期中更严重一档（RED > YELLOW > GREEN）。
+    """
+    n = len(frames) if frames else 0
+    t0 = int(plan.t0_index)
+    if n <= 0:
+        return {
+            "trunk_lean_angle": None,
+            "trunk_lean_t0_deg": None,
+            "trunk_lean_t_minus_1_deg": None,
+            "trunk_lean_status": "GREEN",
+            "trunk_lean_linked_to_wide_stance": False,
+        }
+
+    t0 = int(max(0, min(n - 1, t0)))
+    t_prep = support.get("landing_frame_index")
+    try:
+        t_prep = int(t_prep) if t_prep is not None else max(0, t0 - 1)
+    except (TypeError, ValueError):
+        t_prep = max(0, t0 - 1)
+    t_prep = int(max(0, min(n - 1, t_prep)))
+    if t_prep == t0 and t0 > 0:
+        t_prep = t0 - 1
+
+    ball = plan.ball_center
+    lean_t0 = calculate_trunk_lean(frames[t0], ball_center=ball)
+    lean_tm1 = calculate_trunk_lean(frames[t_prep], ball_center=ball)
+
+    st_t0 = classify_trunk_lean_status(lean_t0)
+    st_tm1 = classify_trunk_lean_status(lean_tm1)
+    severity = {"GREEN": 0, "YELLOW": 1, "RED": 2}
+    # 代表角：优先取更严重相位的角度；并列时取 T0
+    if severity[st_tm1] > severity[st_t0]:
+        lean_rep, st_rep = lean_tm1, st_tm1
+    else:
+        lean_rep, st_rep = lean_t0, st_t0
+
+    support_code = support.get("support_stance_code")
+    support_ratio = support.get("support_ratio")
+    try:
+        ratio_f = float(support_ratio) if support_ratio is not None else None
+    except (TypeError, ValueError):
+        ratio_f = None
+    wide_stance = support_code in (ERR_SUPPORT_TOO_WIDE, ERR_A2_SUPPORT_WIDE) or (
+        ratio_f is not None and ratio_f > SUPPORT_SHOULDER_RATIO_RED_HIGH
+    )
+    # 后仰 + 支撑过远 → 物理代偿关联
+    lean_for_link = lean_rep if lean_rep is not None else lean_t0
+    linked = bool(
+        wide_stance
+        and lean_for_link is not None
+        and float(lean_for_link) < float(TRUNK_LEAN_GREEN_LOW)
+    )
+
+    return {
+        "trunk_lean_angle": (
+            round(float(lean_rep), 2) if lean_rep is not None else None
+        ),
+        "trunk_lean_t0_deg": (
+            round(float(lean_t0), 2) if lean_t0 is not None else None
+        ),
+        "trunk_lean_t_minus_1_deg": (
+            round(float(lean_tm1), 2) if lean_tm1 is not None else None
+        ),
+        "trunk_lean_status": st_rep,
+        "trunk_lean_prep_frame_index": int(t_prep),
+        "trunk_lean_linked_to_wide_stance": linked,
+    }
+
+
 def _impact_metrics(frames, plan: TemporalIsolationPlan) -> dict[str, Any]:
     phase = plan.phases["impact_phase"]
     idxs = list(phase.indices())
@@ -963,9 +1166,8 @@ def _impact_metrics(frames, plan: TemporalIsolationPlan) -> dict[str, Any]:
         )
         for i in idxs
     ]
-    # 【V3.1/Phase2】全序列 + 按时长冲击窗方差（可见度门控 + 中值滤波去飞点）
-    # 方差权威实现见 biomech_primitives.calculate_ankle_stiffness_variance：
-    # 冲击窗扩邻域 → 插值 → kernel=3 中值平滑 → 仅平滑数组参与 np.var；空序列返回 0.0
+    # 【V3.9】全序列 + T0±2 最大形变落差角（SG 平滑后 max−min）
+    # 权威实现见 biomech_primitives.calculate_ankle_deflection
     full_ankle_series = [
         calculate_3d_joint_angle(
             frames[i][knee_k], frames[i][ankle_k], frames[i][foot_k]
@@ -976,24 +1178,24 @@ def _impact_metrics(frames, plan: TemporalIsolationPlan) -> dict[str, Any]:
         min(_landmark_visibility(frames[i], j) for j in ankle_vis_joints)
         for i in range(len(frames))
     ] if frames else None
-    fps = float(getattr(plan, "fps", DEFAULT_VIDEO_FPS) or DEFAULT_VIDEO_FPS)
     try:
-        variance, stiffness_status = calculate_ankle_stiffness_variance(
+        deflection_deg, stiffness_status = calculate_ankle_deflection(
             full_ankle_series,
             plan.t0_index,
-            fps=fps,
             landmark_visibility_series=full_ankle_vis,
         )
     except Exception:  # noqa: BLE001
-        variance, stiffness_status = 0.0, ANKLE_STIFFNESS_LOCKED
+        deflection_deg, stiffness_status = 0.0, ANKLE_STIFFNESS_LOCKED
     t0_local = idxs.index(plan.t0_index) if plan.t0_index in idxs else len(idxs) // 2
     ankle_at_t0 = float(ankle_angles[t0_local]) if ankle_angles else 140.0
-    # 背屈角骤降：窗口内 max - min
-    dorsi_drop = float(max(ankle_angles) - min(ankle_angles)) if ankle_angles else 0.0
+    # 形变落差与背屈骤降同构（max−min）；保留 dorsi 字段供旧消费者
+    dorsi_drop = float(deflection_deg)
     abduction = _instep_abduction_proxy_deg(frames[plan.t0_index], plan.ball_center)
     return {
         "ankle_angle": round(ankle_at_t0, 1),
-        "ankle_variance": round(variance, 2),
+        "ankle_deflection_deg": round(float(deflection_deg), 2),
+        # 兼容旧字段名：数值现为 deflection_deg，不再是 σ²
+        "ankle_variance": round(float(deflection_deg), 2),
         "ankle_stiffness_status": stiffness_status,
         "ankle_dorsiflex_drop_deg": round(dorsi_drop, 1),
         "ankle_locked": bool(
@@ -1243,26 +1445,74 @@ class DeterministicErrorEngine:
         ball_dist = float(metrics.get("support_ball_dist_cm", lateral) or lateral)
         fold = float(metrics.get("swing_fold_angle", 180.0) or 180.0)
         thigh = float(metrics.get("thigh_retraction_deg", 0.0) or 0.0)
-        ankle_var = float(metrics.get("ankle_variance", 99.0) or 99.0)
-        dorsi_drop = float(metrics.get("ankle_dorsiflex_drop_deg", 0.0) or 0.0)
+        ankle_deflection = float(
+            metrics.get("ankle_deflection_deg", metrics.get("ankle_variance", 99.0))
+            or 99.0
+        )
+        ankle_var = float(ankle_deflection)  # 兼容旧局部变量名
+        dorsi_drop = float(
+            metrics.get("ankle_dorsiflex_drop_deg", ankle_deflection) or ankle_deflection
+        )
         abduction = float(metrics.get("instep_abduction_deg", 0.0) or 0.0)
         ankle_locked = bool(metrics.get("ankle_locked", False))
+        stiffness_status = str(metrics.get("ankle_stiffness_status") or "")
         approach = float(metrics.get("approach_angle", 35.0) or 35.0)
         foot_ratio = float(metrics.get("support_foot_ratio", 1.0) or 1.0)
         stance_code = metrics.get("support_stance_code")
         approach_code = metrics.get("approach_error_code")
         early_decel = bool(metrics.get("early_deceleration", False))
         foot_len_m = float(metrics.get("foot_len_m", AVERAGE_CHILD_FOOT_LEN_M) or AVERAGE_CHILD_FOOT_LEN_M)
+        trunk_lean = metrics.get("trunk_lean_angle")
+        try:
+            trunk_lean_f = float(trunk_lean) if trunk_lean is not None else None
+        except (TypeError, ValueError):
+            trunk_lean_f = None
+        trunk_status = str(
+            metrics.get("trunk_lean_status")
+            or classify_trunk_lean_status(trunk_lean_f)
+        ).upper()
+        trunk_linked = bool(metrics.get("trunk_lean_linked_to_wide_stance", False))
 
-        too_close = (
-            stance_code == ERR_SUPPORT_TOO_CLOSE
-            or foot_ratio < SUPPORT_FOOT_RATIO_LOW
-            or ball_dist < SUPPORT_WARMUP_CLOSE_CM
-            or lateral < SUPPORT_WARMUP_CLOSE_CM
-        )
-        too_wide = (
-            stance_code in (ERR_SUPPORT_TOO_WIDE, ERR_A2_SUPPORT_WIDE)
-            or foot_ratio > SUPPORT_FOOT_RATIO_HIGH
+        support_ratio = metrics.get("support_ratio")
+        try:
+            support_ratio_f = float(support_ratio) if support_ratio is not None else None
+        except (TypeError, ValueError):
+            support_ratio_f = None
+
+        # 【V3.8】站位判定全面改用肩宽比；无 ratio 时才回退脚长比 / 遗留 cm
+        if support_ratio_f is not None:
+            too_close = (
+                stance_code == ERR_SUPPORT_TOO_CLOSE
+                or support_ratio_f < SUPPORT_SHOULDER_RATIO_RED_LOW
+            )
+            too_wide = (
+                stance_code in (ERR_SUPPORT_TOO_WIDE, ERR_A2_SUPPORT_WIDE)
+                or support_ratio_f > SUPPORT_SHOULDER_RATIO_RED_HIGH
+            )
+        else:
+            too_close = (
+                stance_code == ERR_SUPPORT_TOO_CLOSE
+                or foot_ratio < SUPPORT_FOOT_RATIO_LOW
+                or ball_dist < SUPPORT_WARMUP_CLOSE_CM
+                or lateral < SUPPORT_WARMUP_CLOSE_CM
+            )
+            too_wide = (
+                lateral > SUPPORT_WIDE_CM
+                or foot_ratio > SUPPORT_FOOT_RATIO_HIGH
+                or (
+                    stance_code in (ERR_SUPPORT_TOO_WIDE, ERR_A2_SUPPORT_WIDE)
+                    and lateral > SUPPORT_WIDE_CM
+                )
+            )
+        # 支撑过远 + 躯干后仰：标记代偿关联（供 A2 / D1 文案使用）
+        if too_wide and trunk_lean_f is not None and trunk_lean_f < TRUNK_LEAN_GREEN_LOW:
+            trunk_linked = True
+        # B2：仅浅折叠区 (理想上沿, 直腿阈值] 且髋未后伸；合理 90–130° 绝不误触
+        shank_only_hi = float(_shank_only_fold_max())
+        is_shallow_shank_only = (
+            fold > BACKSWING_FOLD_IDEAL_HIGH_DEG
+            and fold <= min(BACKSWING_STRAIGHT_LEG_DEG, shank_only_hi)
+            and thigh <= THIGH_RETRACTION_NEAR_ZERO_DEG
         )
 
         checks: list[tuple[str, bool, str]] = [
@@ -1278,14 +1528,40 @@ class DeterministicErrorEngine:
             ),
             (
                 ERR_WARMUP_CLOSE,
-                ball_dist < SUPPORT_WARMUP_CLOSE_CM and foot_ratio >= SUPPORT_FOOT_RATIO_LOW,
-                f"支撑脚距球心 {ball_dist:.1f}cm（横距 {lateral:.1f}cm），小于 {SUPPORT_WARMUP_CLOSE_CM:.0f}cm 安全间距",
+                (
+                    support_ratio_f is not None
+                    and support_ratio_f < SUPPORT_SHOULDER_RATIO_YELLOW_LOW
+                    and not too_close
+                )
+                or (
+                    support_ratio_f is None
+                    and ball_dist < SUPPORT_WARMUP_CLOSE_CM
+                    and foot_ratio >= SUPPORT_FOOT_RATIO_LOW
+                ),
+                (
+                    f"支撑脚横距比例 {support_ratio_f:.2f} < {SUPPORT_SHOULDER_RATIO_YELLOW_LOW:.2f}（过近）"
+                    if support_ratio_f is not None
+                    else (
+                        f"支撑脚距球心 {ball_dist:.1f}cm（横距 {lateral:.1f}cm），"
+                        f"小于 {SUPPORT_WARMUP_CLOSE_CM:.0f}cm 安全间距"
+                    )
+                ),
             ),
             (
                 ERR_SUPPORT_TOO_CLOSE,
-                too_close and foot_ratio < SUPPORT_FOOT_RATIO_LOW,
-                f"支撑横距/脚长比 {foot_ratio:.2f} < {SUPPORT_FOOT_RATIO_LOW:.1f}"
-                f"（横距 {lateral:.1f}cm，脚长 {foot_len_m * 100:.1f}cm），踩球槛过近",
+                too_close
+                and (
+                    (support_ratio_f is not None and support_ratio_f < SUPPORT_SHOULDER_RATIO_RED_LOW)
+                    or (support_ratio_f is None and foot_ratio < SUPPORT_FOOT_RATIO_LOW)
+                ),
+                (
+                    f"支撑脚横距比例 {support_ratio_f:.2f} < {SUPPORT_SHOULDER_RATIO_RED_LOW:.2f}（过近）"
+                    if support_ratio_f is not None
+                    else (
+                        f"支撑横距/脚长比 {foot_ratio:.2f} < {SUPPORT_FOOT_RATIO_LOW:.1f}"
+                        f"（横距 {lateral:.1f}cm，脚长 {foot_len_m * 100:.1f}cm），踩球槛过近"
+                    )
+                ),
             ),
             (
                 ERR_A1_SUPPORT_BACK,
@@ -1295,8 +1571,44 @@ class DeterministicErrorEngine:
             (
                 ERR_A2_SUPPORT_WIDE,
                 too_wide,
-                f"支撑横距/脚长比 {foot_ratio:.2f} > {SUPPORT_FOOT_RATIO_HIGH:.1f}"
-                f"（横距 {lateral:.1f}cm = {foot_ratio:.2f}×脚长），站位偏宽易诱发横向扫把踢",
+                (
+                    (
+                        f"支撑脚横距比例 {support_ratio_f:.2f} > {SUPPORT_SHOULDER_RATIO_RED_HIGH:.2f}"
+                        f"（严重外挂，距离过远）"
+                        if support_ratio_f is not None
+                        else (
+                            f"支撑横距 {lateral:.1f}cm > {SUPPORT_WIDE_CM:.0f}cm"
+                            f"（脚长比 {foot_ratio:.2f}），站位偏宽易诱发横向扫把踢"
+                        )
+                    )
+                    + (
+                        f"；伴随躯干后仰 {trunk_lean_f:.1f}°，属站位过远的近端代偿"
+                        if trunk_linked and trunk_lean_f is not None
+                        else ""
+                    )
+                ),
+            ),
+            (
+                ERR_D1_TRUNK_LEAN,
+                trunk_status == "RED"
+                or (
+                    trunk_lean_f is not None
+                    and (
+                        trunk_lean_f < TRUNK_LEAN_YELLOW_BACK
+                        or trunk_lean_f > TRUNK_LEAN_RED_FORWARD
+                    )
+                ),
+                (
+                    f"躯干倾角 {trunk_lean_f:.1f}°" if trunk_lean_f is not None else "躯干倾角异常"
+                )
+                + (
+                    f"（RED：后仰<{TRUNK_LEAN_YELLOW_BACK:.0f}° 或前倾>{TRUNK_LEAN_RED_FORWARD:.0f}°）"
+                )
+                + (
+                    "；与支撑脚过远联动——后仰多为够球代偿，请先收回站位再压重心"
+                    if trunk_linked
+                    else "；近端核心失稳，触球前应微微前倾压住重心"
+                ),
             ),
             (
                 ERR_EARLY_DECELERATION,
@@ -1306,21 +1618,25 @@ class DeterministicErrorEngine:
             (
                 ERR_B1_STRAIGHT_LEG,
                 fold > BACKSWING_STRAIGHT_LEG_DEG,
-                f"backswing_phase 内膝关节极值角 {fold:.1f}°，大于 {BACKSWING_STRAIGHT_LEG_DEG:.0f}°（全程直腿）",
+                f"后摆膝内角（swing_fold_angle）{fold:.1f}° > {BACKSWING_STRAIGHT_LEG_DEG:.0f}°"
+                f"（几乎没折叠；合理区间 {BACKSWING_FOLD_IDEAL_LOW_DEG:.0f}–"
+                f"{BACKSWING_FOLD_IDEAL_HIGH_DEG:.0f}°）",
             ),
             (
                 ERR_B2_SHANK_ONLY,
-                fold <= BACKSWING_STRAIGHT_LEG_DEG
-                and fold < _shank_only_fold_max()
-                and thigh <= THIGH_RETRACTION_NEAR_ZERO_DEG,
-                f"backswing_phase 内小腿折叠角 {fold:.1f}° 但大腿后伸（髋后伸代理）仅 {thigh:.1f}°≈0°，只用小腿弹射",
+                is_shallow_shank_only,
+                f"后摆膝内角 {fold:.1f}° 处于浅折叠区（>"
+                f"{BACKSWING_FOLD_IDEAL_HIGH_DEG:.0f}°）且大腿后伸仅 {thigh:.1f}°≈0°，只用小腿弹射",
             ),
             (
                 ERR_C1_LOOSE_ANKLE,
-                (not ankle_locked)
-                or ankle_var >= ANKLE_VARIANCE_FAIL
-                or dorsi_drop >= ANKLE_DORSIFLEX_DROP_DEG,
-                f"击球窗踝角方差 σ²={ankle_var:.2f}，背屈骤降 {dorsi_drop:.1f}°，踝关节锁死={ankle_locked}",
+                (
+                    ankle_deflection > ANKLE_DEFLECTION_FAIL_DEG
+                    or stiffness_status == ANKLE_STIFFNESS_YIELDING
+                ),
+                f"击球窗踝形变落差 {ankle_deflection:.1f}° > {ANKLE_DEFLECTION_FAIL_DEG:.0f}°"
+                f"（严重松弛；GREEN<{ANKLE_DEFLECTION_GREEN_MAX_DEG:.0f}°），"
+                f"刚度={stiffness_status or ('LOCKED' if ankle_locked else 'YIELDING')}",
             ),
             (
                 ERR_C2_TOE_POKE,
@@ -1338,11 +1654,16 @@ class DeterministicErrorEngine:
                     "decision_reason": reason,
                 }
 
+        lean_txt = (
+            f"{trunk_lean_f:.1f}°/{trunk_status}"
+            if trunk_lean_f is not None
+            else "n/a"
+        )
         reason = (
             f"助跑角 {approach:.1f}°，支撑比 {foot_ratio:.2f}（"
             f"{SUPPORT_FOOT_RATIO_LOW:.1f}~{SUPPORT_FOOT_RATIO_HIGH:.1f}），"
             f"膝折叠 {fold:.1f}°，大腿后伸 {thigh:.1f}°，踝锁死={ankle_locked}，"
-            f"足背外展 {abduction:.1f}°"
+            f"足背外展 {abduction:.1f}°，躯干倾角 {lean_txt}"
         )
         return {
             "primary_error_code": PASS_STANDARD,
@@ -1366,6 +1687,7 @@ KEYFRAME_PHASE_BY_ERROR: dict[str, str] = {
     ERR_B2_SHANK_ONLY: "backswing_phase",
     ERR_C1_LOOSE_ANKLE: "impact_phase",
     ERR_C2_TOE_POKE: "impact_phase",
+    ERR_D1_TRUNK_LEAN: "impact_phase",
     PASS_SUPPORT_OK: "support_phase",
     PASS_STANDARD: "impact_phase",
 }
@@ -1395,6 +1717,10 @@ def resolve_keyframe_index(diagnosis: dict[str, Any]) -> int:
         ERR_A2_SUPPORT_WIDE,
     ):
         return int(metrics.get("landing_frame_index", t0) or t0)
+
+    if code == ERR_D1_TRUNK_LEAN:
+        # 后仰代偿常在准备期更明显；优先 T₋₁ 帧
+        return int(metrics.get("trunk_lean_prep_frame_index", t0) or t0)
 
     if code in (ERR_APPROACH_TOO_STRAIGHT, ERR_APPROACH_TOO_WIDE):
         win = metrics.get("approach_window") or [max(0, t0 - 18), max(0, t0 - 9)]
@@ -1454,6 +1780,7 @@ def _metric_to_joint_name(metric_key: str, swing_side: str = "right") -> Optiona
         "ankle_rigidity": ankle_k,
         "support_knee_angle": support_knee,
         "hip_torsion_angle": hip_k,
+        "trunk_lean_angle": "left_shoulder",  # 近端核心：肩带代表躯干倾角
     }
     return mapping.get(str(metric_key))
 
@@ -1760,7 +2087,7 @@ def diagnose_with_temporal_isolation(
         safe_end = max(0, t0_index - 1)
         safe_start = max(0, safe_end - MIN_PHASE_WINDOW_FRAMES + 1)
         knee_fallback = [
-            calculate_sagittal_angle(
+            calculate_2d_angle(
                 frames[i]["right_hip"], frames[i]["right_knee"], frames[i]["right_ankle"]
             )
             for i in range(safe_start, safe_end + 1)
@@ -1779,6 +2106,7 @@ def diagnose_with_temporal_isolation(
     follow = _follow_through_metrics(frames, plan)
     approach = _approach_metrics(frames, plan, support)
     early = _early_deceleration_metrics(frames, t0_index)
+    trunk = _trunk_lean_metrics(frames, plan, support)
 
     # 鞭打摆速：仅用 T0 前角速度峰值，避免随前干扰（跳过低置信帧）
     knee_series = []
@@ -1796,22 +2124,9 @@ def diagnose_with_temporal_isolation(
     pre_t0_omega = [abs(omega[i]) for i in range(0, t0_index + 1)]
     whip = float(max(pre_t0_omega)) if pre_t0_omega else 0.0
 
-    torso_mid_shoulder = 0.5 * (
-        _joint_prefer_world(frames[t0_index], "left_shoulder")
-        + _joint_prefer_world(frames[t0_index], "right_shoulder")
-    )
-    torso_mid_hip = 0.5 * (
-        _joint_prefer_world(frames[t0_index], "left_hip")
-        + _joint_prefer_world(frames[t0_index], "right_hip")
-    )
-    dx = float(torso_mid_shoulder[0] - torso_mid_hip[0])
-    dy = float(torso_mid_shoulder[1] - torso_mid_hip[1])
-    if dx == 0.0 and dy == 0.0:
-        torso_tilt = 0.0
-    elif dy == 0.0:
-        torso_tilt = 90.0
-    else:
-        torso_tilt = float(np.degrees(np.arctan2(abs(dx), abs(dy))))
+    # 兼容旧字段：无符号倾角幅值 ≈ |trunk_lean|
+    lean_abs = trunk.get("trunk_lean_angle")
+    torso_tilt = abs(float(lean_abs)) if lean_abs is not None else 0.0
 
     metrics: dict[str, Any] = {
         **approach,
@@ -1820,6 +2135,7 @@ def diagnose_with_temporal_isolation(
         **impact,
         **follow,
         **early,
+        **trunk,
         "torso_lateral_tilt": round(torso_tilt, 1),
         "whipping_speed_peak": round(whip, 1),
         "contact_frame_index": int(t0_index),
@@ -1829,6 +2145,64 @@ def diagnose_with_temporal_isolation(
     }
 
     decision = DeterministicErrorEngine().evaluate(metrics)
+
+    # 为每个相位组装完整窗口（索引边界 + 时序范围 + 该相位专属指标 + 代表性关键帧）
+    phase_metrics_map = {
+        "approach_phase": approach,
+        "support_phase": support,
+        "backswing_phase": backswing,
+        "impact_phase": impact,
+        "follow_through_phase": follow,
+    }
+
+    phase_windows_enriched = {}
+    for name, p in phases.items():
+        # ±inf 是"动态窗"的内部哨兵（自序列起点 / 到序列末尾），不是可外传的数值：
+        # 经 json_safe_number 归成 None，并用 open_start / open_end 显式表达该语义，
+        # 前端据此渲染"自开头"/"至结尾"，而不是把边界误读成 0 毫秒。
+        phase_data = {
+            "start_index": p.start_index,
+            "end_index": p.end_index,
+            "start_ms_rel": json_safe_number(p.start_ms_rel),
+            "end_ms_rel": json_safe_number(p.end_ms_rel),
+            "open_start": json_safe_number(p.start_ms_rel) is None,
+            "open_end": json_safe_number(p.end_ms_rel) is None,
+            "frame_count": len(p.indices()),
+        }
+
+        # 附加该相位的专属指标（遵守 provenance 规则：仅暴露 measured/calibrated）
+        phase_specific_metrics = phase_metrics_map.get(name, {})
+        if phase_specific_metrics:
+            # 过滤掉 provenance 为 default/missing/estimated 的指标
+            filtered_metrics = {}
+            for key, value in phase_specific_metrics.items():
+                if isinstance(value, dict) and "provenance" in value:
+                    prov = value.get("provenance", "")
+                    if prov in ("measured", "calibrated"):
+                        filtered_metrics[key] = value
+                elif not isinstance(value, dict):
+                    # 标量值（如 _frame_index 等辅助字段）：保留
+                    filtered_metrics[key] = value
+            phase_data["metrics"] = filtered_metrics
+
+        # 代表性关键帧：每个相位取其中点帧或特征帧
+        if name == "impact_phase":
+            phase_data["keyframe_index"] = int(t0_index)
+        elif name == "backswing_phase":
+            # 后摆相位的极值帧（最大折叠角度帧）
+            extreme_idx = backswing.get("backswing_extreme_frame_index")
+            if extreme_idx is not None and p.contains_index(int(extreme_idx)):
+                phase_data["keyframe_index"] = int(extreme_idx)
+            else:
+                phase_data["keyframe_index"] = (p.start_index + p.end_index) // 2
+        else:
+            # 其他相位：取中点帧
+            phase_data["keyframe_index"] = (p.start_index + p.end_index) // 2
+
+        # 最后一道闸：metrics 里的数值来自 numpy 运算（除零 / 空切片均值等都会
+        # 产出 NaN 或 ±inf），必须整棵递归清洗后才允许进入响应体。
+        phase_windows_enriched[name] = json_safe_payload(phase_data)
+
     diagnosis = {
         "ok": True,
         "primary_error_code": decision["primary_error_code"],
@@ -1838,15 +2212,7 @@ def diagnose_with_temporal_isolation(
         "metrics": metrics,
         "t0_index": int(t0_index),
         "t0_meta": t0_meta,
-        "phase_windows": {
-            name: {
-                "start_index": p.start_index,
-                "end_index": p.end_index,
-                "start_ms_rel": p.start_ms_rel,
-                "end_ms_rel": p.end_ms_rel,
-            }
-            for name, p in phases.items()
-        },
+        "phase_windows": phase_windows_enriched,
     }
     key_idx = resolve_keyframe_index(diagnosis)
     # B1/B2 最终闸门
@@ -1869,11 +2235,21 @@ def diagnose_with_temporal_isolation(
         "support_knee_angle": metrics.get("support_knee_angle"),
         "hip_torsion_angle": metrics.get("hip_torsion_angle"),
         "ankle_angles_window": metrics.get("ankle_angles_window"),
+        "trunk_lean_angle": metrics.get("trunk_lean_angle"),
+        "trunk_lean_linked_to_wide_stance": metrics.get(
+            "trunk_lean_linked_to_wide_stance"
+        ),
+        "ball_center": metrics.get("ball_center_px") or ball,
+        "support_ratio": metrics.get("support_ratio"),
     }
     trajectory_payload = {
         "max_folding_angle": metrics.get("max_folding_angle"),
         "whipping_velocity": metrics.get("whipping_speed_peak"),
         "swing_fold_angle": metrics.get("swing_fold_angle"),
+        "trunk_lean_angle": metrics.get("trunk_lean_angle"),
+        "trunk_lean_linked_to_wide_stance": metrics.get(
+            "trunk_lean_linked_to_wide_stance"
+        ),
     }
     # 补齐触球膝角 / 脚尖角 / 髋扭转 / 折叠角（若 metrics 尚未写入）
     try:
@@ -1902,6 +2278,11 @@ def diagnose_with_temporal_isolation(
     total_score, score_detail = DeterministicScorer().calculate_biomechanical_score(
         impact_payload, trajectory_payload
     )
+    # 全链路透明化：强制为每个 indicator 绑定 provenance_tier
+    if isinstance(score_detail, dict):
+        indicators = score_detail.get("indicators")
+        if isinstance(indicators, dict):
+            score_detail["indicators"] = apply_provenance_tiers(indicators)
     diagnosis["TotalScore"] = total_score
     diagnosis["score_detail"] = score_detail
     diagnosis["t_impact"] = int(t0_index)
@@ -1920,6 +2301,13 @@ def diagnose_with_temporal_isolation(
     metrics["hip_torsion_angle"] = round(
         float(score_detail["indicators"]["hip_torsion_angle"]["value"]), 1
     )
+    trunk_entry = (score_detail.get("indicators") or {}).get("trunk_lean_angle") or {}
+    if trunk_entry.get("value") is not None:
+        try:
+            metrics["trunk_lean_angle"] = round(float(trunk_entry["value"]), 2)
+            metrics["trunk_lean_status"] = status_to_color_code(trunk_entry.get("status"))
+        except (TypeError, ValueError):
+            pass
     # 具身隐喻：问题关节高亮（含临床绝对时间戳，避免全时段常亮）
     swing_side = str(score_detail.get("swing_leg") or "right")
     joint_highlights = score_detail.get("joint_highlights")
@@ -2074,16 +2462,26 @@ def _scale_delta_to_cm(
     *,
     coord_space: str,
     cm_per_pixel: float,
+    shoulder_width: Optional[float] = None,
 ) -> tuple[float, float]:
     """把相对位移向量从原始单位换算为厘米。
 
-    - world_m：原始单位为米 → ×100
-    - image_px：原始单位为像素 → × cm_per_pixel
-    - normalized：近似按像素比例尺处理（调用方应尽量避免）
+    - world_m：【V3.6】肩宽归一化 → 等效 cm（禁止裸 ×100）
+    - image_px：优先肩宽归一化；否则 × cm_per_pixel
     """
     dx, dy = float(delta_xy[0]), float(delta_xy[1])
-    if coord_space == "world_m":
-        return dx * 100.0, dy * 100.0
+    if coord_space == "world_m" or (
+        shoulder_width is not None
+        and np.isfinite(float(shoulder_width))
+        and float(shoulder_width) > 1e-9
+    ):
+        if shoulder_width is not None and float(shoulder_width) > 1e-9:
+            return world_delta_to_shoulder_normalized_cm(
+                (dx, dy), float(shoulder_width)
+            )
+        # world 无肩宽时不假装绝对米制
+        if coord_space == "world_m":
+            return 0.0, 0.0
     scale = float(cm_per_pixel) if cm_per_pixel > 1e-12 else 1.0
     return dx * scale, dy * scale
 
@@ -2190,6 +2588,22 @@ def generate_spatial_trajectory(
     coord_space = _detect_heatmap_coord_space(impact_rec)
     cm_per_pixel = float(_estimate_cm_per_pixel(impact_rec)) if impact_rec else 1.0
 
+    # 肩宽参考尺（world/image 同源归一化）
+    shoulder_width = None
+    try:
+        if coord_space == "world_m":
+            ls = _world_joint(impact_rec, "left_shoulder")
+            rs = _world_joint(impact_rec, "right_shoulder")
+        else:
+            ls = _as_vec3(impact_rec["left_shoulder"]) if "left_shoulder" in impact_rec else None
+            rs = _as_vec3(impact_rec["right_shoulder"]) if "right_shoulder" in impact_rec else None
+        if ls is not None and rs is not None:
+            shoulder_width = float(np.linalg.norm(ls - rs))
+            if not np.isfinite(shoulder_width) or shoulder_width < 1e-9:
+                shoulder_width = None
+    except Exception:
+        shoulder_width = None
+
     # ---- 球心绝对原点：强制锚定为 t_impact 时刻 ----
     ball_abs = None
     if ball_center_t_impact is not None:
@@ -2215,7 +2629,10 @@ def generate_spatial_trajectory(
         dx_support, dy_support = 0.0, 0.0
     else:
         dx_support, dy_support = _scale_delta_to_cm(
-            support_abs - ball_abs, coord_space=coord_space, cm_per_pixel=cm_per_pixel
+            support_abs - ball_abs,
+            coord_space=coord_space,
+            cm_per_pixel=cm_per_pixel,
+            shoulder_width=shoulder_width,
         )
 
     # ---- 摆动腿踝轨迹：[t_impact-15, t_impact] 相对同一球心 ----
@@ -2228,19 +2645,32 @@ def generate_spatial_trajectory(
         if swing_abs is None or not np.all(np.isfinite(swing_abs)):
             continue
         dx_s, dy_s = _scale_delta_to_cm(
-            swing_abs - ball_abs, coord_space=coord_space, cm_per_pixel=cm_per_pixel
+            swing_abs - ball_abs,
+            coord_space=coord_space,
+            cm_per_pixel=cm_per_pixel,
+            shoulder_width=shoulder_width,
         )
         swing_trajectory.append([round(float(dx_s), 2), round(float(dy_s), 2)])
+
+    support_ratio_hm = None
+    if shoulder_width and shoulder_width > 1e-9:
+        support_ratio_hm = round(
+            float(np.hypot(dx_support, dy_support)) / float(AVERAGE_CHILD_SHOULDER_WIDTH_CM),
+            4,
+        )
 
     return {
         "dx_support": round(float(dx_support), 2),
         "dy_support": round(float(dy_support), 2),
         "support_rel": [round(float(dx_support), 2), round(float(dy_support), 2)],
+        "support_ratio": support_ratio_hm,
         "swing_trajectory": swing_trajectory,
         "ball_origin_cm": [0.0, 0.0],
         "t_impact": int(t),
         "window": [int(win_start), int(win_end)],
-        "coord_space": coord_space,
+        "coord_space": (
+            "shoulder_width_ratio" if shoulder_width else coord_space
+        ),
         "cm_per_pixel": round(float(cm_per_pixel), 4) if coord_space != "world_m" else None,
         "scale": {
             "cm_per_px": HEATMAP_CM_PER_PX,

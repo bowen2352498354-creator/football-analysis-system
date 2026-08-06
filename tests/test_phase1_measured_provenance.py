@@ -25,7 +25,7 @@ def test_is_aigc_measurable_provenance_gate():
 
 
 def test_scorer_default_distance_not_exported_as_measured():
-    """无 PCR / 无显式横距时：评分可用 17.5，但对外 value 必须为 None。"""
+    """无肩宽 landmarks / 无上游 ratio 时：评分可用绿带中心 0.55，对外 value 必须为 None。"""
     impact = {
         "t_impact": 1,
         "toe_angle": 5.0,
@@ -39,16 +39,29 @@ def test_scorer_default_distance_not_exported_as_measured():
     dist = detail["indicators"]["distance_cm"]
     assert dist["provenance"] == PROVENANCE_DEFAULT
     assert dist["value"] is None
-    assert abs(float(dist["scoring_value"]) - 17.5) < 1e-9
+    assert dist["unit"] == "ratio"
+    assert abs(float(dist["scoring_value"]) - 0.55) < 1e-9
 
 
-def test_scorer_pcr_distance_is_measured():
-    """YOLO 球框 PCR 路径必须标为 measured，并写出 value。"""
-    # 球径 84px → PCR=0.25；踝距球心 68px → 17.0 cm
+def test_scorer_shoulder_ratio_is_calibrated():
+    """肩宽归一化路径标 calibrated，对外 value 为无量纲比例（废除 PCR measured cm）。"""
+    from indicator_builder import PROVENANCE_CALIBRATED
+
     impact = {
-        "t_impact": 1,
-        "support_ankle_px": (210.0, 250.0),
-        "ball_pixel_bbox": [100.0, 200.0, 184.0, 284.0],
+        "t_impact": 0,
+        "frames": [
+            {
+                "left_ankle": [70.0, 200.0, 0.0],
+                "right_foot_index": [100.0, 200.0, 0.0],
+                "left_shoulder": [100.0, 80.0, 0.0],
+                "right_shoulder": [160.0, 80.0, 0.0],  # 肩宽 60 → |Δx|=30 → ratio=0.5
+                "left_hip": [100.0, 140.0, 0.0],
+                "left_knee": [100.0, 170.0, 0.0],
+                "right_hip": [130.0, 140.0, 0.0],
+                "right_knee": [130.0, 170.0, 0.0],
+                "right_ankle": [130.0, 200.0, 0.0],
+            }
+        ],
         "toe_angle": 5.0,
         "impact_knee_angle": 150.0,
         "support_knee_angle": 155.0,
@@ -58,14 +71,16 @@ def test_scorer_pcr_distance_is_measured():
     trajectory = {"max_folding_angle": 82.0, "whipping_velocity": 500.0}
     _, detail = calculate_biomechanical_score(impact, trajectory)
     dist = detail["indicators"]["distance_cm"]
-    assert dist["provenance"] == PROVENANCE_MEASURED
-    assert dist["method"] == "ball_pcr"
+    assert dist["provenance"] == PROVENANCE_CALIBRATED
+    assert dist["method"] == "shoulder_width_ratio"
+    assert dist["unit"] == "ratio"
     assert dist["value"] is not None
-    assert abs(float(dist["value"]) - 17.0) < 1e-6
+    assert abs(float(dist["value"]) - 0.5) < 0.05
+    assert is_aigc_measurable_provenance(dist["provenance"]) is True
 
 
 def test_scorer_default_folding_without_frames():
-    """无帧且无上游折叠角：80° 仅作 scoring_value，不得进入 value。"""
+    """无帧且无上游折叠角：中性带中心仅作 scoring_value，不得进入 value。"""
     impact = {
         "t_impact": 1,
         "distance_cm": 17.5,
@@ -80,7 +95,8 @@ def test_scorer_default_folding_without_frames():
     fold = detail["indicators"]["max_folding_angle"]
     assert fold["provenance"] == PROVENANCE_DEFAULT
     assert fold["value"] is None
-    assert abs(float(fold["scoring_value"]) - 80.0) < 1e-9
+    # V3.9+ 折叠理想中心 85°（XY-2D 绿带 70–100）
+    assert abs(float(fold["scoring_value"]) - 85.0) < 1e-9
 
 
 def test_scorer_missing_ankle_window_not_locked_for_aigc():
@@ -245,10 +261,22 @@ def test_fallback_markdown_does_not_invent_focus_numbers():
 
 
 def test_pack_focus_roundtrip_via_scorer_explicit_upstream():
-    """显式上游实测值应进入 AIGC payload。"""
+    """肩宽比 / 上游折叠实测应进入 AIGC payload（废除 PCR cm measured）。"""
     impact = {
-        "t_impact": 1,
-        "distance_cm": 18.2,
+        "t_impact": 0,
+        "frames": [
+            {
+                "left_ankle": [70.0, 200.0, 0.0],
+                "right_foot_index": [100.0, 200.0, 0.0],
+                "left_shoulder": [100.0, 80.0, 0.0],
+                "right_shoulder": [160.0, 80.0, 0.0],
+                "left_hip": [100.0, 140.0, 0.0],
+                "left_knee": [100.0, 170.0, 0.0],
+                "right_hip": [130.0, 140.0, 0.0],
+                "right_knee": [130.0, 170.0, 0.0],
+                "right_ankle": [130.0, 200.0, 0.0],
+            }
+        ],
         "toe_angle": 5.0,
         "impact_knee_angle": 150.0,
         "support_knee_angle": 155.0,
@@ -259,7 +287,9 @@ def test_pack_focus_roundtrip_via_scorer_explicit_upstream():
     score, detail = DeterministicScorer().calculate_biomechanical_score(impact, trajectory)
     assert isinstance(score, float)
     payload = _extract_indicator_payload({"score_detail": detail})
-    assert payload["distance_cm"]["value"] == 18.2
+    assert payload["distance_cm"]["measured"] is True
+    assert "value" in payload["distance_cm"]
+    assert float(payload["distance_cm"]["value"]) < 3.5  # 肩宽比，非 cm
     assert payload["max_folding_angle"]["value"] == 78.0
     assert payload["ankle_rigidity"]["measured"] is True
     assert "value" in payload["ankle_rigidity"]

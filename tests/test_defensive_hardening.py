@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pytest
 from pydantic import ValidationError
@@ -123,10 +125,12 @@ def test_pose_tracker_10pct_dropout_stream_stable():
 
 
 def test_judge_knee_status_threshold_unchanged():
-    """三色判定阈值 140–160 零破坏。"""
+    """三色判定阈值 V3.5：135–165 绿；仅 >165 进直腿黄/红带。"""
     assert judge_knee_status(150)[0] == "Green"
-    assert judge_knee_status(135)[0] == "Yellow"
-    assert judge_knee_status(120)[0] == "Red"
+    assert judge_knee_status(135)[0] == "Green"
+    assert judge_knee_status(166)[0] == "Yellow"
+    assert judge_knee_status(120)[0] == "Yellow"
+    assert judge_knee_status(110)[0] == "Red"
     assert judge_knee_status(None)[0] == "Red"
 
 
@@ -257,8 +261,66 @@ def test_chat_backoff_eventually_falls_back(monkeypatch):
 def test_optimal_json_parse_falls_back_on_garbage():
     import llm_agent as la
 
-    dual = la._parse_optimal_dual_feedback("这不是JSON，模型抽风了", None)
-    assert dual == la._STATIC_OPTIMAL_FALLBACK
+    diagnosis = {
+        "score_detail": {
+            "indicators": {
+                "distance_cm": {
+                    "value": 28.5,
+                    "status": "RED_DEVIATED",
+                    "penalty": 12.0,
+                    "unit": "cm",
+                    "provenance": "measured",
+                }
+            }
+        }
+    }
+    dual = la._parse_optimal_dual_feedback("这不是JSON，模型抽风了", diagnosis)
+    hard = la._hard_fallback_dual(
+        la.build_primary_error_description(diagnosis), diagnosis
+    )
+    assert dual["correction_metaphor"] == hard["correction_metaphor"]
+    assert dual["praise_encouragement"] == hard["praise_encouragement"]
+    assert dual.get("aigc_source") == "fallback"
+    joined = " ".join(
+        str(dual.get(k) or "")
+        for k in ("overview", "biomechanical_analysis", "correction_metaphor", "magic_metaphor")
+    )
+    assert "支撑" in joined
+    assert "28.5" in joined
+    assert dual["correction_metaphor"] != dual["praise_encouragement"]
+    assert dual.get("overview") and dual.get("biomechanical_analysis")
+
+
+def test_optimal_json_parse_rejects_duplicate_filler():
+    import llm_agent as la
+
+    diagnosis = {
+        "score_detail": {
+            "indicators": {
+                "distance_cm": {
+                    "value": 28.5,
+                    "status": "RED_DEVIATED",
+                    "penalty": 12.0,
+                    "unit": "cm",
+                }
+            }
+        }
+    }
+    raw = json.dumps(
+        {
+            "correction_metaphor": "继续加油保持自信！",
+            "praise_encouragement": "继续加油保持自信！",
+        },
+        ensure_ascii=False,
+    )
+    dual = la._parse_optimal_dual_feedback(raw, diagnosis)
+    assert dual["correction_metaphor"] != dual["praise_encouragement"]
+    assert dual.get("aigc_source") == "fallback"
+    joined = " ".join(
+        str(dual.get(k) or "")
+        for k in ("overview", "biomechanical_analysis", "correction_metaphor")
+    )
+    assert "支撑" in joined
 
 
 def test_optimal_json_parse_accepts_valid_payload():
@@ -268,6 +330,38 @@ def test_optimal_json_parse_accepts_valid_payload():
     dual = la._parse_optimal_dual_feedback(raw, None)
     assert dual["correction_metaphor"] == "别用僵尸腿踢球！"
     assert dual["praise_encouragement"] == "踢得很用力！"
+
+
+def test_primary_error_description_picks_max_penalty():
+    import llm_agent as la
+
+    diagnosis = {
+        "score_detail": {
+            "indicators": {
+                "max_folding_angle": {
+                    "value": 42.0,
+                    "status": "RED_DEVIATED",
+                    "penalty": 5.0,
+                    "unit": "deg",
+                },
+                "distance_cm": {
+                    "value": 28.5,
+                    "status": "RED_DEVIATED",
+                    "penalty": 14.0,
+                    "unit": "cm",
+                    "green_band": [12.0, 20.0],
+                },
+            }
+        }
+    }
+    desc = la.build_primary_error_description(diagnosis)
+    assert "支撑脚偏移" in desc
+    assert "28.5" in desc
+    assert "距离过远" in desc
+    prompt = la.build_system_prompt(desc)
+    assert "【核心指令】" in prompt
+    assert desc in prompt
+    assert "绝不能每次说一样的话" in prompt
 
 
 # ---------------------------------------------------------------------------

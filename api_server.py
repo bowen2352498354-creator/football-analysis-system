@@ -43,6 +43,11 @@ v1.1 前后端全栈联调阶段：后台服务网关（FastAPI + Uvicorn）
                                 "一级测试类型 -> 二级学校-班级/组别 -> 三级学生编号"
                                 的规则建好文件夹树，并把规范排版的 Word (.docx) 报告
                                 写入其中，返回成功消息与生成文件的绝对物理路径。
+    POST /api/lock_baseline  ：实验防干扰——锁定课堂环境基线（class_id /
+                                camera_height_cm / calibrator_status），生成全局
+                                session_id；后续每次 score_detail / SPSS 导出均
+                                打上该水印与 is_baseline_trusted。
+    GET  /api/baseline_status：查询当前基线是否已锁定及环境参数。
     GET  /api/fatigue_alert  ：课堂疲劳熔断轮询（ANKLE_FATIGUE / KNEE_STIFFNESS）。
                                 generate_report 写入时序后命中规则即缓存；教练端
                                 「纵向双轴进化图谱」每 2.5s 拉取并渲染熔断闪烁卡。
@@ -214,6 +219,10 @@ from session_monitor import (
     RECENT_WINDOW,
     FatigueMonitor,
     flatten_eight_metrics,
+)
+from session_baseline import (
+    SESSION_METADATA_STORE,
+    stamp_baseline_watermark,
 )
 
 # 【第 6 点重构】射门分析的全部计算逻辑已迁移到 shot_analysis_service.ShotAnalysisPipeline。
@@ -530,6 +539,16 @@ class AnalysisSession:
             raise RuntimeError("分析管线尚未启动，无法构造打分载荷")
         return self.pipeline.build_scoring_payloads()
 
+    def get_ball_outcome(self) -> dict:
+        if self.pipeline is None:
+            return {"ball_speed_kmh": None, "launch_angle_deg": None, "meta": {}}
+        return self.pipeline.get_ball_outcome()
+
+    def inject_ball_outcome_into_score_detail(self, score_detail=None) -> dict:
+        if self.pipeline is None:
+            return dict(score_detail or {})
+        return self.pipeline.inject_ball_outcome_into_score_detail(score_detail)
+
     def build_time_series_velocity_window(
         self, t_impact: Optional[int] = None
     ) -> tuple[list, int, int, list]:
@@ -537,10 +556,26 @@ class AnalysisSession:
             return [], 0, 0, []
         return self.pipeline.build_time_series_velocity_window(t_impact=t_impact)
 
-    def rebuild_leg_annotation(self, score_detail=None, t_impact=None):
+    def build_phase_windows(
+        self, t_impact: Optional[int] = None, total_frames: Optional[int] = None
+    ) -> dict:
+        if self.pipeline is None:
+            return {}
+        # 优先使用 T0 锁定 + 相位隔离的富化版本（含每相位测量指标和 keyframe_index）；
+        # 若富化版本无法构建（轨迹不足 / diagnose 异常），降级到固定偏移简化版。
+        rich = self.pipeline.build_phase_windows_rich()
+        if rich:
+            return rich
+        return self.pipeline.build_phase_windows(
+            t_impact=t_impact, total_frames=total_frames
+        )
+
+    def rebuild_leg_annotation(self, score_detail=None, t_impact=None, force_impact_frame=True):
         if self.pipeline is None:
             return None, None
-        return self.pipeline.rebuild_leg_annotation(score_detail, t_impact=t_impact)
+        return self.pipeline.rebuild_leg_annotation(
+            score_detail, t_impact=t_impact, force_impact_frame=force_impact_frame
+        )
 
     def get_blurred_frame(self, index: Optional[int]):
         if self.pipeline is None:
@@ -738,6 +773,9 @@ async def websocket_analyze(websocket: WebSocket):
                 if pump_task is not None:
                     pump_task.cancel()
 
+                # 实验防干扰：未锁定基线时强烈警告（跨日摄像头偏移污染 SPSS）
+                SESSION_METADATA_STORE.warn_if_unlocked(log_fn=safe_print)
+
                 session_id = str(uuid.uuid4())
                 source = data.get("source", "webcam")
                 video_path = data.get("video_path")
@@ -749,7 +787,19 @@ async def websocket_analyze(websocket: WebSocket):
                 SESSIONS[session_id] = current_session
                 current_session.start()
 
-                await websocket.send_text(json.dumps({"type": "started", "session_id": session_id}))
+                baseline_meta = SESSION_METADATA_STORE.status_dict()
+                await websocket.send_text(
+                    json.dumps(
+                        {
+                            "type": "started",
+                            "session_id": session_id,
+                            "baseline_session_id": baseline_meta.get("session_id"),
+                            "is_baseline_trusted": bool(
+                                baseline_meta.get("session_locked")
+                            ),
+                        }
+                    )
+                )
                 pump_task = asyncio.create_task(pump_frames(current_session))
 
             elif action == "stop":
@@ -843,6 +893,9 @@ def generate_report(payload: GenerateReportRequest):
     # 「双轴互动运动学成长期刊图」右侧蓝色虚线轴与学术统计矩阵导出直接消费。
     avg_knee_angle = round(sum(sample_angles) / len(sample_angles), 1) if sample_angles else None
 
+    # 实验防干扰：报告生成路径再次校验基线锁定
+    SESSION_METADATA_STORE.warn_if_unlocked(log_fn=safe_print)
+
     # ---------- V2.5 确定性打分（Action ROI）+ 黄金审计 ----------
     deterministic_score = None
     score_detail = None
@@ -883,6 +936,17 @@ def generate_report(payload: GenerateReportRequest):
             impact_frame_idx=t_impact_locked,
             final_score=float(deterministic_score),
         )
+        # 【V3.11】射门结果闭环：出球初速度 / 发射仰角注入 score_detail
+        try:
+            score_detail = session.inject_ball_outcome_into_score_detail(score_detail)
+        except Exception as ball_exc:  # noqa: BLE001
+            safe_print(f"【api_server】出球结果注入失败（不影响评分）：{ball_exc}")
+
+    # 实验防干扰：score_detail 成功生成时强制打基线水印
+    if isinstance(score_detail, dict):
+        score_detail = stamp_baseline_watermark(
+            score_detail, analysis_session_id=payload.session_id
+        )
 
     # 【关键接线】必须把 DeterministicScorer 的 score_detail 交给 AIGC（已含脏数据 fallback）。
     diagnosis_for_aigc = None
@@ -908,11 +972,30 @@ def generate_report(payload: GenerateReportRequest):
     )
 
     generated_at = time.strftime("%Y-%m-%d %H:%M:%S")
+    clinical_echo = ai_result.get("clinical_echo") or ai_result.get("clinicalEcho") or ""
+    overview = ai_result.get("overview") or clinical_echo
+    biomechanical_analysis = ai_result.get("biomechanical_analysis") or ""
+    magic_metaphor = (
+        ai_result.get("magic_metaphor")
+        or ai_result.get("correction_metaphor")
+        or ai_result.get("painPoint")
+        or ""
+    )
+    action_plan = (
+        ai_result.get("action_plan")
+        or ai_result.get("praise_encouragement")
+        or ai_result.get("prescription")
+        or ""
+    )
+    aigc_source = ai_result.get("aigc_source") or ai_result.get("aigcSource") or "fallback"
+    clinical_brief = ai_result.get("clinical_brief") or ai_result.get("clinicalBrief")
     full_text = (
         f"学号 {payload.student_number or '未填写'} 本次综合练习诊断报告\n\n"
         f"发力稳定性评分：{final_score:.2f} 分（共采集 {total_attempts} 次有效触球数据）。\n"
-        f"{ai_result['painPoint']}\n"
-        f"{ai_result['prescription']}"
+        + (f"【综合评价】{overview}\n" if overview else "")
+        + (f"【动力链病理分析】{biomechanical_analysis}\n" if biomechanical_analysis else "")
+        + (f"【具身隐喻处方】{magic_metaphor}\n" if magic_metaphor else "")
+        + (f"【下一步训练指令】{action_plan}" if action_plan else "")
     )
 
     # 【大小腿夹角可视化】优先折叠极值帧 + 摆动腿关键点重标定；几何不合格则降级提示
@@ -975,6 +1058,20 @@ def generate_report(payload: GenerateReportRequest):
                 roi["absolute_timestamps"] = list(absolute_timestamps)
                 roi["start"] = int(_roi_start)
 
+    # 【动作相位切分】五阶段帧索引区间，全部以 t_impact 为绝对基准点相对偏移。
+    # 必须在 SESSIONS.pop 之前算完（pop 后管线轨迹即被释放）。
+    phase_windows = None
+    if session is not None:
+        try:
+            phase_windows = session.build_phase_windows(
+                t_impact=t_impact_locked, total_frames=frame_count_out
+            ) or None
+            if isinstance(score_detail, dict) and phase_windows:
+                score_detail["phase_windows"] = phase_windows
+        except Exception as phase_exc:  # noqa: BLE001 - 相位切分失败不阻断报告
+            safe_print(f"【api_server】动作相位切分失败（不影响评分）：{phase_exc}")
+            phase_windows = None
+
     # 报告已生成完毕，主动清理这份会话（连同内存中持有的击球关键帧画面），
     # 严格遵守"不长期持久化保存任何视频帧"的科技伦理红线，同时避免内存持续累积。
     SESSIONS.pop(payload.session_id, None)
@@ -993,14 +1090,24 @@ def generate_report(payload: GenerateReportRequest):
     return {
         "score": final_score,
         "totalAttempts": total_attempts,
-        "painPoint": ai_result["painPoint"],
-        "prescription": ai_result["prescription"],
+        "overview": overview,
+        "biomechanical_analysis": biomechanical_analysis,
+        "magic_metaphor": magic_metaphor,
+        "action_plan": action_plan,
+        "painPoint": ai_result.get("painPoint") or biomechanical_analysis or magic_metaphor,
+        "prescription": ai_result.get("prescription") or action_plan,
         "correction_metaphor": ai_result.get(
-            "correction_metaphor", ai_result["painPoint"]
+            "correction_metaphor", magic_metaphor or ai_result.get("painPoint")
         ),
         "praise_encouragement": ai_result.get(
-            "praise_encouragement", ai_result["prescription"]
+            "praise_encouragement", action_plan or ai_result.get("prescription")
         ),
+        "clinical_echo": overview or clinical_echo,
+        "clinicalEcho": overview or clinical_echo,
+        "aigc_source": aigc_source,
+        "aigcSource": aigc_source,
+        "clinical_brief": clinical_brief,
+        "clinicalBrief": clinical_brief,
         "fullText": full_text,
         "generatedAt": generated_at,
         "hitStats": hit_stats,
@@ -1020,6 +1127,17 @@ def generate_report(payload: GenerateReportRequest):
         "absoluteTimestamps": absolute_timestamps,
         "impact_index_in_window": impact_index_in_window,
         "impactIndexInWindow": impact_index_in_window,
+        # 动作相位切分。优先为 T0 锁定 + 相位隔离的富化版本，key 为
+        # approach_phase / support_phase / backswing_phase / impact_phase /
+        # follow_through_phase，每段含 start_index、end_index（闭区间）、
+        # start_ms_rel、end_ms_rel（相对 T0 毫秒）、frame_count、
+        # keyframe_index（该相位代表帧）以及 metrics（仅 provenance 为
+        # measured/calibrated 的实测指标，估计值与缺省值不外泄）。
+        # 轨迹不足或诊断异常时降级为固定偏移简化版，key 为
+        # approach / plant / fold / impact / follow_through，
+        # 每段为 {start_frame, end_frame} 闭区间，均以 t_impact 相对偏移得出。
+        "phase_windows": phase_windows,
+        "phaseWindows": phase_windows,
         "task_status": TASK_STATUS_COMPLETED,
         "scoreDetail": score_detail,
         "scoringEngine": "DeterministicScorer_V2.5" if deterministic_score is not None else "llm_fallback",
@@ -1030,6 +1148,29 @@ def generate_report(payload: GenerateReportRequest):
         "spatialTrajectory": spatial_trajectory,
         "fatigue_warning": fatigue_warning,
         "fatigueWarning": fatigue_warning,
+        # 实验防干扰：基线水印摘要（完整字段已写入 scoreDetail）
+        "baseline_session_id": (
+            score_detail.get("baseline_session_id")
+            if isinstance(score_detail, dict)
+            else None
+        ),
+        "is_baseline_trusted": bool(
+            isinstance(score_detail, dict)
+            and score_detail.get("is_baseline_trusted")
+        ),
+        "class_id": (
+            score_detail.get("class_id") if isinstance(score_detail, dict) else ""
+        ),
+        "camera_height_cm": (
+            score_detail.get("camera_height_cm")
+            if isinstance(score_detail, dict)
+            else None
+        ),
+        "calibrator_status": (
+            score_detail.get("calibrator_status")
+            if isinstance(score_detail, dict)
+            else "unlocked"
+        ),
     }
 
 
@@ -1060,6 +1201,72 @@ class SaveSessionRequest(BaseModel):
             if not isinstance(item, dict):
                 raise ValueError(f"sessions[{i}] 必须为对象")
         return value
+
+
+class LockBaselineRequest(BaseModel):
+    """锁定实验环境基线：class_id / 摄像头高度 / 标定矩阵状态。"""
+
+    model_config = ConfigDict(extra="ignore", str_strip_whitespace=True)
+
+    class_id: str = Field(default="", max_length=128)
+    camera_height_cm: Optional[float] = Field(default=None, ge=0, le=500)
+    calibrator_status: str = Field(default="unknown", max_length=64)
+    school: str = Field(default="", max_length=128)
+    class_group: str = Field(default="", max_length=128)
+    session_id: Optional[str] = Field(default=None, max_length=128)
+
+
+@app.post("/api/lock_baseline")
+def lock_baseline(payload: LockBaselineRequest):
+    """实验防干扰：锁定当前课堂环境参数，生成全局唯一 baseline session_id。
+
+    锁定后，每一次 ``score_detail`` / ``global_training_db.json`` / SPSS 导出
+    都会强制写入该水印；未锁定时分析仍可运行，但会打强烈警告且
+    ``is_baseline_trusted=false``。
+    """
+    try:
+        checkpoint = SESSION_METADATA_STORE.lock_baseline(
+            class_id=payload.class_id,
+            camera_height_cm=payload.camera_height_cm,
+            calibrator_status=payload.calibrator_status,
+            school=payload.school,
+            class_group=payload.class_group,
+            session_id=payload.session_id,
+        )
+        safe_print(
+            f"【api_server】基线已锁定 session_id={checkpoint.session_id} "
+            f"class_id={checkpoint.class_id} "
+            f"camera_height_cm={checkpoint.camera_height_cm} "
+            f"calibrator_status={checkpoint.calibrator_status}"
+        )
+        body = checkpoint.to_dict()
+        body.update(
+            {
+                "success": True,
+                "session_locked": True,
+                "is_baseline_trusted": True,
+            }
+        )
+        return body
+    except Exception as exc:  # noqa: BLE001
+        safe_print(f"【api_server】lock_baseline 失败：{exc}")
+        raise HTTPException(status_code=500, detail=f"锁定基线失败: {exc}") from exc
+
+
+@app.get("/api/baseline_status")
+def baseline_status():
+    """查询当前实验基线是否已锁定及环境参数。"""
+    status = SESSION_METADATA_STORE.status_dict()
+    status["success"] = True
+    return status
+
+
+@app.post("/api/unlock_baseline")
+def unlock_baseline():
+    """解除基线锁定（换班 / 跨日重标定前调用）。"""
+    SESSION_METADATA_STORE.unlock_baseline()
+    safe_print("【api_server】基线锁定已解除（session_locked=False）")
+    return {"success": True, "session_locked": False, "is_baseline_trusted": False}
 
 
 @app.post("/api/save_session")
@@ -1486,8 +1693,19 @@ class SaveWordReportRequest(BaseModel):
     # 若写成 Optional[int] 会在 Pydantic v2 直接 422（int_from_float）。
     score: Optional[float] = None
     totalAttempts: Optional[float] = None
+    # 四维深度诊断（大模型主字段）；缺失时 word_reporter 回落旧字段
+    overview: Optional[str] = ""
+    biomechanical_analysis: Optional[str] = ""
+    magic_metaphor: Optional[str] = ""
+    action_plan: Optional[str] = ""
+    # 旧字段兼容（painPoint≈病理分析/隐喻，prescription≈训练指令）
     painPoint: str = ""
     prescription: str = ""
+    correction_metaphor: Optional[str] = ""
+    praise_encouragement: Optional[str] = ""
+    clinical_echo: Optional[str] = ""
+    clinical_brief: Optional[Any] = None
+    aigc_source: Optional[str] = None
     comment: Optional[str] = ""
     # 报告生成时间戳（前端已格式化好的字符串），缺省时后端自动补当前时间
     generatedAt: Optional[str] = None
@@ -2447,6 +2665,7 @@ def _metrics_snapshot_from_score_detail(score_detail: Optional[dict]) -> dict:
                 "status",
                 "penalty",
                 "provenance",
+                "provenance_tier",
                 "method",
                 "stiffness_status",
             ):
@@ -2455,11 +2674,37 @@ def _metrics_snapshot_from_score_detail(score_detail: Optional[dict]) -> dict:
             if slim:
                 slim_indicators[key] = slim
     if slim_indicators or radar:
+        # 保留总分与扣分明细，供 Word 四维报告 / 复盘二次生成引用真实数据
+        deductions = score_detail.get("deductions")
+        if not isinstance(deductions, list):
+            deductions = []
         snapshot["scoreDetail"] = {
+            "TotalScore": score_detail.get("TotalScore"),
             "indicators": slim_indicators,
             "radar_scores": radar if isinstance(radar, dict) else None,
             "t_impact": score_detail.get("t_impact"),
+            "deductions": deductions,
+            # 实验防干扰水印（供归档 / SPSS 二次读取）
+            "baseline_session_id": score_detail.get("baseline_session_id"),
+            "class_id": score_detail.get("class_id"),
+            "camera_height_cm": score_detail.get("camera_height_cm"),
+            "calibrator_status": score_detail.get("calibrator_status"),
+            "is_baseline_trusted": score_detail.get("is_baseline_trusted"),
+            "session_checkpoint": score_detail.get("session_checkpoint"),
         }
+    # 顶层快照同步基线字段（即使无 indicators 也保留）
+    for bk in (
+        "baseline_session_id",
+        "class_id",
+        "camera_height_cm",
+        "calibrator_status",
+        "is_baseline_trusted",
+        "session_checkpoint",
+        "baseline_locked_at",
+        "analysis_session_id",
+    ):
+        if bk in score_detail and score_detail.get(bk) is not None:
+            snapshot[bk] = score_detail[bk]
     # Phase 3：若横距指标带实测 provenance，同步到快照顶层
     dist_entry = indicators.get("distance_cm") if isinstance(indicators, dict) else None
     if isinstance(dist_entry, dict):
@@ -2561,10 +2806,20 @@ def save_word_report(payload: SaveWordReportRequest):
         record = None
         try:
             record_type = "delayed" if getattr(payload, "mode", None) == "delayed" else "realtime"
+            overview = getattr(payload, "overview", None) or ""
+            biomech = getattr(payload, "biomechanical_analysis", None) or ""
+            magic = getattr(payload, "magic_metaphor", None) or ""
+            action = getattr(payload, "action_plan", None) or ""
             pain = getattr(payload, "painPoint", None) or ""
             prescription = getattr(payload, "prescription", None) or ""
+            ai_parts = [
+                overview,
+                biomech or pain,
+                magic,
+                action or prescription,
+            ]
             ai_feedback_text = "\n".join(
-                part.strip() for part in (pain, prescription) if part and str(part).strip()
+                str(part).strip() for part in ai_parts if part and str(part).strip()
             )
 
             record_timestamp = getattr(payload, "generatedAt", None) or time.strftime(
@@ -2621,6 +2876,13 @@ def save_word_report(payload: SaveWordReportRequest):
                 "score": getattr(payload, "score", None),
                 "biomechanicalErrors": biomechanical_errors,
                 "aiFeedback": ai_feedback_text,
+                "overview": str(overview or "").strip() or None,
+                "biomechanical_analysis": str(biomech or pain or "").strip() or None,
+                "magic_metaphor": str(magic or "").strip() or None,
+                "action_plan": str(action or prescription or "").strip() or None,
+                "painPoint": str(biomech or pain or "").strip() or None,
+                "prescription": str(action or prescription or "").strip() or None,
+                "aigc_source": getattr(payload, "aigc_source", None),
                 "impactFrameBase64": getattr(payload, "impactFrameImage", None),
                 "heatmapBase64": getattr(payload, "heatmapBase64", None)
                 or getattr(payload, "heatmap_base64", None),
@@ -2644,6 +2906,22 @@ def save_word_report(payload: SaveWordReportRequest):
                 if key in ("supportFootDistance", "supportFootDistanceProvenance"):
                     continue
                 record[key] = value
+            # 实验防干扰：归档 JSON 强制写入基线水印（优先 scoreDetail，再回退全局锁）
+            if isinstance(detail_dict, dict) and detail_dict.get("baseline_session_id"):
+                for bk in (
+                    "baseline_session_id",
+                    "class_id",
+                    "camera_height_cm",
+                    "calibrator_status",
+                    "baseline_locked_at",
+                    "is_baseline_trusted",
+                    "session_checkpoint",
+                    "analysis_session_id",
+                ):
+                    if bk in detail_dict:
+                        record[bk] = detail_dict[bk]
+            else:
+                record = stamp_baseline_watermark(record)
             try:
                 _append_global_record(record)
             except Exception as db_exc:  # noqa: BLE001

@@ -440,7 +440,11 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [finalReport, globalSettings.enableDataArchiving])
 
-  /** 清空本次复盘结果并强制回到摄像头待机捕获 */
+  /**
+   * 清空本次复盘结果并返回采集页：
+   * - 本地视频模式：保留视频源与已上传文件，回到本地视频功能页
+   * - 实时摄像头模式：回到摄像头待机捕获
+   */
   function resetToIdleCapture() {
     wsRef.current?.close()
     wsRef.current = null
@@ -459,12 +463,17 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
     setIsGeneratingReport(false)
     setWordSaveStatus('idle')
     setLastSessionId(null)
-    setLocalVideoFile(null)
-    setUploadedVideoPath(null)
-    setVideoSourceMode('webcam')
+    // 仅摄像头模式清理本地视频残留；本地视频模式保留文件，便于继续分析
+    if (videoSourceMode !== 'file') {
+      setLocalVideoFile(null)
+      setUploadedVideoPath(null)
+    }
     setAnalysisStatus('idle')
     setDwellSecondsLeft(null)
-    showWordSaveToast('复盘结束，请准备下一次踢球', true)
+    showWordSaveToast(
+      videoSourceMode === 'file' ? '复盘结束，可继续本地视频分析' : '复盘结束，请准备下一次踢球',
+      true,
+    )
   }
 
   /**
@@ -619,14 +628,47 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
           studentNumber: studentNumber || '未填写编号',
           score: finalReport.score,
           totalAttempts: finalReport.totalAttempts,
+          overview: finalReport.overview || finalReport.clinical_echo || finalReport.clinicalEcho || '',
+          biomechanical_analysis:
+            finalReport.biomechanical_analysis || finalReport.painPoint || '',
+          magic_metaphor:
+            finalReport.magic_metaphor ||
+            finalReport.correction_metaphor ||
+            '',
+          action_plan:
+            finalReport.action_plan ||
+            finalReport.praise_encouragement ||
+            finalReport.prescription ||
+            '',
           painPoint:
-            finalReport.correction_metaphor || finalReport.painPoint,
+            finalReport.biomechanical_analysis ||
+            finalReport.correction_metaphor ||
+            finalReport.painPoint,
           prescription:
-            finalReport.praise_encouragement || finalReport.prescription,
+            finalReport.action_plan ||
+            finalReport.praise_encouragement ||
+            finalReport.prescription,
           correction_metaphor:
-            finalReport.correction_metaphor || finalReport.painPoint,
+            finalReport.magic_metaphor ||
+            finalReport.correction_metaphor ||
+            finalReport.painPoint,
           praise_encouragement:
-            finalReport.praise_encouragement || finalReport.prescription,
+            finalReport.action_plan ||
+            finalReport.praise_encouragement ||
+            finalReport.prescription,
+          clinical_echo:
+            finalReport.overview ||
+            finalReport.clinical_echo ||
+            finalReport.clinicalEcho ||
+            null,
+          aigc_source:
+            finalReport.aigc_source || finalReport.aigcSource || null,
+          aigcSource:
+            finalReport.aigc_source || finalReport.aigcSource || null,
+          clinical_brief:
+            finalReport.clinical_brief || finalReport.clinicalBrief || null,
+          t_impact: finalReport.t_impact ?? finalReport.tImpact ?? null,
+          tImpact: finalReport.t_impact ?? finalReport.tImpact ?? null,
           generatedAt: finalReport.generatedAt,
           impactFrameImage: finalReport.impactFrameImage ?? null,
           heatmapBase64:
@@ -829,7 +871,9 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
               title={
                 isAutoReplay
                   ? '自动闭环进行中，倒计时结束后将返回待机；可切换至「手动复盘」以取消自动跳转'
-                  : '清空本次复盘结果，返回摄像头待机捕获'
+                  : videoSourceMode === 'file'
+                    ? '清空本次复盘结果，返回本地视频模式继续采集'
+                    : '清空本次复盘结果，返回实时摄像头待机捕获'
               }
               className="flex items-center gap-1.5 rounded-full bg-sky-500 px-4 py-1.5 text-xs font-semibold text-slate-950 transition hover:brightness-110 active:scale-95 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-300"
             >

@@ -32,6 +32,106 @@ AIGC_FOCUS_METRIC_KEYS = frozenset(
 )
 
 # --------------------------------------------------------------------------
+# 【全链路透明化】UI / 报告用 PROVENANCE 血统层级（大写枚举）
+# 与小写 provenance（AIGC 复述门禁）并存：tier 描述测量方法学置信度。
+# --------------------------------------------------------------------------
+PROVENANCE_TIER_MEASURED = "MEASURED"
+PROVENANCE_TIER_CALIBRATED = "CALIBRATED"
+PROVENANCE_TIER_ESTIMATED = "ESTIMATED"
+PROVENANCE_TIERS = frozenset(
+    {
+        PROVENANCE_TIER_MEASURED,
+        PROVENANCE_TIER_CALIBRATED,
+        PROVENANCE_TIER_ESTIMATED,
+    }
+)
+
+# 指标键 → 默认血统层级（方法学分类；可被 method / 显式字段覆盖）
+_DEFAULT_PROVENANCE_TIER_BY_KEY: dict[str, str] = {
+    # 纯几何 / 物理像素实测（含 XY-2D Z 坍缩膝角）
+    "whipping_velocity": PROVENANCE_TIER_MEASURED,
+    "trunk_lean_angle": PROVENANCE_TIER_MEASURED,
+    "ball_speed_kmh": PROVENANCE_TIER_MEASURED,
+    "launch_angle_deg": PROVENANCE_TIER_MEASURED,
+    "impact_knee_angle": PROVENANCE_TIER_MEASURED,
+    "max_folding_angle": PROVENANCE_TIER_MEASURED,
+    "toe_angle": PROVENANCE_TIER_MEASURED,
+    "ankle_rigidity": PROVENANCE_TIER_MEASURED,
+    "support_knee_angle": PROVENANCE_TIER_MEASURED,
+    # 肩宽基准 / 单应性标定
+    "distance_cm": PROVENANCE_TIER_CALIBRATED,
+    "support_ratio": PROVENANCE_TIER_CALIBRATED,
+    # 直接依赖 MediaPipe 原始 3D（Z）推断
+    "hip_torsion_angle": PROVENANCE_TIER_ESTIMATED,
+}
+
+
+def resolve_provenance_tier(
+    metric_key: str, entry: Optional[dict] = None
+) -> str:
+    """为单条指标解析 ``provenance_tier``（MEASURED|CALIBRATED|ESTIMATED）。"""
+    item = entry if isinstance(entry, dict) else {}
+    for field in ("provenance_tier", "provenanceTier"):
+        raw = item.get(field)
+        if raw is None:
+            continue
+        tier = str(raw).strip().upper()
+        if tier in PROVENANCE_TIERS:
+            return tier
+
+    method = str(item.get("method") or "").strip().lower()
+    if any(
+        token in method
+        for token in (
+            "shoulder",
+            "homography",
+            "calibrat",
+            "ratio",
+            "pcr",
+        )
+    ):
+        return PROVENANCE_TIER_CALIBRATED
+    if any(
+        token in method
+        for token in (
+            "world_z",
+            "mediapipe_z",
+            "raw_3d",
+            "hip_torsion",
+            "xz_plane",
+            "horizontal_3d",
+        )
+    ):
+        return PROVENANCE_TIER_ESTIMATED
+    # 显式 3D 且非 2D/Z-collapse 路径 → 估算
+    if "3d" in method and "2d" not in method and "z_collapse" not in method:
+        return PROVENANCE_TIER_ESTIMATED
+
+    key = str(metric_key or "").strip()
+    if key in _DEFAULT_PROVENANCE_TIER_BY_KEY:
+        return _DEFAULT_PROVENANCE_TIER_BY_KEY[key]
+
+    # 未知键：用小写 provenance 回退；否则保守 ESTIMATED
+    prov = str(item.get("provenance") or "").strip().lower()
+    if prov == PROVENANCE_CALIBRATED:
+        return PROVENANCE_TIER_CALIBRATED
+    if prov == PROVENANCE_MEASURED:
+        return PROVENANCE_TIER_MEASURED
+    return PROVENANCE_TIER_ESTIMATED
+
+
+def apply_provenance_tiers(indicators: Optional[dict]) -> dict:
+    """强制为 indicators 中每一条 metric 写入 ``provenance_tier``。"""
+    out: dict[str, Any] = dict(indicators or {})
+    for metric_key, entry in list(out.items()):
+        if not isinstance(entry, dict):
+            continue
+        tier = resolve_provenance_tier(str(metric_key), entry)
+        entry["provenance_tier"] = tier
+        out[metric_key] = entry
+    return out
+
+# --------------------------------------------------------------------------
 # 指标状态等级（Green/Yellow/Red）
 # --------------------------------------------------------------------------
 STATUS_GREEN = "GREEN_OPTIMAL"
@@ -113,7 +213,7 @@ _EIGHT_DIMENSION_FALLBACK_VALUES: dict[str, float] = {
     "max_folding_angle": 80.0,
     "whipping_velocity": 320.0,
     "impact_knee_angle": 150.0,
-    "ankle_rigidity": 1.0,  # 方差默认 1.0 锁定
+    "ankle_rigidity": 2.0,  # 形变落差默认 2°（锁踝带内）
     "support_knee_angle": 155.0,
     "hip_torsion_angle": 25.0,
 }
@@ -123,7 +223,7 @@ _EIGHT_DIMENSION_FALLBACK_UNITS: dict[str, str] = {
     "max_folding_angle": "deg",
     "whipping_velocity": "deg/s",
     "impact_knee_angle": "deg",
-    "ankle_rigidity": "variance",
+    "ankle_rigidity": "deg",
     "support_knee_angle": "deg",
     "hip_torsion_angle": "deg",
 }
@@ -167,7 +267,7 @@ def sanitize_eight_dimension_indicators(indicators: Optional[dict]) -> dict:
         # 非 measured 量纲：value=None 是契约要求的正确状态，不是脏数据。
         # 此时只需保证 scoring_value 等评分侧字段可用，不得回填对外 value。
         if dirty and not measurable:
-            decimals = 4 if key == "ankle_rigidity" else 2
+            decimals = 2
             filled = round(float(default_val), decimals)
             item["value"] = None
             item["scoring_value"] = (
@@ -209,7 +309,7 @@ def sanitize_eight_dimension_indicators(indicators: Optional[dict]) -> dict:
                 f"【Warning】DeterministicScorer 量纲 `{key}` 计算失败（None/NaN），"
                 f"已回填默认值 {default_val}，状态强制 {STATUS_YELLOW}。"
             )
-            decimals = 4 if key == "ankle_rigidity" else 2
+            decimals = 2
             filled = round(float(default_val), decimals)
             # AIGC 防幻觉契约：先确认 provenance，再决定是否写入 value。
             # provenance 为 default / missing / estimated 时 value 必须保持 None，
@@ -268,5 +368,6 @@ def sanitize_eight_dimension_indicators(indicators: Optional[dict]) -> dict:
             item["green_band"] = cleaned_gb
 
         out[key] = item
-    return out
+    # 全链路血统标签：清洗后强制为每个量纲写入 provenance_tier
+    return apply_provenance_tiers(out)
 

@@ -73,13 +73,17 @@ def test_aigc_e2e_user_message_contains_exact_measured_numbers():
     assert payload["indicators"]["distance_cm"]["value"] == 28.5
     assert payload["indicators"]["max_folding_angle"]["value"] == 55.0
     assert payload["indicators"]["ankle_rigidity"]["value"] == 6.2
+    assert "primary_error_description" in payload
     msg = build_aigc_user_message(diagnosis)
     assert "28.5" in msg
     assert "55.0" in msg or "55" in msg
     assert "6.2" in msg
-    # 禁止把评分字段塞进 AIGC
-    assert "TotalScore" not in msg
-    assert "penalty" not in msg
+    assert "【ClinicalBrief 首要事实】" in msg or "【首要错误锁定】" in msg
+    # 全量测量上下文必须注入（总分 / 雷达 / 扣分）
+    assert "TotalScore" in msg
+    assert "overview" in msg
+    assert "biomechanical_analysis" in msg
+    assert "主要扣分病灶" in msg
 
 
 def test_aigc_e2e_fallback_quotes_measured_and_blocks_defaults():
@@ -123,11 +127,13 @@ def test_aigc_e2e_generate_feedback_offline_fallback_optimal_dual(monkeypatch):
         "score_detail": {
             "indicators": {
                 "distance_cm": {
-                    "value": 19.2,
-                    "scoring_value": 19.2,
-                    "provenance": PROVENANCE_MEASURED,
+                    "value": 0.55,
+                    "scoring_value": 0.55,
+                    "provenance": "calibrated",
                     "status": "GREEN_OPTIMAL",
-                    "unit": "cm",
+                    "unit": "ratio",
+                    "support_ratio": 0.55,
+                    "method": "shoulder_width_ratio",
                 },
                 "max_folding_angle": {
                     "value": 82.0,
@@ -164,22 +170,34 @@ def test_aigc_e2e_generate_feedback_offline_fallback_optimal_dual(monkeypatch):
     assert dual["correction_metaphor"].startswith("你刚才")
     assert "就像" in dual["correction_metaphor"] and "下次试试" in dual["correction_metaphor"]
     assert len(dual["correction_metaphor"]) <= la._CORRECTION_MAX_CHARS
-    assert len(dual["praise_encouragement"]) <= la._PRAISE_MAX_CHARS
+    # action_plan / praise 动态兜底允许略超短句上限（见 _clamp_report_phrase +25）
+    assert len(dual["praise_encouragement"]) <= la._ACTION_MAX_CHARS + 25
     text = generate_feedback(diagnosis)
     assert "【魔法指令】" in text and "【闪光点发现】" in text
     # 实测值复述仍由 clinical helper 负责（不塞进孩子话术）
     clinical = _build_clinical_fallback_markdown(diagnosis)
-    assert "19.2" in clinical
+    assert "0.55" in clinical or "支撑脚横距比例" in clinical
     assert "82.0" in clinical or "82" in clinical
     assert "1.1" in clinical
 
 
-def test_scorer_to_aigc_e2e_pcr_measured_roundtrip():
-    """PCR 实测 → Scorer → AIGC payload 数值一致。"""
+def test_scorer_to_aigc_e2e_shoulder_ratio_roundtrip():
+    """肩宽比实测 → Scorer → AIGC payload 数值一致（废除 PCR cm）。"""
     impact = {
-        "t_impact": 1,
-        "support_ankle_px": (210.0, 250.0),
-        "ball_pixel_bbox": [100.0, 200.0, 184.0, 284.0],  # 17.0 cm
+        "t_impact": 0,
+        "frames": [
+            {
+                "left_ankle": [70.0, 200.0, 0.0],
+                "right_foot_index": [100.0, 200.0, 0.0],
+                "left_shoulder": [100.0, 80.0, 0.0],
+                "right_shoulder": [160.0, 80.0, 0.0],
+                "left_hip": [100.0, 140.0, 0.0],
+                "left_knee": [100.0, 170.0, 0.0],
+                "right_hip": [130.0, 140.0, 0.0],
+                "right_knee": [130.0, 170.0, 0.0],
+                "right_ankle": [130.0, 200.0, 0.0],
+            }
+        ],
         "toe_angle": 5.0,
         "impact_knee_angle": 150.0,
         "support_knee_angle": 155.0,
@@ -189,11 +207,13 @@ def test_scorer_to_aigc_e2e_pcr_measured_roundtrip():
     trajectory = {"max_folding_angle": 78.0, "whipping_velocity": 500.0}
     _, detail = calculate_biomechanical_score(impact, trajectory)
     msg = build_aigc_user_message({"score_detail": detail})
-    assert "17.0" in msg
+    dist = detail["indicators"]["distance_cm"]
+    assert dist["unit"] == "ratio"
+    assert dist["value"] is not None
     assert "78.0" in msg or "78" in msg
     raw_json = msg[msg.index("{") :]
     payload = json.loads(raw_json)
-    assert payload["indicators"]["distance_cm"]["value"] == 17.0
+    assert abs(float(payload["indicators"]["distance_cm"]["value"]) - float(dist["value"])) < 1e-6
 
 
 def test_long_format_tags_heuristic_as_estimated():
@@ -296,5 +316,5 @@ if __name__ == "__main__":
     test_long_format_preserves_measured_provenance()
     test_long_format_legacy_value_without_provenance_is_unknown_not_measured()
     test_measured_only_filters_estimated_and_unknown()
-    test_scorer_to_aigc_e2e_pcr_measured_roundtrip()
+    test_scorer_to_aigc_e2e_shoulder_ratio_roundtrip()
     print("ALL PHASE3 TESTS PASSED (offline subset)")

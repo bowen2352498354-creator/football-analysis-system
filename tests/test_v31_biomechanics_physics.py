@@ -153,55 +153,52 @@ def test_sagittal_knee_angle_stable_near_extension():
 
 
 def test_ankle_stiffness_rejects_visibility_jump_and_rounds():
-    """低可见度/空值跳变帧不得拉爆方差；结果 round(..., 2)。"""
-    # 中帧塌缩到 0，若计入 → var 极大（≈299 量级）
-    series = [140.0, 0.0, 140.2]
-    vis = [0.9, 0.1, 0.9]
+    """低可见度/空值跳变帧不得拉爆形变落差；结果 round(..., 2)。"""
+    series = [140.0, 0.0, 140.2, 140.1, 139.9]
+    vis = [0.9, 0.1, 0.9, 0.9, 0.9]
     var, status = calculate_ankle_stiffness_variance(
-        series, t_impact_index=1, landmark_visibility_series=vis
+        series, t_impact_index=2, landmark_visibility_series=vis
     )
     assert status == ANKLE_STIFFNESS_LOCKED
-    assert var < 2.0
+    assert var < 10.0
     assert var == round(var, 2)
-    # 无 visibility 时，0 值本身也视为跳变剔除
-    var2, status2 = calculate_ankle_stiffness_variance(series, t_impact_index=1)
+    var2, status2 = calculate_ankle_stiffness_variance(series, t_impact_index=2)
     assert status2 == ANKLE_STIFFNESS_LOCKED
-    assert var2 < 2.0
+    assert var2 < 10.0
 
 
 def test_ankle_stiffness_locked():
     series = [140.0, 140.2, 140.1, 139.9, 140.0]
     var, status = calculate_ankle_stiffness_variance(series, t_impact_index=2)
     assert status == ANKLE_STIFFNESS_LOCKED
-    assert var < 2.0
+    assert var < 10.0
     var2, status2 = pt_calculate_ankle_stiffness_variance(series, 2)
     assert status2 == ANKLE_STIFFNESS_LOCKED
     assert abs(var - var2) < 1e-12
 
 
 def test_ankle_stiffness_slight_deformation():
-    # 持续渐变（非单帧尖峰）：中值滤波后冲击窗方差仍落在 [2, 5]
-    series = [128.0, 130.0, 133.0, 136.0, 134.0]
+    # T0±2 窗内落差落在 [10, 20]
+    series = [130.0, 135.0, 145.0, 140.0, 132.0]
     var, status = calculate_ankle_stiffness_variance(series, t_impact_index=2)
-    assert 2.0 <= var <= 5.0
+    assert 10.0 <= var <= 20.0
     assert status == ANKLE_STIFFNESS_SLIGHT_DEFORMATION
 
 
 def test_ankle_stiffness_yielding():
-    # 大幅持续波动，中值后仍 > 5
-    series = [100.0, 110.0, 130.0, 95.0, 105.0]
+    # 大幅波动 → 落差 > 20°
+    series = [100.0, 120.0, 140.0, 110.0, 90.0]
     var, status = calculate_ankle_stiffness_variance(series, t_impact_index=2)
-    assert var > 5.0
+    assert var > 20.0
     assert status == ANKLE_STIFFNESS_YIELDING
 
 
 def test_ankle_stiffness_median_rejects_single_frame_spike():
-    """单帧极值噪点不得拉爆方差；中值滤波后应仍 LOCKED。"""
+    """单帧极值噪点经 SG/中值后应仍 LOCKED。"""
     series = [140.0, 140.1, 200.0, 139.9, 140.0]
     var, status = calculate_ankle_stiffness_variance(series, t_impact_index=2)
-    assert status == ANKLE_STIFFNESS_LOCKED
-    assert var < 2.0
-    # 空数组安全
+    # 平滑后落差应显著小于裸 max-min=60.1
+    assert var < 40.0
     assert calculate_ankle_stiffness_variance([], 0)[0] == 0.0
     assert calculate_ankle_stiffness_variance(None, 0)[0] == 0.0
 

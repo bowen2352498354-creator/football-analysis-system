@@ -82,6 +82,48 @@ def test_resolve_prefers_fold_extreme_when_measured():
     assert side == "right"
 
 
+def test_rebuild_leg_annotation_forces_t_impact_not_fold():
+    """射门瞬间分析帧必须定格 t_impact，不得被折叠极值帧劫持。"""
+    from shot_analysis_service import ShotAnalysisPipeline
+
+    pipe = ShotAnalysisPipeline(
+        session_id="ann-force-t0",
+        source="file",
+        video_path=None,
+        push_fn=lambda _m: None,
+    )
+    fold_rec = {
+        "right_hip": [100.0, 80.0, 0.0],
+        "right_knee": [110.0, 140.0, 0.0],
+        "right_ankle": [90.0, 220.0, 0.0],
+        "visibility": {"right_hip": 0.99, "right_knee": 0.99, "right_ankle": 0.99},
+    }
+    impact_rec = {
+        "right_hip": [100.0, 80.0, 0.0],
+        "right_knee": [120.0, 150.0, 0.0],
+        "right_ankle": [140.0, 230.0, 0.0],
+        "visibility": {"right_hip": 0.99, "right_knee": 0.99, "right_ankle": 0.99},
+    }
+    pipe._trajectory_pose_frames = [fold_rec, impact_rec]
+    pipe._cache_blurred_frame(0, np.zeros((240, 320, 3), dtype=np.uint8))
+    pipe._cache_blurred_frame(1, np.zeros((240, 320, 3), dtype=np.uint8) + 10)
+    detail = {
+        "swing_leg": "right",
+        "indicators": {
+            "max_folding_angle": {
+                "value": 95.0,
+                "provenance": "measured",
+                "extreme_frame_index": 0,
+                "method": "roi_3d_knee_min_right",
+                "swing_leg": "right",
+            }
+        },
+    }
+    frame, metrics = pipe.rebuild_leg_annotation(detail, t_impact=1, force_impact_frame=True)
+    assert frame is not None and metrics is not None
+    assert int(metrics.get("annotation_frame_index", -1)) == 1
+
+
 def test_draw_skips_arc_when_overlay_not_ok():
     frame = np.zeros((240, 320, 3), dtype=np.uint8)
     metrics = {

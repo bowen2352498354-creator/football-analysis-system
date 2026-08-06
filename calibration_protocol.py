@@ -147,25 +147,32 @@ def run_fold_angle_calibration(
 
 
 def run_ankle_stiffness_calibration() -> dict[str, Any]:
-    """锁踝 / 松踝分档标定（确定性序列，不依赖视频）。"""
+    """锁踝 / 松踝分档标定（确定性序列，不依赖视频）。
+
+    【V3.9】指标为最大形变落差角 deflection_deg：LOCKED < 10°，YIELDING > 20°。
+    """
+    from biomech_primitives import calculate_ankle_deflection
+
     locked_series = [140.0, 140.1, 140.0, 139.9, 140.05]
     yielding_series = [100.0, 130.0, 90.0, 140.0, 80.0]
-    v_lock, s_lock = calculate_ankle_stiffness_variance(locked_series, t_impact_index=2)
-    v_yield, s_yield = calculate_ankle_stiffness_variance(yielding_series, t_impact_index=2)
+    v_lock, s_lock = calculate_ankle_deflection(locked_series, 2)
+    v_yield, s_yield = calculate_ankle_deflection(yielding_series, 2)
     rows = [
         {
             "label": "locked",
-            "variance": round(float(v_lock), 4),
+            "deflection_deg": round(float(v_lock), 4),
+            "variance": round(float(v_lock), 4),  # 兼容旧字段
             "status": s_lock,
             "expected_status": ANKLE_STIFFNESS_LOCKED,
-            "pass": s_lock == ANKLE_STIFFNESS_LOCKED and float(v_lock) < 2.0,
+            "pass": s_lock == ANKLE_STIFFNESS_LOCKED and float(v_lock) < 10.0,
         },
         {
             "label": "yielding",
+            "deflection_deg": round(float(v_yield), 4),
             "variance": round(float(v_yield), 4),
             "status": s_yield,
             "expected_status": ANKLE_STIFFNESS_YIELDING,
-            "pass": s_yield == ANKLE_STIFFNESS_YIELDING and float(v_yield) > 5.0,
+            "pass": s_yield == ANKLE_STIFFNESS_YIELDING and float(v_yield) > 20.0,
         },
     ]
     return {

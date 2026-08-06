@@ -445,10 +445,39 @@ export default function ZenWorkspace({ globalSettings }: ZenWorkspaceProps) {
           studentNumber: studentIdForReport || '未填写编号',
           score: toFixedFloat(report?.score),
           totalAttempts: toFixedFloat(report?.totalAttempts),
-          painPoint: report?.correction_metaphor || report?.painPoint || '',
-          prescription: report?.praise_encouragement || report?.prescription || '',
-          correction_metaphor: report?.correction_metaphor || report?.painPoint || '',
-          praise_encouragement: report?.praise_encouragement || report?.prescription || '',
+          overview: report?.overview || report?.clinical_echo || report?.clinicalEcho || '',
+          biomechanical_analysis:
+            report?.biomechanical_analysis || report?.painPoint || '',
+          magic_metaphor:
+            report?.magic_metaphor || report?.correction_metaphor || '',
+          action_plan:
+            report?.action_plan ||
+            report?.praise_encouragement ||
+            report?.prescription ||
+            '',
+          painPoint:
+            report?.biomechanical_analysis ||
+            report?.correction_metaphor ||
+            report?.painPoint ||
+            '',
+          prescription:
+            report?.action_plan ||
+            report?.praise_encouragement ||
+            report?.prescription ||
+            '',
+          correction_metaphor:
+            report?.magic_metaphor ||
+            report?.correction_metaphor ||
+            report?.painPoint ||
+            '',
+          praise_encouragement:
+            report?.action_plan ||
+            report?.praise_encouragement ||
+            report?.prescription ||
+            '',
+          clinical_echo:
+            report?.overview || report?.clinical_echo || report?.clinicalEcho || null,
+          t_impact: report?.t_impact ?? report?.tImpact ?? null,
           generatedAt: report?.generatedAt ?? null,
           impactFrameImage: attempt.impactFrameBase64 ?? report?.impactFrameImage ?? null,
           heatmapBase64:

@@ -5,6 +5,9 @@ v0.4 差异化双界面开发阶段脚本（在 v0.3 AIGC 认知转译接入基�
 【V2.5】新增底层运动学清洗：KinematicSignalProcessor（Savitzky-Golay）
         + locate_impact_frame（双向交叉触球锁帧），消除单目帧间抖动导致的
         角度/触球时间戳跳变。
+【V2.6】find_precise_impact_subframe：CubicSpline 将球/踝轨迹升频至 120Hz，
+        多模态融合（球速阶跃 × 踝急刹 × 距离极小）亚像素锁定 T0；失败降级
+        回抛物线锁帧，管线不崩溃。
 
 功能说明（本版本核心变化）：
     本版本把之前"一个从头跑到尾的 OpenCV 脚本"彻底重构成了一个真正的
@@ -136,6 +139,7 @@ import mediapipe as mp
 from mediapipe.tasks import python as mp_tasks_python
 from mediapipe.tasks.python import vision as mp_vision
 from PIL import Image, ImageDraw, ImageFont
+from scipy.interpolate import CubicSpline
 from scipy.signal import savgol_filter
 
 from PyQt5.QtGui import QImage
@@ -351,7 +355,10 @@ from biomech_primitives import (  # noqa: E402
     LANDMARK_EMA_ALPHA,
     LandmarkEMASmoother,
     STANDARD_BALL_DIAMETER_CM,
+    calculate_2d_angle,
+    calculate_2d_angle_or_none,
     calculate_3d_joint_angle,  # re-export：单测 parity / 旧调用方
+    calculate_ankle_deflection,
     calculate_ankle_stiffness_variance,
     calculate_sagittal_angle,
     calculate_sagittal_angle_or_none,
@@ -365,21 +372,21 @@ _LAST_VALID_KNEE_DIAGNOSIS: dict[str, tuple] = {}
 
 
 def calculate_angle(a, b, c, *, is_knee_extension: bool = False):
-    """髋/膝关节屈伸角（度）：矢状面 Y-Z + atan2，废弃 3D arccos。
+    """髋/膝关节屈伸角（度）：XY-2D（强制坍缩 Z），抗 MediaPipe 深度畸变。
 
-    ``is_knee_extension`` 保留兼容旧调用方；算法统一走 ``calculate_sagittal_angle``。
+    ``is_knee_extension`` 保留兼容旧调用方；算法统一走 ``calculate_2d_angle``。
     """
     _ = is_knee_extension
-    return calculate_sagittal_angle(a, b, c, signed=False)
+    return calculate_2d_angle(a, b, c)
 
 
 def judge_knee_status(angle):
-    """根据文档规定的三级容错阈值，判定当前膝关节角度所处的状态。
+    """根据 V3.5 儿童/业余三级容错阈值，判定触球膝角状态。
 
-    判定规则（严格按照 project_plan.md 中"核心生物力学诊断参数"章节）：
-        Green（达标）：140° <= 角度 <= 160°
-        Yellow（接近）：130° <= 角度 < 140° 或 160° < 角度 <= 170°
-        Red（错误）：角度 < 130° 或 角度 > 170°
+    判定规则（与 DeterministicScorer / empirical_thresholds 对齐）：
+        Green（达标）：135° <= 角度 <= 165°（仅 >165° 才进入直腿扣分带）
+        Yellow（接近）：120° <= 角度 < 135° 或 165° < 角度 <= 172°
+        Red（错误）：角度 < 120° 或 角度 > 172°
 
     返回：
         (status_text, status_color)：状态文字与对应的 BGR 颜色元组。
@@ -390,9 +397,9 @@ def judge_knee_status(angle):
         return "Red", COLOR_RED
     if not np.isfinite(angle_v):
         return "Red", COLOR_RED
-    if 140 <= angle_v <= 160:
+    if 135 <= angle_v <= 165:
         return "Green", COLOR_GREEN
-    elif (130 <= angle_v < 140) or (160 < angle_v <= 170):
+    elif (120 <= angle_v < 135) or (165 < angle_v <= 172):
         return "Yellow", COLOR_YELLOW
     else:
         return "Red", COLOR_RED
@@ -512,7 +519,7 @@ def compute_knee_diagnosis_for_side(frame, single_person_landmarks, side: str = 
     knee_point = (float(knee_s[0]), float(knee_s[1]), float(knee_s[2]))
     ankle_point = (float(ankle_s[0]), float(ankle_s[1]), float(ankle_s[2]))
 
-    knee_angle_opt = calculate_sagittal_angle_or_none(
+    knee_angle_opt = calculate_2d_angle_or_none(
         hip_point, knee_point, ankle_point
     )
     if knee_angle_opt is None:
@@ -637,11 +644,12 @@ def build_annotation_metrics_from_pose_record(
         and world.get(knee_k) is not None
         and world.get(ankle_k) is not None
     ):
+        # world 亦坍缩 Z：侧向踢球深度畸变会污染 Y-Z 矢状投影
         angle = float(
-            calculate_sagittal_angle(world[hip_k], world[knee_k], world[ankle_k])
+            calculate_2d_angle(world[hip_k], world[knee_k], world[ankle_k])
         )
     else:
-        angle = float(calculate_sagittal_angle(hip, knee, ankle))
+        angle = float(calculate_2d_angle(hip, knee, ankle))
 
     vis = pose_record.get("visibility") or {}
     qa = evaluate_leg_overlay_geometry(
@@ -742,6 +750,13 @@ SAVGOL_POLYORDER: int = 3
 
 # 触球锁帧：以角速度极值点为中心的前后搜索半窗（帧）
 IMPACT_SEARCH_HALF_WINDOW: int = 5
+
+# 【V2.6】CubicSpline 升频亚像素锁帧：30fps → 120Hz（×4）
+SUBFRAME_UPSAMPLE_FACTOR: int = 4
+# 触球候选窗半宽（原始 30fps 帧）；总窗约 10–15+ 帧，供样条拟合
+SUBFRAME_CANDIDATE_HALF_WINDOW: int = 12
+# CubicSpline 最少采样点（含二阶导数所需）
+SUBFRAME_MIN_SAMPLES: int = 4
 
 # 坐标点类型：二维 (x, y) 或三维 (x, y, z)，元素为浮点或可转浮点
 PointLike = Union[Tuple[float, ...], Sequence[float]]
@@ -948,14 +963,184 @@ def _nearest_omega_zero_crossing(
 # ---------------------------------------------------------------------------
 # 【T0 精度等级】抛物线亚帧插值是否真正生效的确定性标记
 # ---------------------------------------------------------------------------
+# subframe_cubic_120hz: CubicSpline 升频至 120Hz 后，多模态融合锁定亚像素 T0，
+#                       再映射回最近 30fps 整数帧（突破硬件采样率瓶颈）。
 # subframe_interp  : 距离极小值的左右邻帧都存在，三点抛物线拟合成功，
 #                    t_impact 具备亚帧级精度（角度极值可信）。
 # fallback_midframe: 极小值落在搜索窗边界 / 邻帧缺失（遮挡、反光、序列过短），
 #                    只能取离散最近帧。此时 t_impact 可能偏差 ±1 帧，
 #                    触球瞬间膝角有帧率相关的系统误差，下游打分需放宽阈值，
 #                    避免把采样精度问题误判成动作红灯。
+T0_QUALITY_CUBIC_120HZ = "subframe_cubic_120hz"
 T0_QUALITY_SUBFRAME = "subframe_interp"
 T0_QUALITY_FALLBACK = "fallback_midframe"
+
+
+def _sanitize_trajectory_series(raw: Sequence[float]) -> Optional[np.ndarray]:
+    """将轨迹序列转为有限 float64；局部 NaN/Inf 用邻域线性插值填补。
+
+    全无效或空序列返回 None（由调用方降级）。
+    """
+    try:
+        arr = np.asarray(
+            [float(v) if v is not None else float("nan") for v in raw],
+            dtype=np.float64,
+        ).reshape(-1)
+    except (TypeError, ValueError):
+        return None
+    if arr.size == 0:
+        return None
+    finite = np.isfinite(arr)
+    if not bool(np.any(finite)):
+        return None
+    if bool(np.all(finite)):
+        return arr
+    good_idx = np.flatnonzero(finite)
+    bad_idx = np.flatnonzero(~finite)
+    filled = arr.copy()
+    filled[bad_idx] = np.interp(bad_idx.astype(np.float64), good_idx.astype(np.float64), arr[good_idx])
+    if not bool(np.all(np.isfinite(filled))):
+        return None
+    return filled
+
+
+def _zscore_or_zero(signal: np.ndarray) -> np.ndarray:
+    """标准化为一维 z-score；方差过小时返回全零（该模态静默失效）。"""
+    x = np.asarray(signal, dtype=np.float64).reshape(-1)
+    if x.size == 0:
+        return x
+    std = float(np.std(x))
+    if not np.isfinite(std) or std <= 1e-12:
+        return np.zeros_like(x)
+    mean = float(np.mean(x))
+    return (x - mean) / std
+
+
+def find_precise_impact_subframe(
+    ball_x: Sequence[float],
+    ball_y: Sequence[float],
+    swing_ankle_x: Sequence[float],
+    swing_ankle_y: Sequence[float],
+    *,
+    window_start_frame: int = 0,
+    upsample_factor: int = SUBFRAME_UPSAMPLE_FACTOR,
+) -> Optional[int]:
+    """【V2.6】CubicSpline 升频 + 多模态亚像素触球锁帧。
+
+    在原始 30fps 候选窗（通常前后 10–15 帧）上，对 YOLO 球心与 MediaPipe
+    摆动脚踝四条轨迹做三次样条插值，时间轴放大 ``upsample_factor`` 倍
+    （默认 ×4 → 等效 120Hz），再在升频曲线上融合：
+
+        a) 足球瞬时速度最陡峭正向阶跃（激增）；
+        b) 摆动脚踝沿速度方向的切向加速度最深负向峰值（动量转移/急刹车）；
+        c) 球-踝欧氏距离局部极小。
+
+    将得分最高的亚像素时刻四舍五入映射回最近的原始 30fps 帧索引。
+
+    参数:
+        ball_x / ball_y: 候选窗内足球中心轨迹（与帧对齐）。
+        swing_ankle_x / swing_ankle_y: 候选窗内摆动脚踝轨迹。
+        window_start_frame: 候选窗第一帧在全局序列中的绝对索引。
+        upsample_factor: 升频倍数，默认 4（30→120）。
+
+    返回:
+        全局 30fps 整数帧索引；样条拟合失败 / 脏数据不足时返回 ``None``，
+        由调用方降级到原有抛物线 ``locate_impact_frame`` 逻辑。
+    """
+    try:
+        bx = _sanitize_trajectory_series(ball_x)
+        by = _sanitize_trajectory_series(ball_y)
+        ax = _sanitize_trajectory_series(swing_ankle_x)
+        ay = _sanitize_trajectory_series(swing_ankle_y)
+        if bx is None or by is None or ax is None or ay is None:
+            return None
+
+        n = int(min(bx.size, by.size, ax.size, ay.size))
+        if n < int(SUBFRAME_MIN_SAMPLES):
+            return None
+        bx, by, ax, ay = bx[:n], by[:n], ax[:n], ay[:n]
+
+        factor = int(upsample_factor)
+        if factor < 2:
+            return None
+
+        # 原始时间轴：以帧为单位（相对窗起点）；升频后 Δt = 1/factor
+        t_lo = np.arange(n, dtype=np.float64)
+        # 保证节点严格递增（CubicSpline 硬性要求）
+        if float(np.min(np.diff(t_lo))) <= 0.0:
+            return None
+
+        n_hi = int((n - 1) * factor + 1)
+        t_hi = np.linspace(0.0, float(n - 1), n_hi, dtype=np.float64)
+
+        cs_bx = CubicSpline(t_lo, bx, bc_type="natural")
+        cs_by = CubicSpline(t_lo, by, bc_type="natural")
+        cs_ax = CubicSpline(t_lo, ax, bc_type="natural")
+        cs_ay = CubicSpline(t_lo, ay, bc_type="natural")
+
+        # --- 120Hz 运动学导数 ---
+        # 足球瞬时速度（位移一阶导）及其正向激增（速度阶跃）
+        v_bx = np.asarray(cs_bx(t_hi, 1), dtype=np.float64)
+        v_by = np.asarray(cs_by(t_hi, 1), dtype=np.float64)
+        ball_speed = np.hypot(v_bx, v_by)
+        ball_surge = np.gradient(ball_speed, t_hi)
+        ball_surge_pos = np.maximum(ball_surge, 0.0)
+
+        # 摆动脚踝加速度（位移二阶导）；沿速度方向切向分量的负峰 = 急刹车
+        v_ax = np.asarray(cs_ax(t_hi, 1), dtype=np.float64)
+        v_ay = np.asarray(cs_ay(t_hi, 1), dtype=np.float64)
+        a_ax = np.asarray(cs_ax(t_hi, 2), dtype=np.float64)
+        a_ay = np.asarray(cs_ay(t_hi, 2), dtype=np.float64)
+        ankle_speed = np.hypot(v_ax, v_ay)
+        # 切向加速度 a·v/|v|；触球动量转移时急剧变负
+        tang_acc = (a_ax * v_ax + a_ay * v_ay) / (ankle_speed + 1e-9)
+        ankle_brake = -tang_acc  # 越大 = 刹车越猛
+
+        # 球-踝欧氏距离 → 局部极小贡献
+        p_bx = np.asarray(cs_bx(t_hi), dtype=np.float64)
+        p_by = np.asarray(cs_by(t_hi), dtype=np.float64)
+        p_ax = np.asarray(cs_ax(t_hi), dtype=np.float64)
+        p_ay = np.asarray(cs_ay(t_hi), dtype=np.float64)
+        dist = np.hypot(p_bx - p_ax, p_by - p_ay)
+        proximity = -dist
+
+        # 球几乎静止（无 YOLO 时常用踝高分位代理球心）：关闭速度阶跃模态
+        w_surge = 1.0 if float(np.std(ball_speed)) > 1e-6 else 0.0
+        w_brake = 1.0
+        w_prox = 1.5  # 距离极小是触球几何硬约束，略加权
+
+        score = (
+            w_surge * _zscore_or_zero(ball_surge_pos)
+            + w_brake * _zscore_or_zero(ankle_brake)
+            + w_prox * _zscore_or_zero(proximity)
+        )
+        if not bool(np.any(np.isfinite(score))):
+            return None
+
+        # 软约束：优先落在距离局部极小邻域（±1 个升频步）
+        if n_hi >= 3:
+            local_min = np.zeros(n_hi, dtype=bool)
+            local_min[1:-1] = (dist[1:-1] <= dist[:-2]) & (dist[1:-1] <= dist[2:])
+            if bool(np.any(local_min)):
+                mask = local_min.copy()
+                # 扩一圈，避免采样噪声把真极小挤出
+                mask[1:] |= local_min[:-1]
+                mask[:-1] |= local_min[1:]
+                gated = np.where(mask, score, -np.inf)
+                if bool(np.any(np.isfinite(gated) & (gated > -np.inf))):
+                    score = gated
+
+        best_hi = int(np.nanargmax(score))
+        t_sub = float(t_hi[best_hi])  # 窗内亚像素帧（以原始帧为单位）
+        # 映射回最近原始 30fps 帧（窗内）再加全局偏移
+        local_frame = int(np.floor(t_sub + 0.5))
+        local_frame = int(np.clip(local_frame, 0, n - 1))
+        global_frame = int(window_start_frame) + local_frame
+        if global_frame < 0:
+            return None
+        return global_frame
+    except Exception:  # noqa: BLE001 - 脏数据/样条失败：交由调用方降级
+        return None
 
 
 def locate_impact_frame_with_quality(
@@ -1106,8 +1291,48 @@ def _locate_impact_frame_impl(
                 )
         idx_min = int(refined)
 
-    # ---------- 第四步：全局唯一触球时间戳 t_impact ----------
+    # ---------- 第四步：全局唯一触球时间戳 t_impact（抛物线粗锁） ----------
     t_impact: int = int(np.clip(idx_min, 0, n - 1))
+
+    # ---------- 第五步：CubicSpline 120Hz 多模态亚像素精修 ----------
+    # 以角速度峰为中心取候选窗；样条失败 / 脏数据时静默保留抛物线结果。
+    try:
+        half = int(SUBFRAME_CANDIDATE_HALF_WINDOW)
+        center = int(idx_max_omega)
+        win_lo = max(0, center - half)
+        win_hi = min(n - 1, center + half)
+        if win_hi - win_lo + 1 >= int(SUBFRAME_MIN_SAMPLES):
+            ball_xs: List[float] = []
+            ball_ys: List[float] = []
+            ankle_xs: List[float] = []
+            ankle_ys: List[float] = []
+            extract_ok = True
+            for i in range(win_lo, win_hi + 1):
+                try:
+                    bpt = ball_coordinates[i]
+                    apt = ankle_coordinates[i]
+                    ball_xs.append(float(bpt[0]))
+                    ball_ys.append(float(bpt[1]) if len(bpt) > 1 else 0.0)
+                    ankle_xs.append(float(apt[0]))
+                    ankle_ys.append(float(apt[1]) if len(apt) > 1 else 0.0)
+                except (IndexError, TypeError, ValueError):
+                    extract_ok = False
+                    break
+            if extract_ok:
+                refined = find_precise_impact_subframe(
+                    ball_xs,
+                    ball_ys,
+                    ankle_xs,
+                    ankle_ys,
+                    window_start_frame=win_lo,
+                    upsample_factor=SUBFRAME_UPSAMPLE_FACTOR,
+                )
+                if refined is not None:
+                    t_impact = int(np.clip(int(refined), 0, n - 1))
+                    t0_quality = T0_QUALITY_CUBIC_120HZ
+    except Exception:  # noqa: BLE001 - 升频精修任何异常均降级，管线不崩溃
+        pass
+
     return t_impact, t0_quality
 
 
@@ -1171,6 +1396,27 @@ class ImpactFrameLocator:
             smoothed_knee_angular_velocities,
             ankle_coordinates,
             ball_coordinates,
+        )
+
+    @classmethod
+    def find_precise_subframe(
+        cls,
+        ball_x: Sequence[float],
+        ball_y: Sequence[float],
+        swing_ankle_x: Sequence[float],
+        swing_ankle_y: Sequence[float],
+        *,
+        window_start_frame: int = 0,
+        upsample_factor: int = SUBFRAME_UPSAMPLE_FACTOR,
+    ) -> Optional[int]:
+        """CubicSpline 120Hz 多模态亚像素锁帧；失败返回 ``None``（由调用方降级）。"""
+        return find_precise_impact_subframe(
+            ball_x,
+            ball_y,
+            swing_ankle_x,
+            swing_ankle_y,
+            window_start_frame=window_start_frame,
+            upsample_factor=upsample_factor,
         )
 
 
@@ -1411,6 +1657,71 @@ def yolo_detect_frame(model: Any, frame_bgr: np.ndarray) -> Any:
             return model.predict(source=frame_bgr, verbose=False)
         except Exception:  # noqa: BLE001
             return None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+# COCO 类别：32 = sports ball
+_YOLO_SPORTS_BALL_CLASS_ID = 32
+
+
+def extract_sports_ball_center(
+    yolo_results: Any,
+    *,
+    min_conf: float = 0.25,
+) -> Optional[Tuple[float, float, float]]:
+    """从 YOLO predict 结果提取置信度最高的足球中心与直径。
+
+    返回 ``(cx, cy, diameter_px)``；无球 / 解析失败 → ``None``。
+    """
+    if yolo_results is None:
+        return None
+    try:
+        results_list = yolo_results if isinstance(yolo_results, (list, tuple)) else [yolo_results]
+        best: Optional[Tuple[float, float, float, float]] = None  # conf, cx, cy, diam
+        for res in results_list:
+            boxes = getattr(res, "boxes", None)
+            if boxes is None:
+                continue
+            xyxy = getattr(boxes, "xyxy", None)
+            confs = getattr(boxes, "conf", None)
+            clss = getattr(boxes, "cls", None)
+            if xyxy is None:
+                continue
+            xyxy_np = np.asarray(xyxy.cpu() if hasattr(xyxy, "cpu") else xyxy, dtype=np.float64)
+            if xyxy_np.ndim == 1:
+                xyxy_np = xyxy_np.reshape(1, -1)
+            n = int(xyxy_np.shape[0])
+            for i in range(n):
+                try:
+                    cls_id = (
+                        int(clss[i].item())
+                        if clss is not None and hasattr(clss[i], "item")
+                        else (int(clss[i]) if clss is not None else _YOLO_SPORTS_BALL_CLASS_ID)
+                    )
+                except Exception:  # noqa: BLE001
+                    cls_id = _YOLO_SPORTS_BALL_CLASS_ID
+                if cls_id != _YOLO_SPORTS_BALL_CLASS_ID:
+                    continue
+                try:
+                    conf = (
+                        float(confs[i].item())
+                        if confs is not None and hasattr(confs[i], "item")
+                        else (float(confs[i]) if confs is not None else 1.0)
+                    )
+                except Exception:  # noqa: BLE001
+                    conf = 1.0
+                if conf < float(min_conf):
+                    continue
+                x1, y1, x2, y2 = (float(v) for v in xyxy_np[i, :4])
+                cx = 0.5 * (x1 + x2)
+                cy = 0.5 * (y1 + y2)
+                diam = max(abs(x2 - x1), abs(y2 - y1))
+                if best is None or conf > best[0]:
+                    best = (conf, cx, cy, diam)
+        if best is None:
+            return None
+        return float(best[1]), float(best[2]), float(best[3])
     except Exception:  # noqa: BLE001
         return None
 

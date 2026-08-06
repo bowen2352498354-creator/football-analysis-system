@@ -21,8 +21,9 @@ import type {
 
 /** 根据膝关节角度计算三级阈值等级（140-160 绿；130-140 或 160-170 黄；其余红） */
 export function getThresholdLevel(angle: number): ThresholdLevel {
-  if (angle >= 140 && angle <= 160) return 'green'
-  if ((angle >= 130 && angle < 140) || (angle > 160 && angle <= 170)) return 'yellow'
+  // V3.5：触球膝角仅 >165° 进入直腿扣分带
+  if (angle >= 135 && angle <= 165) return 'green'
+  if ((angle >= 120 && angle < 135) || (angle > 165 && angle <= 172)) return 'yellow'
   return 'red'
 }
 
@@ -88,11 +89,16 @@ export const MOCK_SCORE_DETAIL_V31: ScoreDetailPayload = {
   radar_scores: MOCK_RADAR_SCORES,
   indicators: {
     distance_cm: {
-      value: 17.2,
-      unit: 'cm',
+      value: 0.55,
+      unit: 'ratio',
       status: 'GREEN_OPTIMAL',
       penalty: 0,
       extreme_frame_index: 39,
+      support_ratio: 0.55,
+      green_band: [0.4, 0.7],
+      provenance: 'calibrated',
+      provenance_tier: 'CALIBRATED',
+      provenanceTier: 'CALIBRATED',
     },
     toe_angle: {
       value: 8.0,
@@ -100,6 +106,9 @@ export const MOCK_SCORE_DETAIL_V31: ScoreDetailPayload = {
       status: 'GREEN_OPTIMAL',
       penalty: 0,
       extreme_frame_index: 39,
+      provenance: 'measured',
+      provenance_tier: 'MEASURED',
+      provenanceTier: 'MEASURED',
     },
     max_folding_angle: {
       value: 78.0,
@@ -107,6 +116,9 @@ export const MOCK_SCORE_DETAIL_V31: ScoreDetailPayload = {
       status: 'GREEN_OPTIMAL',
       penalty: 0,
       extreme_frame_index: 34,
+      provenance: 'measured',
+      provenance_tier: 'MEASURED',
+      provenanceTier: 'MEASURED',
     },
     whipping_velocity: {
       value: 279.0,
@@ -114,6 +126,9 @@ export const MOCK_SCORE_DETAIL_V31: ScoreDetailPayload = {
       status: 'YELLOW_APPROACHING',
       penalty: 4.2,
       extreme_frame_index: 40,
+      provenance: 'measured',
+      provenance_tier: 'MEASURED',
+      provenanceTier: 'MEASURED',
     },
     impact_knee_angle: {
       value: 148.0,
@@ -121,6 +136,9 @@ export const MOCK_SCORE_DETAIL_V31: ScoreDetailPayload = {
       status: 'GREEN_OPTIMAL',
       penalty: 0,
       extreme_frame_index: 42,
+      provenance: 'measured',
+      provenance_tier: 'MEASURED',
+      provenanceTier: 'MEASURED',
     },
     ankle_rigidity: {
       value: 3.2,
@@ -129,6 +147,9 @@ export const MOCK_SCORE_DETAIL_V31: ScoreDetailPayload = {
       status: 'YELLOW_APPROACHING',
       penalty: 4.1,
       extreme_frame_index: 42,
+      provenance: 'measured',
+      provenance_tier: 'MEASURED',
+      provenanceTier: 'MEASURED',
     },
     support_knee_angle: {
       value: 152.0,
@@ -136,6 +157,9 @@ export const MOCK_SCORE_DETAIL_V31: ScoreDetailPayload = {
       status: 'GREEN_OPTIMAL',
       penalty: 0,
       extreme_frame_index: 39,
+      provenance: 'measured',
+      provenance_tier: 'MEASURED',
+      provenanceTier: 'MEASURED',
     },
     hip_torsion_angle: {
       value: 22.0,
@@ -143,6 +167,9 @@ export const MOCK_SCORE_DETAIL_V31: ScoreDetailPayload = {
       status: 'GREEN_OPTIMAL',
       penalty: 0,
       extreme_frame_index: 42,
+      provenance: 'estimated',
+      provenance_tier: 'ESTIMATED',
+      provenanceTier: 'ESTIMATED',
     },
   },
 }
@@ -201,8 +228,8 @@ export const MOCK_COMPLIANCE_RATE = 78
 
 /** 错误类型分布（用于柱状图/饼图） */
 export const MOCK_ERROR_DISTRIBUTION: ErrorTypeDistribution[] = [
-  { level: 'green', label: '达标 (140°-160°)', count: 156 },
-  { level: 'yellow', label: '接近 (130°-140° / 160°-170°)', count: 64 },
+  { level: 'green', label: '达标 (135°-165°)', count: 156 },
+  { level: 'yellow', label: '接近 (120°-135° / 165°-172°)', count: 64 },
   { level: 'red', label: '错误 (<130° 或 >170°)', count: 32 },
 ]
 

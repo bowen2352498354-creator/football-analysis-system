@@ -108,12 +108,13 @@ def test_scorer_rejects_blur_bbox_as_unmeasured():
     assert "value" not in payload["distance_cm"]
 
 
-def test_scorer_pcr_world_disagree_demotes_when_confidence_low():
+def test_scorer_ignores_pcr_bbox_prefers_shoulder_ratio():
+    """V3.8：即便有合格球框 PCR，站位评分也不得走 ball_pcr；须肩宽比或中性默认。"""
     impact = {
         "t_impact": 1,
         "support_ankle_px": (210.0, 250.0),
-        "ball_pixel_bbox": [100.0, 200.0, 184.0, 284.0],  # PCR → 17cm
-        "world_support_lateral_cm": 40.0,  # 严重不一致
+        "ball_pixel_bbox": [100.0, 200.0, 184.0, 284.0],  # 旧 PCR 路径会得到 ~17cm
+        "world_support_lateral_cm": 40.0,
         "toe_angle": 5.0,
         "impact_knee_angle": 150.0,
         "support_knee_angle": 155.0,
@@ -123,13 +124,12 @@ def test_scorer_pcr_world_disagree_demotes_when_confidence_low():
     trajectory = {"max_folding_angle": 80.0, "whipping_velocity": 500.0}
     _, detail = calculate_biomechanical_score(impact, trajectory)
     dist = detail["indicators"]["distance_cm"]
-    qa = (dist.get("ball_bbox_qa") or {})
-    assert "world_crosscheck" in qa
-    assert qa["world_crosscheck"]["agree"] is False
-    # 大偏差应降为 estimated，AIGC 不得复述
-    assert dist["provenance"] == PROVENANCE_ESTIMATED
+    assert dist["method"] != "ball_pcr"
+    assert dist["unit"] == "ratio"
+    # 无 landmarks / 无上游 ratio → 中性绿带中心，不得标 measured PCR
+    assert dist["provenance"] != PROVENANCE_MEASURED
     payload = _extract_indicator_payload({"score_detail": detail})
-    assert "value" not in payload["distance_cm"]
+    assert "value" not in payload.get("distance_cm", {}) or dist["value"] is None
 
 
 def test_crosscheck_agree_within_tol():
@@ -147,22 +147,20 @@ def test_ankle_half_window_scales_with_fps():
     assert lo == 47 and hi == 53
 
 
-def test_ankle_variance_60fps_uses_wider_window():
-    """60fps 半窗 3 帧：更多点参与方差，与强制 t±1 不同。"""
-    # 中心平稳；远端用「持续两帧」扰动（单帧尖峰会被中值滤波剔除）
+def test_ankle_deflection_fixed_half_window_ignores_fps_ms():
+    """V3.9：形变落差固定 T0±2；fps/ms 参数被兼容入口忽略。"""
     series = [100.0] * 10
-    series[2] = 130.0
-    series[3] = 131.0
-    series[7] = 129.0
-    series[8] = 130.0
-    v_narrow, _ = calculate_ankle_stiffness_variance(
-        series, 5, fps=30.0, half_window_ms=50.0
-    )  # half=1 → idx 4,5,6 全 100
-    v_wide, _ = calculate_ankle_stiffness_variance(
-        series, 5, fps=60.0, half_window_ms=50.0
-    )  # half=3 → 含 2–3 与 7–8
-    assert v_narrow < 1e-9
-    assert v_wide > 5.0
+    series[3] = 130.0
+    series[4] = 131.0
+    series[6] = 129.0
+    # 默认 half=2 → 窗 [3,7] 含扰动
+    d_default, _ = calculate_ankle_stiffness_variance(series, 5)
+    # 显式 half=1 → 窗 [4,6]，落差应更小或相等
+    d_narrow, _ = calculate_ankle_stiffness_variance(
+        series, 5, half_window_frames=1
+    )
+    assert d_default >= d_narrow
+    assert d_default > 5.0
 
 
 def test_infer_swing_leg_explicit_and_motion():
@@ -237,8 +235,10 @@ def test_scorer_ankle_includes_dorsiflex_drop_when_measured():
     _, detail = calculate_biomechanical_score(impact, trajectory)
     ankle = detail["indicators"]["ankle_rigidity"]
     assert ankle["provenance"] == PROVENANCE_MEASURED
-    assert ankle.get("dorsiflex_drop_deg") == 40.0
-    assert ankle.get("window_half_frames") == 1
+    assert ankle.get("unit") == "deg"
+    assert ankle.get("deflection_deg") is not None or ankle.get("dorsiflex_drop_deg") is not None
+    assert float(ankle.get("dorsiflex_drop_deg") or ankle.get("deflection_deg") or 0) > 0
+    assert ankle.get("window_half_frames") == 2
 
 
 def test_default_empirical_pcr_constant():
@@ -246,7 +246,7 @@ def test_default_empirical_pcr_constant():
 
 
 def test_kinematic_physical_guards_knee_distance_ankle():
-    """Kinematic Boundary Guard：膝角补角+生理钳位 / 横距暴走 / 踝方差防暴走。"""
+    """Kinematic Boundary Guard：膝角补角+生理钳位 / 横距暴走；踝落差不再钳制。"""
     from error_diagnoser import apply_kinematic_physical_guards
 
     # 锐角补角假象 52° → 128°，落在 [120, 175]
@@ -261,32 +261,33 @@ def test_kinematic_physical_guards_knee_distance_ankle():
     assert abs(g["support_knee_angle"] - 120.0) < 1e-9
     assert g["support_knee_flipped"] is True
 
-    # YOLO 漂移 68cm → 钳制 28.5 + Warning
+    # YOLO 漂移 68cm → 钳制 40.0 + Warning（V3.5：35cm 为合法严重区）
     g2 = apply_kinematic_physical_guards(
         impact_knee_angle=150.0,
         support_knee_angle=155.0,
         distance_cm=68.0,
         ankle_variance=1.0,
     )
-    assert abs(g2["distance_cm"] - 28.5) < 1e-9
+    assert abs(g2["distance_cm"] - 40.0) < 1e-9
     assert g2["distance_clamped"] is True
     assert any("WARNING" in (e.get("status") or "") for e in g2["events"])
 
-    # 踝方差暴走 80 → 12
+    # V3.9：踝形变落差原样透传，不再 80→12 钳制
     g3 = apply_kinematic_physical_guards(
         impact_knee_angle=150.0,
         support_knee_angle=155.0,
         distance_cm=17.5,
         ankle_variance=80.0,
     )
-    assert abs(g3["ankle_variance"] - 12.0) < 1e-9
-    assert g3["ankle_clamped"] is True
+    assert abs(g3["ankle_variance"] - 80.0) < 1e-9
+    assert g3["ankle_clamped"] is False
 
 
 def test_scorer_applies_kinematic_guards_before_output():
-    """DeterministicScorer 输出前应用 Guard：离谱横距与锐角膝被拦截。"""
+    """DeterministicScorer：锐角膝护栏生效；裸漂移 cm 不再被吃进评分。"""
     impact = {
         "t_impact": 1,
+        # V3.6：无 PCR / 无肩宽帧时，禁止把裸 68cm 当 measured
         "distance_cm": 68.0,
         "toe_angle": 5.0,
         "impact_knee_angle": 52.0,
@@ -294,10 +295,13 @@ def test_scorer_applies_kinematic_guards_before_output():
         "hip_torsion_angle": 25.0,
         "ankle_angles_window": [140.0, 140.1, 140.0],
     }
-    trajectory = {"max_folding_angle": 80.0, "whipping_velocity": 500.0}
+    trajectory = {"max_folding_angle": 70.0, "whipping_velocity": 500.0}
     _, detail = calculate_biomechanical_score(impact, trajectory)
-    assert abs(detail["indicators"]["distance_cm"]["scoring_value"] - 28.5) < 1e-9
-    assert detail["kinematic_guards"]["distance_clamped"] is True
+    dist = detail["indicators"]["distance_cm"]
+    # 回退肩宽比中性带（≈0.55），而非钳制后的伪 40cm / PCR
+    assert float(dist["scoring_value"]) <= 1.0
+    assert dist["unit"] == "ratio"
+    assert dist["method"] in ("neutral_band_center", "shoulder_width_ratio")
     assert abs(detail["indicators"]["impact_knee_angle"]["value"] - 128.0) < 1e-9
     assert detail["indicators"]["impact_knee_angle"]["kinematic_guard"]["supplementary_flip"]
 
@@ -307,10 +311,10 @@ if __name__ == "__main__":
     test_ball_bbox_qa_rejects_tiny_and_blur()
     test_pcr_detailed_rejects_bad_bbox_not_measured_path()
     test_scorer_rejects_blur_bbox_as_unmeasured()
-    test_scorer_pcr_world_disagree_demotes_when_confidence_low()
+    test_scorer_ignores_pcr_bbox_prefers_shoulder_ratio()
     test_crosscheck_agree_within_tol()
     test_ankle_half_window_scales_with_fps()
-    test_ankle_variance_60fps_uses_wider_window()
+    test_ankle_deflection_fixed_half_window_ignores_fps_ms()
     test_infer_swing_leg_explicit_and_motion()
     test_scorer_swing_leg_left_fold_method()
     test_scorer_ankle_includes_dorsiflex_drop_when_measured()

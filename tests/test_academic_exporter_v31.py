@@ -30,9 +30,10 @@ def test_heatmap_dispersion_index_standard_distance():
 
 
 def test_ankle_rigidity_score_normalization():
+    """V3.9：形变落差软上界 40° → 刚性分数 [0,1]。"""
     assert ae.normalize_ankle_rigidity_score(0.0) == 1.0
-    assert ae.normalize_ankle_rigidity_score(10.0) == 0.0
-    assert ae.normalize_ankle_rigidity_score(5.0) == 0.5
+    assert ae.normalize_ankle_rigidity_score(40.0) == 0.0
+    assert ae.normalize_ankle_rigidity_score(20.0) == 0.5
 
 
 def test_wide_format_skips_soft_deleted_shots():

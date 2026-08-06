@@ -579,3 +579,142 @@ class TestPushFnStopped:
         assert order == ["completed", "stopped"], (
             "不变式违反：stopped 消息必须严格晚于 on_completed 回调"
         )
+
+
+# ---------------------------------------------------------------------------
+# build_phase_windows：五相位切分 + fps 重缩放不变式
+# ---------------------------------------------------------------------------
+
+PHASE_ORDER = ("approach", "plant", "fold", "impact", "follow_through")
+
+
+class TestBuildPhaseWindows:
+    def _pipeline(self, fps, n: int = 400, t_impact: int = 200):
+        p = make_pipeline()
+        p._trajectory_omega = [float(i) for i in range(n)]
+        p._video_fps = fps
+        p.t_impact = t_impact
+        return p
+
+    def test_empty_trajectory_returns_empty(self):
+        p = make_pipeline()
+        assert p.build_phase_windows() == {}
+
+    def test_all_five_phases_present_with_meta(self):
+        w = self._pipeline(30.0).build_phase_windows()
+        for name in PHASE_ORDER:
+            assert name in w, f"缺少相位 '{name}'"
+        assert "_meta" in w
+
+    def test_reference_fps_leaves_offsets_unscaled(self):
+        w = self._pipeline(30.0).build_phase_windows()
+        assert (w["approach"]["start_offset"], w["approach"]["end_offset"]) == (-45, -16)
+        assert (w["plant"]["start_offset"], w["plant"]["end_offset"]) == (-15, -11)
+        assert (w["fold"]["start_offset"], w["fold"]["end_offset"]) == (-10, -1)
+        assert (w["follow_through"]["start_offset"], w["follow_through"]["end_offset"]) == (1, 15)
+        assert w["_meta"]["offset_scale"] == pytest.approx(1.0)
+
+    @pytest.mark.parametrize("fps,expected_scale", [(60.0, 2.0), (25.0, 25 / 30), (120.0, 4.0)])
+    def test_offsets_scale_with_fps(self, fps, expected_scale):
+        w = self._pipeline(fps).build_phase_windows()
+        assert w["_meta"]["effective_fps"] == pytest.approx(fps)
+        assert w["_meta"]["offset_scale"] == pytest.approx(expected_scale)
+        assert w["approach"]["start_offset"] == round(-45 * expected_scale)
+
+    @pytest.mark.parametrize("fps", [None, 0.0, 1.0, -5.0])
+    def test_invalid_fps_falls_back_to_30(self, fps):
+        w = self._pipeline(fps).build_phase_windows()
+        assert w["_meta"]["effective_fps"] == pytest.approx(30.0)
+        assert w["_meta"]["offset_scale"] == pytest.approx(1.0)
+        assert (w["approach"]["start_offset"], w["approach"]["end_offset"]) == (-45, -16)
+
+    @pytest.mark.parametrize("fps", [24.0, 25.0, 30.0, 50.0, 60.0, 120.0, 240.0])
+    def test_phases_stay_disjoint_and_ordered(self, fps):
+        w = self._pipeline(fps, n=2000, t_impact=1000).build_phase_windows()
+        prev_end = None
+        for name in PHASE_ORDER:
+            seg = w[name]
+            assert seg["start_offset"] <= seg["end_offset"], f"{name} 区间倒序"
+            if prev_end is not None:
+                assert seg["start_offset"] > prev_end, f"{name} 与上一段端点重叠"
+            prev_end = seg["end_offset"]
+
+    @pytest.mark.parametrize("fps", [24.0, 25.0, 30.0, 50.0, 60.0, 120.0, 240.0])
+    def test_impact_is_always_single_anchor_frame(self, fps):
+        w = self._pipeline(fps, n=2000, t_impact=1000).build_phase_windows()
+        impact = w["impact"]
+        assert (impact["start_offset"], impact["end_offset"]) == (0, 0)
+        assert impact["start_frame"] == impact["end_frame"] == w["_meta"]["t_impact"]
+
+    @pytest.mark.parametrize("fps", [24.0, 25.0, 30.0, 50.0, 60.0, 120.0, 240.0])
+    def test_pre_impact_phases_never_cross_t0(self, fps):
+        """非零偏移不允许被取整成 0（否则相位会跨越触球帧）。"""
+        w = self._pipeline(fps, n=2000, t_impact=1000).build_phase_windows()
+        for name in ("approach", "plant", "fold"):
+            assert w[name]["end_offset"] < 0, f"{name} 越过了触球帧"
+        assert w["follow_through"]["start_offset"] > 0
+
+    @pytest.mark.parametrize("fps", [25.0, 30.0, 60.0, 120.0])
+    def test_phase_duration_is_fps_invariant(self, fps):
+        """重缩放的目的：各相位覆盖的物理时长与 fps 基本无关（容差 1 帧）。"""
+        w = self._pipeline(fps, n=2000, t_impact=1000).build_phase_windows()
+        expected_sec = {
+            "approach": (45 - 16) / 30.0,
+            "plant": (15 - 11) / 30.0,
+            "fold": (10 - 1) / 30.0,
+            "follow_through": (15 - 1) / 30.0,
+        }
+        for name, want in expected_sec.items():
+            seg = w[name]
+            got = (seg["end_offset"] - seg["start_offset"]) / fps
+            assert got == pytest.approx(want, abs=2.0 / fps), f"{name} 时长随 fps 漂移"
+
+    def test_reference_offsets_are_reported_unscaled(self):
+        w = self._pipeline(60.0).build_phase_windows()
+        assert (w["approach"]["reference_start_offset"], w["approach"]["reference_end_offset"]) == (-45, -16)
+        assert w["approach"]["start_offset"] == -90
+
+    def test_frames_never_out_of_bounds_and_clamp_flagged(self):
+        p = self._pipeline(30.0, n=20, t_impact=2)
+        w = p.build_phase_windows()
+        for name in PHASE_ORDER:
+            seg = w[name]
+            assert 0 <= seg["start_frame"] <= 19
+            assert 0 <= seg["end_frame"] <= 19
+            assert seg["start_frame"] <= seg["end_frame"]
+        assert w["approach"]["clamped"] is True
+
+    def test_fully_out_of_range_phase_marked_truncated(self):
+        p = self._pipeline(30.0, n=6, t_impact=5)
+        w = p.build_phase_windows()
+        assert w["follow_through"]["truncated"] is True
+        assert w["follow_through"]["frame_count"] == 1
+
+    def test_explicit_args_override_state(self):
+        p = self._pipeline(30.0, n=400, t_impact=200)
+        w = p.build_phase_windows(t_impact=100, total_frames=300)
+        assert w["_meta"]["t_impact"] == 100
+        assert w["_meta"]["total_frames"] == 300
+
+    def test_t_impact_falls_back_to_peak_omega(self):
+        p = make_pipeline()
+        p._trajectory_omega = [1.0, 2.0, 90.0, 3.0, 1.0]
+        p._video_fps = 30.0
+        p.t_impact = None
+        w = p.build_phase_windows()
+        assert w["_meta"]["t_impact"] == 2
+
+    def test_t_impact_clamped_into_range(self):
+        p = self._pipeline(30.0, n=50, t_impact=999)
+        w = p.build_phase_windows()
+        assert w["_meta"]["t_impact"] == 49
+
+    def test_frame_count_matches_frame_bounds(self):
+        w = self._pipeline(60.0, n=2000, t_impact=1000).build_phase_windows()
+        for name in PHASE_ORDER:
+            seg = w[name]
+            assert seg["frame_count"] == seg["end_frame"] - seg["start_frame"] + 1
+
+    def test_deterministic_across_repeated_calls(self):
+        p = self._pipeline(60.0)
+        assert p.build_phase_windows() == p.build_phase_windows()

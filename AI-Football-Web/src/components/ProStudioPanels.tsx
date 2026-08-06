@@ -9,16 +9,52 @@ import type {
 } from '../types'
 import { TRAFFIC_CLASS, type TrafficLightLevel } from '../theme/trafficLight'
 
-/** 8 大量纲 → 扣分错误码（右栏证据链回填） */
+/** 8 大量纲 → 默认扣分错误码（右栏证据链回填；折叠/膝角按实测值再细分） */
 const INDICATOR_ERROR_CODE: Partial<Record<BiomechIndicatorKey, string>> = {
   distance_cm: 'ERR_A2_SUPPORT_WIDE',
   toe_angle: 'ERR_C2_TOE_POKE',
-  max_folding_angle: 'ERR_B1_STRAIGHT_LEG',
+  max_folding_angle: 'ERR_SWING_FOLD',
   whipping_velocity: 'ERR_FOLLOW_THROUGH',
   impact_knee_angle: 'ERR_KNEE_STIFF',
   ankle_rigidity: 'ERR_C1_LOOSE_ANKLE',
   support_knee_angle: 'ERR_KNEE_STIFF',
   hip_torsion_angle: 'ERR_TORSO_TILT',
+}
+
+/** 折叠深度 → 后摆膝内角；与后端 max_folding = 180 − swing_fold 同源 */
+function foldingDepthToSwingInterior(foldingDepth: number): number {
+  return Math.max(0, 180 - foldingDepth)
+}
+
+/**
+ * 按实测值选择错误码，杜绝「测得 120° 却挂 >170° 直腿文案」的错位。
+ * - max_folding_angle：深度过小（膝内角 >140）→ B1；过大（膝内角 <70）→ SWING_FOLD
+ * - impact_knee_angle：仅 >165° → B1 直腿；其余 → KNEE_STIFF
+ * - distance_cm：肩宽比 >0.9 → A2 严重偏宽；否则 SUPPORT_LATERAL
+ */
+function resolveIndicatorErrorCode(
+  key: BiomechIndicatorKey,
+  entry: BiomechIndicatorValue,
+): string | undefined {
+  const value = typeof entry.value === 'number' ? entry.value : null
+  if (key === 'max_folding_angle' && value != null) {
+    const interior = foldingDepthToSwingInterior(value)
+    if (interior > 140) return 'ERR_B1_STRAIGHT_LEG'
+    return 'ERR_SWING_FOLD'
+  }
+  if (key === 'impact_knee_angle' && value != null) {
+    if (value > 165) return 'ERR_B1_STRAIGHT_LEG'
+    return 'ERR_KNEE_STIFF'
+  }
+  if (key === 'distance_cm' && value != null) {
+    // V3.8：肩宽归一化比例；>0.9 严重外挂，<0.25 过近
+    const ratio =
+      typeof entry.support_ratio === 'number' ? entry.support_ratio : value
+    if (ratio > 0.9) return 'ERR_A2_SUPPORT_WIDE'
+    if (ratio < 0.25) return 'ERR_SUPPORT_TOO_CLOSE'
+    return 'ERR_SUPPORT_LATERAL'
+  }
+  return INDICATOR_ERROR_CODE[key]
 }
 
 function indicatorTrafficLevel(status: string | null | undefined): TrafficLightLevel {
@@ -76,7 +112,7 @@ export function deriveErrorCodesFromIndicators(
     if (!entry) continue
     const level = indicatorTrafficLevel(entry.status)
     if (level !== 'red' && level !== 'yellow') continue
-    const code = INDICATOR_ERROR_CODE[key]
+    const code = resolveIndicatorErrorCode(key, entry)
     if (!code || seen.has(code)) continue
     seen.add(code)
     codes.push(code)
@@ -126,7 +162,7 @@ export const GOLDEN_METRIC_DEFS: GoldenMetricDef[] = [
     label: '支撑前后偏移',
     unit: 'cm',
     errorCode: 'ERR_A1_SUPPORT_BACK',
-    penalty: 8,
+    penalty: 6,
     format: (v) => (typeof v === 'number' ? `${v.toFixed(1)}cm` : '--'),
   },
   {
@@ -134,7 +170,7 @@ export const GOLDEN_METRIC_DEFS: GoldenMetricDef[] = [
     label: '支撑膝角',
     unit: '°',
     errorCode: 'ERR_KNEE_STIFF',
-    penalty: 10,
+    penalty: 6,
     format: (v) => (typeof v === 'number' ? `${v.toFixed(1)}°` : '--'),
   },
   {
@@ -142,7 +178,7 @@ export const GOLDEN_METRIC_DEFS: GoldenMetricDef[] = [
     label: '蓄力膝角',
     unit: '°',
     errorCode: 'ERR_B1_STRAIGHT_LEG',
-    penalty: 6,
+    penalty: 8,
     format: (v) => (typeof v === 'number' ? `${v.toFixed(1)}°` : '--'),
   },
   {
@@ -158,7 +194,7 @@ export const GOLDEN_METRIC_DEFS: GoldenMetricDef[] = [
     label: '脚踝锁死',
     unit: '°',
     errorCode: 'ERR_C1_LOOSE_ANKLE',
-    penalty: 15,
+    penalty: 8,
     format: (v) => (typeof v === 'number' ? `${v.toFixed(1)}°` : '--'),
   },
   {
@@ -166,26 +202,27 @@ export const GOLDEN_METRIC_DEFS: GoldenMetricDef[] = [
     label: '随摆鞭打速度',
     unit: '°/s',
     errorCode: 'ERR_FOLLOW_THROUGH',
-    penalty: 5,
+    penalty: 6,
     format: (v) => (typeof v === 'number' ? `${v.toFixed(0)}°/s` : '--'),
   },
 ]
 
-/** 8 大黄金指标错误代码 -> 人类可读的技术扣分理由文案（与 llm_agent.py 保持一致的技术口径） */
+/** 8 大黄金指标错误代码 -> 人类可读的技术扣分理由文案（V3.5 儿童/业余容错） */
 export const ERROR_CODE_LABELS: Record<string, string> = {
   ERR_WARMUP_CLOSE: '支撑脚距球心过近（<5cm）',
   ERR_A1_SUPPORT_BACK: '支撑脚尖落后球心超过 10cm',
-  ERR_A2_SUPPORT_WIDE: '支撑脚横向距离偏宽（>20cm）',
-  ERR_B1_STRAIGHT_LEG: '蓄力窗内膝关节极值角 >170°（全程直腿）',
-  ERR_B2_SHANK_ONLY: '小腿有折叠但大腿后伸≈0°（仅小腿弹射）',
+  ERR_A2_SUPPORT_WIDE: '支撑脚横距比例过远（>0.9 个肩宽，严重外挂）',
+  ERR_B1_STRAIGHT_LEG: '后摆/触球膝角过大：后摆膝内角>140° 或触球膝角>165°（折叠不足/直腿）',
+  ERR_B2_SHANK_ONLY: '浅折叠且大腿后伸≈0°（仅小腿弹射；90–130° 合理区不触发）',
   ERR_C1_LOOSE_ANKLE: '击球窗踝关节松弛泄力（方差/背屈骤降超标）',
   ERR_C2_TOE_POKE: '足背未外展，脚尖直捅球体',
   PASS_STANDARD: '各项指标落入合理区间',
   ERR_APPROACH_ANGLE: '助跑夹角未落在 20°-60° 黄金斜线区间',
-  ERR_SUPPORT_LATERAL: '支撑脚横向距离超出 15-20cm 合理区间',
+  ERR_SUPPORT_LATERAL: '支撑脚横距比例略偏（理想约 0.4–0.7 个肩宽）',
+  ERR_SUPPORT_TOO_CLOSE: '支撑脚横距比例过近（<0.25 个肩宽）',
   ERR_SUPPORT_AP: '支撑脚尖相对球心前后位置不合理',
-  ERR_KNEE_STIFF: '支撑腿膝关节过度绷直（超过 160°），缺乏缓冲',
-  ERR_SWING_FOLD: '蓄力阶段膝折叠不足（直腿戳球）',
+  ERR_KNEE_STIFF: '触球/支撑膝角偏离缓冲带（触球直腿仅 >165° 触发）',
+  ERR_SWING_FOLD: '后摆折叠偏离 90–130° 合理发力区（过度折叠或略浅）',
   ERR_TORSO_TILT: '躯干侧倾角度不合理（僵硬直立或侧倾失衡）',
   ERR_ANKLE_LOOSE: '触球瞬间踝关节未绷紧锁死，力量在此环节泄漏',
   ERR_FOLLOW_THROUGH: '随摆挥速不足或未完成跨体随摆，发力不连贯',
@@ -377,7 +414,18 @@ export interface DeductionListProps {
   hasAnalysisResult?: boolean
 }
 
-/** 右栏「扣分项清单」：根据 error_codes / 指标灯色严格渲染，禁止空码误亮合规 */
+/** 后端 deductions 条目（与左侧展示变量同源） */
+type ScorerDeduction = {
+  metric_key?: string
+  measured_value?: number
+  unit?: string
+  penalty?: number
+  status?: string
+  reason?: string
+  error_code?: string
+}
+
+/** 右栏「扣分项清单」：优先后端 deductions（含实测值），否则回退 error_codes */
 export function DeductionList({
   errorCodes,
   overallStatus = null,
@@ -385,6 +433,9 @@ export function DeductionList({
   hasAnalysisResult = false,
 }: DeductionListProps) {
   const derived = deriveErrorCodesFromIndicators(scoreDetail?.indicators)
+  const backendDeductions = (scoreDetail as { deductions?: ScorerDeduction[] } | null)
+    ?.deductions
+  const hasBackendDeductions = Array.isArray(backendDeductions) && backendDeductions.length > 0
   // 显式传入数组（含空数组）时尊重调用方筛选结果，不再回填 derived
   const codes = Array.isArray(errorCodes) ? errorCodes : derived
   const isPerfect =
@@ -396,6 +447,30 @@ export function DeductionList({
     return (
       <div className="rounded-2xl border border-emerald-400/20 bg-emerald-500/10 px-3.5 py-3 text-xs text-emerald-200">
         ✅ 本次分析未命中任何量化扣分项，8 大黄金指标全部合规！
+      </div>
+    )
+  }
+
+  // 优先渲染后端 deductions：reason 已绑定实测值，与左侧指标不可能错位
+  if (hasBackendDeductions && !Array.isArray(errorCodes)) {
+    return (
+      <div className="flex flex-col gap-1.5">
+        {backendDeductions!.map((item, idx) => (
+          <div
+            key={`${item.metric_key ?? 'd'}-${idx}`}
+            className="flex items-center justify-between gap-2 rounded-xl border border-rose-400/20 bg-rose-500/10 px-3 py-2"
+          >
+            <span className="text-[11px] leading-relaxed text-rose-200">
+              {item.reason ||
+                (item.error_code ? ERROR_CODE_LABELS[item.error_code] : null) ||
+                item.metric_key ||
+                '扣分项'}
+            </span>
+            <span className="flex-shrink-0 rounded-full bg-rose-500/25 px-2 py-0.5 text-[10px] font-bold text-rose-100">
+              -{typeof item.penalty === 'number' ? item.penalty : '?'} 分
+            </span>
+          </div>
+        ))}
       </div>
     )
   }
@@ -412,20 +487,42 @@ export function DeductionList({
     return null
   }
 
+  const indicatorPenaltyByCode = new Map<string, number>()
+  if (scoreDetail?.indicators) {
+    for (const [key, entry] of Object.entries(scoreDetail.indicators) as Array<
+      [BiomechIndicatorKey, BiomechIndicatorValue | undefined]
+    >) {
+      if (!entry || typeof entry.penalty !== 'number') continue
+      const code = resolveIndicatorErrorCode(key, entry)
+      if (code) indicatorPenaltyByCode.set(code, entry.penalty)
+    }
+  }
+
   return (
     <div className="flex flex-col gap-1.5">
       {codes.map((code) => {
         const def = GOLDEN_METRIC_DEFS.find((item) => item.errorCode === code)
+        const livePenalty = indicatorPenaltyByCode.get(code)
+        // 优先用指标实测 penalty；过滤视图下若有后端 deductions 也按码对齐
+        const fromBackend = hasBackendDeductions
+          ? backendDeductions!.find((d) => d.error_code === code)
+          : undefined
+        const penalty =
+          typeof fromBackend?.penalty === 'number'
+            ? fromBackend.penalty
+            : typeof livePenalty === 'number'
+              ? livePenalty
+              : def?.penalty
+        const label =
+          fromBackend?.reason || ERROR_CODE_LABELS[code] || code
         return (
           <div
             key={code}
             className="flex items-center justify-between gap-2 rounded-xl border border-rose-400/20 bg-rose-500/10 px-3 py-2"
           >
-            <span className="text-[11px] leading-relaxed text-rose-200">
-              {ERROR_CODE_LABELS[code] ?? code}
-            </span>
+            <span className="text-[11px] leading-relaxed text-rose-200">{label}</span>
             <span className="flex-shrink-0 rounded-full bg-rose-500/25 px-2 py-0.5 text-[10px] font-bold text-rose-100">
-              -{def?.penalty ?? '?'} 分
+              -{penalty ?? '?'} 分
             </span>
           </div>
         )

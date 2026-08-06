@@ -179,7 +179,7 @@ body,
   animation: blink-caret 0.9s step-end infinite;
 }
 
-/* ---- Coach Dashboard：三栏填满剩余高度并局部滚动 ---- */
+/* ---- Coach Dashboard：固定头 + 互斥 Tab 动态区 ---- */
 .coach-dashboard-shell {
   display: flex;
   flex-direction: column;
@@ -188,15 +188,13 @@ body,
   overflow: hidden;
 }
 
-/* CTMS 全局控制台：悬浮条带 */
+/* CTMS 全局控制台（位于固定 Header 内） */
 .coach-global-control-panel {
-  position: sticky;
-  top: 0;
   z-index: 20;
 }
 
 .coach-panel-scroll {
-  /* 必须相对父级 flex 剩余高度，禁止再用 100vh 硬算（会裁切底部） */
+  /* 相对父级 flex 剩余高度局部滚动，禁止 100vh 硬算 */
   height: 100%;
   max-height: 100%;
   min-height: 0;

@@ -25,8 +25,17 @@ import {
   RotateCcw,
   Activity,
   UsersRound,
+  UserRound,
   GitCompareArrows,
   X,
+  Trash2,
+  ChevronsUpDown,
+  Sparkles,
+  Upload,
+  AlertCircle,
+  ThumbsUp,
+  Target,
+  ClipboardList,
 } from 'lucide-react'
 import {
   loadGlobalRecordsFromLocalStorage,
@@ -45,19 +54,28 @@ import InterventionDosageMonitor from './InterventionDosageMonitor'
 import type {
   AcademicExportResult,
   GlobalTrainingRecord,
+  IndividualSummaryReport,
   ProgressHistoryPoint,
   ProgressHistoryResponse,
   Quantified5dScores,
   RadarAverageScores,
 } from '../types'
 
-type CoachAnalysisTab = 'dosage' | 'classProfile' | 'cohortCompare'
+type CoachAnalysisTab = 'classProfile' | 'individual' | 'cohortCompare' | 'dosage'
 
 const COACH_ANALYSIS_TABS: Array<{ id: CoachAnalysisTab; label: string }> = [
-  { id: 'dosage', label: '实验干预剂量' },
   { id: 'classProfile', label: '班级群体画像' },
-  { id: 'cohortCompare', label: '多维数据对比' },
+  { id: 'individual', label: '个体复盘' },
+  { id: 'cohortCompare', label: '班级对比' },
+  { id: 'dosage', label: '实验干预剂量' },
 ]
+
+const TAB_ICONS: Record<CoachAnalysisTab, typeof Activity> = {
+  classProfile: UsersRound,
+  individual: UserRound,
+  cohortCompare: GitCompareArrows,
+  dosage: Activity,
+}
 
 const API_BASE_URL = 'http://localhost:8000'
 const SCHOOL_FALLBACK = '未设置学校'
@@ -164,10 +182,11 @@ function normalizeClassGroup(value: string | undefined | null): string {
 }
 
 /**
- * 教练端科研指挥中心（Catapult / Hudl 宏观→微观三层下钻）
+ * 教练端科研指挥中心（互斥 Tab 路由布局）
  *
- * 左栏花名册（剂量） → 中栏个人图谱（时序+雷达） → 右栏清道夫尝试日志
- * 三栏填满顶栏以下剩余高度，各自 overflow-y 局部滚动，互不干扰。
+ * 固定头部：KPI + 全局控制台 + Tab 栏
+ * 动态区按 activeTab 互斥渲染：班级群体画像 | 个体复盘 | 班级对比 | 实验干预剂量
+ * 整页锁在一屏高度内，仅动态区内部滚动。
  */
 export default function CoachDashboard() {
   const [records, setRecords] = useState<GlobalTrainingRecord[]>([])
@@ -176,7 +195,7 @@ export default function CoachDashboard() {
   const [toast, setToast] = useState<DashboardToastState | null>(null)
 
   const [globalFilter, setGlobalFilter] = useState<GlobalFilter>(DEFAULT_GLOBAL_FILTER)
-  const [activeTab, setActiveTab] = useState<CoachAnalysisTab>('dosage')
+  const [activeTab, setActiveTab] = useState<CoachAnalysisTab>('classProfile')
   /** 学校/班级选项被删除（隐藏）后递增，驱动下拉列表重算 */
   const [filterOptionsEpoch, setFilterOptionsEpoch] = useState(0)
 
@@ -187,6 +206,8 @@ export default function CoachDashboard() {
   const [dataEpoch, setDataEpoch] = useState(0)
   const [progressHistory, setProgressHistory] = useState<ProgressHistoryPoint[] | null>(null)
   const [radarAverage, setRadarAverage] = useState<RadarAverageScores | null>(null)
+  /** 个人详细数据默认最小化，点击或选中被试后再展开 */
+  const [detailPanelOpen, setDetailPanelOpen] = useState(false)
 
   function showToast(message: string, success: boolean) {
     const id = ++dashboardToastSeq
@@ -280,20 +301,25 @@ export default function CoachDashboard() {
   /**
    * 核心数据过滤管道：全量活跃记录 → school → class → group → dateRange 漏斗。
    * 下游花名册 / 进度图 / 对比雷达均只消费此数据集。
+   * 已从花名册/控制台删除（隐藏）的班级不再进入看板。
    */
   const filteredDataset = useMemo(() => {
+    const hiddenClasses = new Set(loadHiddenClassGroupNames())
     return activeRecords
       .filter((record) => globalFilter.school === 'all' || normalizeSchool(record.school) === globalFilter.school)
       .filter(
         (record) =>
           globalFilter.class === 'all' || normalizeClassGroup(record.classGroup) === globalFilter.class,
       )
+      .filter((record) => !hiddenClasses.has(normalizeClassGroup(record.classGroup)))
       .filter((record) => globalFilter.group === 'all' || resolveGroup(record) === globalFilter.group)
       .filter((record) => isDateInRange(getRecordTestDate(record), globalFilter.dateRange))
       .sort((a, b) => (a.timestamp < b.timestamp ? 1 : -1))
-  }, [activeRecords, globalFilter])
+    // filterOptionsEpoch：花名册删除班级后强制重算
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeRecords, globalFilter, filterOptionsEpoch])
 
-  /** 科研对比模块：仅从过滤后数据集提取班级选项，保证与全局过滤器联动 */
+  /** 班级对比模块：仅从过滤后数据集提取班级选项，保证与全局过滤器联动 */
   const cohortOptions = useMemo(() => {
     const set = new Set<string>()
     filteredDataset.forEach((record) => set.add(normalizeClassGroup(record.classGroup)))
@@ -558,12 +584,14 @@ export default function CoachDashboard() {
   })()
 
   const panelScrollClass =
-    'coach-panel-scroll h-full min-h-0 overflow-y-auto overflow-x-hidden scrollbar-thin scrollbar-thumb-slate-700 scrollbar-track-transparent'
+    'coach-panel-scroll min-h-0 overflow-y-auto overflow-x-hidden scrollbar-thin scrollbar-thumb-slate-700 scrollbar-track-transparent'
+
+  const isIndividualTab = activeTab === 'individual'
 
   return (
     <div className="coach-dashboard-shell flex h-full min-h-0 flex-col overflow-hidden">
-      {/* ============================ 顶栏：KPI + 全局控制台（固定高度，不参与三栏滚动） ============================ */}
-      <div className="flex-shrink-0 space-y-3 border-b border-white/5 px-3 py-3 sm:px-4">
+      {/* ============================ 固定头部：KPI + 全局控制台 + Tab 栏 ============================ */}
+      <header className="flex-shrink-0 space-y-3 border-b border-white/5 px-3 py-3 sm:px-4">
         <div className="flex flex-wrap items-center gap-2">
           <MiniKpi icon={Users} label="总人数" value={kpi.totalStudents} accent="emerald" />
           <MiniKpi icon={Radio} label="A 组" value={kpi.realtimeStudents} accent="sky" />
@@ -597,8 +625,8 @@ export default function CoachDashboard() {
           </div>
         </div>
 
-        {/* CTMS 全局控制台：悬浮条带，统管 school / class / group / dateRange */}
-        <div className="coach-global-control-panel sticky top-0 z-20 flex flex-wrap items-center gap-2 rounded-2xl border border-white/10 bg-slate-950/80 px-3 py-2.5 shadow-[0_8px_32px_rgba(0,0,0,0.35)] backdrop-blur-xl">
+        {/* CTMS 全局控制台：统管 school / class / group / dateRange */}
+        <div className="coach-global-control-panel z-20 flex flex-wrap items-center gap-2 rounded-2xl border border-white/10 bg-slate-950/80 px-3 py-2.5 shadow-[0_8px_32px_rgba(0,0,0,0.35)] backdrop-blur-xl">
           <span className="mr-1 inline-flex items-center gap-1.5 text-[11px] font-semibold tracking-wide text-emerald-300/90">
             <Filter className="h-3.5 w-3.5" />
             全局控制台
@@ -726,116 +754,170 @@ export default function CoachDashboard() {
           </span>
         </div>
 
-        {/* 分析 Tab：剂量热力图 / 班级群体画像 / 多维对比 */}
-        <div className="coach-analysis-tabs space-y-2.5">
-          <div
-            className="flex flex-wrap items-center gap-1 rounded-2xl border border-white/10 bg-black/30 p-1"
-            role="tablist"
-            aria-label="教练端分析视图"
-          >
-            {COACH_ANALYSIS_TABS.map((tab) => {
-              const isActive = activeTab === tab.id
-              const Icon =
-                tab.id === 'dosage' ? Activity : tab.id === 'classProfile' ? UsersRound : GitCompareArrows
-              return (
+        {/* Tab 切换栏（仅导航，内容在下方动态区互斥渲染） */}
+        <div
+          className="flex flex-wrap items-center gap-1 rounded-2xl border border-white/10 bg-black/30 p-1"
+          role="tablist"
+          aria-label="教练端分析视图"
+        >
+          {COACH_ANALYSIS_TABS.map((tab) => {
+            const isActive = activeTab === tab.id
+            const Icon = TAB_ICONS[tab.id]
+            return (
+              <button
+                key={tab.id}
+                type="button"
+                role="tab"
+                aria-selected={isActive}
+                onClick={() => setActiveTab(tab.id)}
+                className={`inline-flex items-center gap-1.5 rounded-xl px-3 py-2 text-[11px] font-semibold transition ${
+                  isActive
+                    ? 'bg-emerald-500/20 text-emerald-100 shadow-[0_0_18px_rgba(16,185,129,0.15)] ring-1 ring-emerald-400/35'
+                    : 'text-white/45 hover:bg-white/5 hover:text-white/75'
+                }`}
+              >
+                <Icon className="h-3.5 w-3.5" />
+                {tab.label}
+              </button>
+            )
+          })}
+        </div>
+      </header>
+
+      {/* ============================ 动态渲染区：按 activeTab 严格互斥 ============================ */}
+      <div
+        className={`flex min-h-0 flex-1 flex-col p-4 ${
+          isIndividualTab ? 'overflow-hidden' : 'overflow-y-auto'
+        }`}
+      >
+        {loadState === 'loading' ? (
+          <div className="flex flex-1 items-center justify-center gap-3 text-white/40">
+            <Loader2 className="h-7 w-7 animate-spin text-emerald-400" />
+            <p className="text-sm">正在加载全量历史归档数据……</p>
+          </div>
+        ) : activeRecords.length === 0 ? (
+          <div className="flex flex-1 items-center justify-center">
+            <EmptyStateCard />
+          </div>
+        ) : filteredDataset.length === 0 ? (
+          <div className="flex flex-1 items-center justify-center">
+            <FilterEmptyState onReset={() => setGlobalFilter(DEFAULT_GLOBAL_FILTER)} />
+          </div>
+        ) : activeTab === 'classProfile' ? (
+          /* 班级群体画像：仅 2×2 图表面板 */
+          <ClassProfilingPanel
+            filteredDataset={filteredDataset}
+            filterSchool={globalFilter.school}
+            filterClass={globalFilter.class}
+          />
+        ) : activeTab === 'cohortCompare' ? (
+          /* 班级对比：多维数据对比面板，隐藏花名册与尝试日志 */
+          <CohortComparePanel
+            cohortOptions={cohortOptions}
+            filteredDataset={filteredDataset}
+          />
+        ) : activeTab === 'dosage' ? (
+          /* 实验干预剂量：全屏热力图 */
+          <InterventionDosageMonitor filteredDataset={filteredDataset} />
+        ) : (
+          /* 个体复盘：左花名册 + 右（个人图谱 / 可展开详细数据） */
+          <div className="flex min-h-0 flex-1 flex-row gap-4 overflow-hidden">
+            <aside
+              className={`w-80 flex-shrink-0 rounded-2xl border border-white/10 bg-slate-900/40 p-3 ${panelScrollClass}`}
+            >
+              <LeftSidebar
+                rosterTree={rosterTree}
+                filteredDataset={filteredDataset}
+                selectedKey={selectedStudent?.key ?? null}
+                onSelect={(student) => {
+                  setSelectedStudent(student)
+                  setDetailPanelOpen(true)
+                }}
+                onDeleteClass={(classGroup) => {
+                  const confirmed = window.confirm(
+                    `确定从花名册删除班级「${classGroup}」？\n删除后该班级将从看板隐藏（数据仍保留在归档中）。`,
+                  )
+                  if (!confirmed) return
+                  removeClassGroupOption(classGroup)
+                  setFilterOptionsEpoch((n) => n + 1)
+                  setGlobalFilter((prev) =>
+                    prev.class === classGroup ? { ...prev, class: 'all', group: 'all' } : prev,
+                  )
+                  setSelectedStudent((prev) => (prev?.classGroup === classGroup ? null : prev))
+                  showToast(`已删除班级「${classGroup}」`, true)
+                }}
+              />
+            </aside>
+
+            <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-4 overflow-hidden">
+              <main
+                className={`min-h-0 flex-1 rounded-2xl border border-white/10 bg-slate-900/30 p-4 ${panelScrollClass}`}
+              >
+                <MainCanvas
+                  selectedStudent={selectedStudent}
+                  filteredDataset={filteredDataset}
+                  selectedAttemptIndex={clampedAttemptIndex}
+                  onSelectAttemptIndex={setSelectedAttemptIndex}
+                  progressHistory={progressHistory}
+                  radarScores={portraitRadarScores}
+                  dataEpoch={dataEpoch}
+                />
+              </main>
+
+              {/* 个人详细数据：默认最小化，选中被试或点击后展开 */}
+              {!detailPanelOpen ? (
                 <button
-                  key={tab.id}
                   type="button"
-                  role="tab"
-                  aria-selected={isActive}
-                  onClick={() => setActiveTab(tab.id)}
-                  className={`inline-flex items-center gap-1.5 rounded-xl px-3 py-2 text-[11px] font-semibold transition ${
-                    isActive
-                      ? 'bg-emerald-500/20 text-emerald-100 shadow-[0_0_18px_rgba(16,185,129,0.15)] ring-1 ring-emerald-400/35'
-                      : 'text-white/45 hover:bg-white/5 hover:text-white/75'
-                  }`}
+                  onClick={() => setDetailPanelOpen(true)}
+                  className="group flex h-11 flex-shrink-0 items-center justify-between gap-3 rounded-2xl border border-white/10 bg-slate-900/50 px-3.5 text-left transition hover:border-sky-400/35 hover:bg-sky-500/10"
                 >
-                  <Icon className="h-3.5 w-3.5" />
-                  {tab.label}
+                  <span className="inline-flex items-center gap-2 text-sm font-medium text-white/70 group-hover:text-sky-100">
+                    <span className="inline-flex h-7 w-7 items-center justify-center rounded-xl bg-sky-500/15 ring-1 ring-sky-400/30">
+                      <ClipboardList className="h-3.5 w-3.5 text-sky-300" />
+                    </span>
+                    个人详细数据
+                    {selectedStudent ? (
+                      <span className="rounded-md bg-white/8 px-1.5 py-0.5 text-[10px] text-white/40">
+                        {selectedStudent.studentId} · {selectedStudent.records.length} 次
+                      </span>
+                    ) : (
+                      <span className="text-[11px] font-normal text-white/30">先选左侧被试</span>
+                    )}
+                  </span>
+                  <span className="inline-flex items-center gap-1 text-[11px] text-white/35 group-hover:text-sky-200/80">
+                    点击查看
+                    <ChevronsUpDown className="h-3.5 w-3.5" />
+                  </span>
                 </button>
-              )
-            })}
+              ) : (
+                <aside className="flex h-[min(42vh,360px)] min-h-[240px] flex-shrink-0 flex-col overflow-hidden rounded-2xl border border-white/10 bg-slate-900/40 p-2">
+                  <div className="mb-1 flex flex-shrink-0 items-center justify-end px-1">
+                    <button
+                      type="button"
+                      onClick={() => setDetailPanelOpen(false)}
+                      className="inline-flex items-center gap-1 rounded-lg px-2 py-1 text-[11px] text-white/40 transition hover:bg-white/10 hover:text-white/80"
+                      title="最小化个人详细数据"
+                    >
+                      最小化
+                      <X className="h-3 w-3" />
+                    </button>
+                  </div>
+                  <CoachDataSanitizerGrid
+                    compact
+                    studentId={selectedStudent?.studentId ?? null}
+                    refreshKey={dataEpoch}
+                    onRecordSoftDeleted={handleRecordSoftDeleted}
+                    onRecordsBatchDeleted={handleRecordsBatchDeleted}
+                    onRadarAverageChange={setRadarAverage}
+                    showToast={showToast}
+                    className="h-full min-h-0"
+                  />
+                </aside>
+              )}
+            </div>
           </div>
-
-          <div className="max-h-[min(48vh,520px)] overflow-y-auto overscroll-contain scrollbar-thin scrollbar-thumb-slate-700 scrollbar-track-transparent">
-            {activeTab === 'dosage' && (
-              <InterventionDosageMonitor filteredDataset={filteredDataset} />
-            )}
-            {activeTab === 'classProfile' && (
-              <ClassProfilingPanel
-                filteredDataset={filteredDataset}
-                filterSchool={globalFilter.school}
-                filterClass={globalFilter.class}
-              />
-            )}
-            {activeTab === 'cohortCompare' && (
-              <CohortComparePanel
-                cohortOptions={cohortOptions}
-                filteredDataset={filteredDataset}
-              />
-            )}
-          </div>
-        </div>
+        )}
       </div>
-
-      {/* ============================ 三栏主工作区（占满剩余高度，各栏独立滚动） ============================ */}
-      {loadState === 'loading' ? (
-        <div className="flex min-h-0 flex-1 items-center justify-center gap-3 text-white/40">
-          <Loader2 className="h-7 w-7 animate-spin text-emerald-400" />
-          <p className="text-sm">正在加载全量历史归档数据……</p>
-        </div>
-      ) : activeRecords.length === 0 ? (
-        <div className="flex min-h-0 flex-1 items-center justify-center p-6">
-          <EmptyStateCard />
-        </div>
-      ) : filteredDataset.length === 0 ? (
-        <div className="flex min-h-0 flex-1 items-center justify-center p-6">
-          <FilterEmptyState onReset={() => setGlobalFilter(DEFAULT_GLOBAL_FILTER)} />
-        </div>
-      ) : (
-        <div className="flex min-h-0 flex-1 gap-3 overflow-hidden px-3 pb-3 pt-2 sm:px-4">
-          {/* -------- 左栏：花名册与剂量监控 -------- */}
-          <aside
-            className={`w-[300px] flex-shrink-0 rounded-2xl border border-white/10 bg-slate-900/40 p-3 ${panelScrollClass}`}
-          >
-            <LeftSidebar
-              rosterTree={rosterTree}
-              filteredDataset={filteredDataset}
-              selectedKey={selectedStudent?.key ?? null}
-              onSelect={(student) => setSelectedStudent(student)}
-            />
-          </aside>
-
-          {/* -------- 中栏：个人时序 + 雷达 -------- */}
-          <main
-            className={`min-w-0 flex-1 rounded-2xl border border-white/10 bg-slate-900/30 p-4 ${panelScrollClass}`}
-          >
-            <MainCanvas
-              selectedStudent={selectedStudent}
-              filteredDataset={filteredDataset}
-              selectedAttemptIndex={clampedAttemptIndex}
-              onSelectAttemptIndex={setSelectedAttemptIndex}
-              progressHistory={progressHistory}
-              radarScores={portraitRadarScores}
-              dataEpoch={dataEpoch}
-            />
-          </main>
-
-          {/* -------- 右栏：清道夫尝试日志 -------- */}
-          <aside className="flex h-full min-h-0 w-[380px] flex-shrink-0 flex-col overflow-hidden rounded-2xl border border-white/10 bg-slate-900/40 p-2">
-            <CoachDataSanitizerGrid
-              compact
-              studentId={selectedStudent?.studentId ?? null}
-              refreshKey={dataEpoch}
-              onRecordSoftDeleted={handleRecordSoftDeleted}
-              onRecordsBatchDeleted={handleRecordsBatchDeleted}
-              onRadarAverageChange={setRadarAverage}
-              showToast={showToast}
-              className="min-h-0 flex-1"
-            />
-          </aside>
-        </div>
-      )}
 
       <AnimatePresence>
         {toast && (
@@ -1026,7 +1108,7 @@ function EmptyStateCard() {
       </div>
       <h3 className="text-lg font-semibold text-white/90">暂无任何历史归档数据</h3>
       <p className="text-sm leading-relaxed text-white/40">
-        前往「实时反馈系统」或「延时反馈系统」完成测试并开启本地落盘归档后，数据将同步至此处三栏指挥台。
+        前往「实时反馈系统」或「延时反馈系统」完成测试并开启本地落盘归档后，数据将同步至教练端看板。
       </p>
     </motion.div>
   )
@@ -1069,12 +1151,14 @@ function LeftSidebar({
   filteredDataset,
   selectedKey,
   onSelect,
+  onDeleteClass,
 }: {
   rosterTree: RosterClassNode[]
   /** 全局过滤后的唯一数据源（剂量统计与花名册树均由此衍生） */
   filteredDataset: GlobalTrainingRecord[]
   selectedKey: string | null
   onSelect: (student: StudentAggregate) => void
+  onDeleteClass: (classGroup: string) => void
 }) {
   const [searchQuery, setSearchQuery] = useState('')
   const [expandedClasses, setExpandedClasses] = useState<Set<string>>(new Set())
@@ -1166,7 +1250,7 @@ function LeftSidebar({
       <div className="flex items-center justify-between">
         <h3 className="flex items-center gap-2 text-sm font-semibold text-white/85">
           <Users className="h-4 w-4 text-emerald-300" />
-          花名册 · 剂量监控
+          花名册
         </h3>
         <span className="rounded-full bg-black/30 px-2 py-0.5 text-[10px] text-white/40">
           {total} 人 · {attemptCount} 次
@@ -1197,23 +1281,38 @@ function LeftSidebar({
                 key={classNode.classGroup}
                 className="overflow-hidden rounded-xl border border-white/8 bg-black/20"
               >
-                <button
-                  type="button"
-                  onClick={() => toggleClass(classNode.classGroup)}
-                  className="flex w-full items-center gap-2 px-2.5 py-2.5 text-left transition hover:bg-white/5"
-                >
-                  {classOpen ? (
-                    <ChevronDown className="h-3.5 w-3.5 flex-shrink-0 text-emerald-300/80" />
-                  ) : (
-                    <ChevronRight className="h-3.5 w-3.5 flex-shrink-0 text-white/35" />
-                  )}
-                  <span className="min-w-0 flex-1 truncate text-sm font-semibold text-white/85">
-                    {classNode.classGroup}
-                  </span>
-                  <span className="flex-shrink-0 rounded-md bg-white/8 px-1.5 py-0.5 text-[10px] tabular-nums text-white/40">
-                    {classNode.studentCount}人
-                  </span>
-                </button>
+                <div className="group/class flex w-full items-center gap-1 px-1.5 py-1.5">
+                  <button
+                    type="button"
+                    onClick={() => toggleClass(classNode.classGroup)}
+                    className="flex min-w-0 flex-1 items-center gap-2 rounded-lg px-1.5 py-1 text-left transition hover:bg-white/5"
+                  >
+                    {classOpen ? (
+                      <ChevronDown className="h-3.5 w-3.5 flex-shrink-0 text-emerald-300/80" />
+                    ) : (
+                      <ChevronRight className="h-3.5 w-3.5 flex-shrink-0 text-white/35" />
+                    )}
+                    <span className="min-w-0 flex-1 truncate text-sm font-semibold text-white/85">
+                      {classNode.classGroup}
+                    </span>
+                    <span className="flex-shrink-0 rounded-md bg-white/8 px-1.5 py-0.5 text-[10px] tabular-nums text-white/40">
+                      {classNode.studentCount}人
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    title={`删除班级「${classNode.classGroup}」`}
+                    aria-label={`删除班级 ${classNode.classGroup}`}
+                    onClick={(e) => {
+                      e.preventDefault()
+                      e.stopPropagation()
+                      onDeleteClass(classNode.classGroup)
+                    }}
+                    className="inline-flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-md text-white/25 opacity-70 transition hover:bg-rose-500/20 hover:text-rose-300 group-hover/class:opacity-100"
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </button>
+                </div>
 
                 <AnimatePresence initial={false}>
                   {classOpen && (
@@ -1354,7 +1453,7 @@ function MainCanvas({
 
   if (!selectedStudent) {
     return (
-      <div className="flex h-full min-h-[420px] flex-col items-center justify-center gap-5 px-6 text-center">
+      <div className="flex h-full min-h-0 flex-col items-center justify-center gap-5 px-6 text-center">
         <div className="relative flex h-24 w-24 items-center justify-center rounded-[28px] bg-gradient-to-br from-emerald-500/15 via-sky-500/10 to-transparent ring-1 ring-white/10">
           <MousePointerClick className="h-10 w-10 text-emerald-300/80" />
           <span className="absolute -left-2 top-1/2 -translate-y-1/2 text-2xl opacity-60">👈</span>
@@ -1364,7 +1463,7 @@ function MainCanvas({
             请在左侧选择被试以查看科研分析图谱
           </h3>
           <p className="text-sm leading-relaxed text-white/40">
-            Catapult / Hudl 式三层下钻：花名册剂量 → 个人时序与五维雷达 → 右侧尝试级清道夫日志。
+            从花名册挑选学生后，可查看个人进步趋势、五维雷达与底部「个人详细数据」；亦可上传数据给 LLM 分析总体情况。
           </p>
         </div>
       </div>
@@ -1379,7 +1478,7 @@ function MainCanvas({
       : 0
 
   return (
-    <div className="flex flex-col gap-5 pb-10">
+    <div className="flex flex-col gap-5">
       <section className="rounded-2xl border border-white/8 bg-white/[0.03] p-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-center gap-3">
@@ -1435,6 +1534,200 @@ function MainCanvas({
           primaryLabel="综合均值"
         />
       </section>
+
+      <IndividualLlmSummaryCard
+        key={`llm-summary-${selectedStudent.key}-${dataEpoch}`}
+        studentId={selectedStudent.studentId}
+        records={scopedRecords}
+      />
     </div>
+  )
+}
+
+type LlmSummaryStatus = 'idle' | 'loading' | 'ready' | 'error'
+
+/** 从被试归档记录汇总评分序列与错误次数，供 /api/generate_individual_summary 消费 */
+function buildIndividualSummaryPayload(records: GlobalTrainingRecord[]): {
+  scoreHistory: number[]
+  errorCounter: Record<string, number>
+} {
+  const chronological = records
+    .slice()
+    .sort((a, b) => (a.timestamp < b.timestamp ? -1 : a.timestamp > b.timestamp ? 1 : 0))
+  const scoreHistory = chronological
+    .map((r) => r.score)
+    .filter((s): s is number => typeof s === 'number' && Number.isFinite(s))
+  const errorCounter: Record<string, number> = {}
+  for (const record of chronological) {
+    for (const err of record.biomechanicalErrors ?? []) {
+      const label = String(err).trim()
+      if (!label) continue
+      errorCounter[label] = (errorCounter[label] || 0) + 1
+    }
+  }
+  return { scoreHistory, errorCounter }
+}
+
+/**
+ * 个体复盘：将当前筛选内的个人数据上传给 LLM，生成总体优缺点总结。
+ * 默认待命；需教练主动点击「上传并分析」。
+ */
+function IndividualLlmSummaryCard({
+  studentId,
+  records,
+}: {
+  studentId: string
+  records: GlobalTrainingRecord[]
+}) {
+  const [status, setStatus] = useState<LlmSummaryStatus>('idle')
+  const [report, setReport] = useState<IndividualSummaryReport | null>(null)
+  const [errorMessage, setErrorMessage] = useState<string | null>(null)
+
+  const { scoreHistory, errorCounter } = useMemo(
+    () => buildIndividualSummaryPayload(records),
+    [records],
+  )
+  const sampleCount = records.length
+  const canAnalyze = scoreHistory.length > 0
+
+  async function handleUploadAndAnalyze() {
+    if (!canAnalyze || status === 'loading') return
+    setStatus('loading')
+    setErrorMessage(null)
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/generate_individual_summary`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          studentId,
+          scoreHistory,
+          errorCounter,
+        }),
+      })
+      if (!response.ok) {
+        throw new Error(`接口返回状态码 ${response.status}`)
+      }
+      const data = (await response.json()) as IndividualSummaryReport
+      if (!data?.strengths && !data?.weaknesses) {
+        throw new Error('后端未返回有效分析内容')
+      }
+      setReport({
+        strengths: data.strengths || '',
+        weaknesses: data.weaknesses || '',
+        generatedAt: data.generatedAt || '',
+      })
+      setStatus('ready')
+    } catch (error) {
+      setReport(null)
+      setErrorMessage(error instanceof Error ? error.message : '分析失败，请稍后重试')
+      setStatus('error')
+    }
+  }
+
+  const topErrors = Object.entries(errorCounter)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3)
+
+  return (
+    <section className="rounded-2xl border border-violet-400/20 bg-gradient-to-br from-violet-500/10 via-white/[0.03] to-transparent p-4">
+      <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
+        <div className="flex items-center gap-2">
+          <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-violet-500/20 ring-1 ring-violet-400/30">
+            <Sparkles className="h-4 w-4 text-violet-200" />
+          </span>
+          <div>
+            <h4 className="text-sm font-semibold text-violet-100">LLM 个人总体分析</h4>
+            <p className="text-[11px] text-white/35">
+              上传筛选内 {sampleCount} 次尝试
+              {scoreHistory.length > 0 ? ` · ${scoreHistory.length} 个有效评分` : ''}
+              ，生成优势 / 盲区总结
+            </p>
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={() => void handleUploadAndAnalyze()}
+          disabled={!canAnalyze || status === 'loading'}
+          className="inline-flex items-center gap-1.5 rounded-full border border-violet-400/35 bg-violet-500/20 px-3.5 py-1.5 text-xs font-semibold text-violet-100 transition hover:bg-violet-500/30 disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          {status === 'loading' ? (
+            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+          ) : (
+            <Upload className="h-3.5 w-3.5" />
+          )}
+          {status === 'loading' ? '分析中…' : status === 'ready' ? '重新上传分析' : '上传数据并分析'}
+        </button>
+      </div>
+
+      {topErrors.length > 0 && status === 'idle' && (
+        <p className="mb-3 text-[11px] text-white/30">
+          待上传高频偏差：
+          {topErrors.map(([label, count]) => `${label}×${count}`).join(' · ')}
+        </p>
+      )}
+
+      {status === 'idle' && (
+        <div className="flex flex-col items-center justify-center gap-2 rounded-xl border border-dashed border-white/10 bg-black/20 px-4 py-8 text-center">
+          <Upload className="h-6 w-6 text-violet-300/50" />
+          <p className="text-sm text-white/55">
+            {canAnalyze
+              ? '点击上方按钮，将本生历史评分与错误统计上传给 LLM 分析个人总体情况'
+              : '当前筛选内暂无有效评分，无法上传分析'}
+          </p>
+        </div>
+      )}
+
+      {status === 'loading' && (
+        <div className="flex flex-col gap-2 rounded-xl border border-violet-400/20 bg-violet-500/5 px-4 py-6">
+          <div className="flex items-center gap-2 text-violet-200/90">
+            <Loader2 className="h-4 w-4 animate-spin" />
+            <span className="text-xs font-medium">DeepSeek 正在解读个人纵向表现…</span>
+          </div>
+          <p className="text-[11px] text-white/30">
+            学号 {studentId} · 评分序列 {scoreHistory.join(' → ') || '—'}
+          </p>
+        </div>
+      )}
+
+      {status === 'error' && (
+        <div className="flex flex-col gap-3 rounded-xl border border-rose-400/25 bg-rose-500/10 px-4 py-5">
+          <div className="flex items-center gap-2 text-rose-300">
+            <AlertCircle className="h-4 w-4" />
+            <span className="text-xs font-medium">分析失败</span>
+          </div>
+          <p className="text-sm text-white/60">{errorMessage || '请确认后端服务已启动后重试'}</p>
+          <button
+            type="button"
+            onClick={() => void handleUploadAndAnalyze()}
+            className="inline-flex w-fit items-center gap-1.5 rounded-full border border-rose-400/30 bg-rose-500/15 px-3 py-1.5 text-[11px] font-medium text-rose-100 transition hover:bg-rose-500/25"
+          >
+            <RefreshCcw className="h-3 w-3" />
+            重试
+          </button>
+        </div>
+      )}
+
+      {status === 'ready' && report && (
+        <div className="flex flex-col gap-3">
+          <article className="rounded-xl border border-emerald-400/20 bg-emerald-500/8 px-4 py-3">
+            <p className="mb-1.5 flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wider text-emerald-300/80">
+              <ThumbsUp className="h-3 w-3" />
+              稳定发力优势
+            </p>
+            <p className="text-sm leading-relaxed text-white/85 whitespace-pre-wrap">{report.strengths}</p>
+          </article>
+          <article className="rounded-xl border border-amber-400/20 bg-amber-500/8 px-4 py-3">
+            <p className="mb-1.5 flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wider text-amber-300/80">
+              <Target className="h-3 w-3" />
+              习惯性盲区
+            </p>
+            <p className="text-sm leading-relaxed text-white/85 whitespace-pre-wrap">{report.weaknesses}</p>
+          </article>
+          {report.generatedAt && (
+            <p className="text-right text-[10px] text-white/25">生成于 {report.generatedAt}</p>
+          )}
+        </div>
+      )}
+    </section>
   )
 }

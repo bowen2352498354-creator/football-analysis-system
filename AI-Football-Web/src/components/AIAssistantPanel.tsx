@@ -91,25 +91,40 @@ export default function AIAssistantPanel({
       if (filter === 'green') return []
       return codes
     }
-    // 黄/红：按扣分严重度启发式过滤（penalty≥10 视为红档偏离，其余黄档接近）
+    // 黄/红：按扣分严重度启发式过滤（V3.5 单项上限 8；penalty≥7 视为红档偏离）
     return codes.filter((code) => {
       const def = GOLDEN_METRIC_DEFS.find((d) => d.errorCode === code)
       const penalty = def?.penalty ?? 6
-      if (filter === 'red') return penalty >= 10
-      return penalty < 10
+      if (filter === 'red') return penalty >= 7
+      return penalty < 7
     })
   }, [resolvedErrorCodes, filter])
 
-  const correctionText = (
-    report?.correction_metaphor ||
-    report?.painPoint ||
+  const overviewText = (
+    report?.overview ||
+    report?.clinical_echo ||
+    report?.clinicalEcho ||
+    report?.clinical_brief?.primary?.coach_fact ||
+    report?.clinicalBrief?.primary?.coach_fact ||
     ''
   ).trim()
-  const praiseText = (
+  const biomechText = (report?.biomechanical_analysis || report?.painPoint || '').trim()
+  const correctionText = (
+    report?.magic_metaphor ||
+    report?.correction_metaphor ||
+    ''
+  ).trim()
+  const actionText = (
+    report?.action_plan ||
     report?.praise_encouragement ||
     report?.prescription ||
     ''
   ).trim()
+  const aigcSource = (
+    report?.aigc_source ||
+    report?.aigcSource ||
+    ''
+  ).toLowerCase()
   const liveStatusText = !report ? (displayText || '').trim() : ''
 
   const filterCount = (id: DefectFilterId): number => {
@@ -130,7 +145,7 @@ export default function AIAssistantPanel({
           </span>
           <div className="min-w-0">
             <h2 className="truncate text-sm font-semibold text-slate-100">AI Assistant</h2>
-            <p className="truncate text-[10px] text-slate-400">魔法咒语 · 高光时刻</p>
+            <p className="truncate text-[10px] text-slate-400">四维诊断 · 千人千面</p>
           </div>
         </header>
 
@@ -174,12 +189,12 @@ export default function AIAssistantPanel({
         </div>
 
         <div className="min-h-0 flex-1 space-y-3 overflow-y-auto overflow-x-hidden px-3 py-3">
-          {/* OPTIMAL 双段式：魔法咒语 + 高光时刻 */}
-          <section className="space-y-3" aria-label="OPTIMAL 双段式教练反馈">
+          {/* 四维深度诊断：综合评价 / 病理分析 / 隐喻处方 / 训练指令 */}
+          <section className="space-y-3" aria-label="四维深度诊断反馈">
             {!report ? (
               <div className="rounded-xl border border-slate-700/70 bg-slate-900/35 p-3">
                 <p className="text-xs leading-relaxed text-slate-500">
-                  结束分析后，这里会亮起两张卡片：上面是「魔法咒语」纠错，下面是「高光时刻」表扬。
+                  结束分析后，这里会展示四维诊断：综合评价、动力链病理分析、具身隐喻处方与下一步训练指令。
                 </p>
                 {liveStatusText && (
                   <p className="mt-2 text-xs leading-relaxed text-slate-400">
@@ -199,10 +214,45 @@ export default function AIAssistantPanel({
                   </div>
                 )}
 
+                {(overviewText || aigcSource) && (
+                  <div className="rounded-lg border border-slate-600/70 bg-slate-900/50 px-3 py-2">
+                    <div className="mb-1 flex items-center justify-between gap-2">
+                      <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">
+                        综合评价
+                      </span>
+                      {aigcSource && (
+                        <span
+                          className={`rounded px-1.5 py-0.5 text-[9px] font-medium ${
+                            aigcSource === 'llm'
+                              ? 'bg-sky-500/20 text-sky-200'
+                              : 'bg-slate-600/40 text-slate-300'
+                          }`}
+                        >
+                          {aigcSource === 'llm' ? 'AI 解读' : '模板兜底'}
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-[12px] leading-relaxed text-slate-200">
+                      {overviewText || '本次动作已完成量化诊断'}
+                    </p>
+                  </div>
+                )}
+
+                {biomechText && (
+                  <div className="rounded-xl border border-rose-400/35 bg-gradient-to-br from-rose-500/12 to-slate-900/30 p-3.5">
+                    <h3 className="mb-2 text-sm font-bold tracking-wide text-rose-200">
+                      动力链病理分析
+                    </h3>
+                    <p className="text-[13px] font-medium leading-relaxed text-rose-50">
+                      {biomechText}
+                    </p>
+                  </div>
+                )}
+
                 <div className="rounded-xl border border-sky-400/45 bg-gradient-to-br from-amber-500/15 via-sky-500/12 to-sky-900/20 p-3.5 shadow-[0_0_24px_rgba(56,189,248,0.12)]">
                   <h3 className="mb-2 flex items-center gap-1.5 text-sm font-bold tracking-wide text-sky-200">
                     <span aria-hidden>💡</span>
-                    教练的魔法咒语
+                    具身隐喻处方
                   </h3>
                   <p className="text-[13px] font-medium leading-relaxed text-amber-50">
                     {correctionText ||
@@ -212,11 +262,11 @@ export default function AIAssistantPanel({
 
                 <div className="rounded-xl border border-emerald-400/50 bg-gradient-to-br from-emerald-500/18 to-teal-900/25 p-3.5 shadow-[0_0_24px_rgba(16,185,129,0.14)]">
                   <h3 className="mb-2 flex items-center gap-1.5 text-sm font-bold tracking-wide text-emerald-200">
-                    <span aria-hidden>🌟</span>
-                    高光时刻
+                    <span aria-hidden>🎯</span>
+                    下一步训练指令
                   </h3>
                   <p className="text-[13px] font-medium leading-relaxed text-emerald-50">
-                    {praiseText || '这次尝试非常勇敢，继续保持！'}
+                    {actionText || '针对核心病灶做慢动作定点控制。'}
                   </p>
                 </div>
               </>

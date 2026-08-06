@@ -108,20 +108,61 @@ export interface ThresholdHitStats {
   red: number
 }
 
+/** 引擎确定性 ClinicalBrief：LLM 只读复述，不算分 */
+export interface ClinicalBriefFact {
+  metric?: string
+  label_zh?: string
+  status?: string
+  band?: string
+  band_text?: string
+  display_value?: number | null
+  display_unit?: string
+  estimate_cm?: number | null
+  support_ratio?: number | null
+  quoteable?: boolean
+  coach_fact?: string
+  penalty?: number
+}
+
+export interface ClinicalBriefPayload {
+  primary?: ClinicalBriefFact | null
+  secondary?: ClinicalBriefFact[]
+  strengths?: Array<{ metric?: string; label_zh?: string; coach_fact?: string }>
+  blocked?: Array<{ metric?: string; reason?: string }>
+  deduction_echo?: string[]
+}
+
 /** DeepSeek 生成的本次综合练习诊断报告（分析结束后展示） */
 export interface FinalDiagnosisReport {
   /** 发力稳定性综合评分（0-100） */
   score: number
   /** 本次分析总触球/采样次数 */
   totalAttempts: number
-  /** 主要痛点描述（具身隐喻化表达） */
+  /** 主要痛点描述（动力链病理分析 / 具身隐喻） */
   painPoint: string
-  /** 教练处方建议 */
+  /** 教练处方建议（下一步训练指令） */
   prescription: string
-  /** OPTIMAL 纠错具身隐喻（与 painPoint 同源） */
+  /** 四维报告：综合评价 */
+  overview?: string
+  /** 四维报告：动力链病理分析 */
+  biomechanical_analysis?: string
+  /** 四维报告：具身隐喻处方 */
+  magic_metaphor?: string
+  /** 四维报告：下一步训练指令 */
+  action_plan?: string
+  /** OPTIMAL 纠错具身隐喻（与 magic_metaphor / painPoint 同源） */
   correction_metaphor?: string
-  /** OPTIMAL 表扬鼓励（与 prescription 同源） */
+  /** 下一步训练指令别名（与 action_plan / prescription 同源） */
   praise_encouragement?: string
+  /** 综合评价别名（与 overview 同源） */
+  clinical_echo?: string
+  clinicalEcho?: string
+  /** llm = DeepSeek 生成；fallback = 静态模板 */
+  aigc_source?: 'llm' | 'fallback' | string
+  aigcSource?: 'llm' | 'fallback' | string
+  /** 引擎组装的 ClinicalBrief（供前端展示依据） */
+  clinical_brief?: ClinicalBriefPayload | null
+  clinicalBrief?: ClinicalBriefPayload | null
   /** 拼接完整的报告正文，用于打字机展示与导出 */
   fullText: string
   /** 报告生成时间 */
@@ -368,8 +409,11 @@ export interface GlobalTrainingRecord {
   phase?: string
   /** 击球瞬间膝关节屈曲角度（度），优先为真实测量均值，缺失历史记录会退化为估算值 */
   kneeFlexionAngle?: number | null
-  /** 支撑脚离球距离（cm）；有 PCR/上游实测时为真实值，缺测时可能为空（勿将启发式当作实测） */
+  /** 支撑脚离球距离估计（cm，由肩宽比反推）；权威口径见 support_ratio / indicators.distance_cm */
   supportFootDistance?: number | null
+  /** 支撑脚横距 / 肩宽（无量纲比例） */
+  support_ratio?: number | null
+  supportRatio?: number | null
   /** 支撑脚横向距离 / 前后偏移（SDT 成就引擎） */
   support_lateral_dist_cm?: number | null
   support_ap_offset_cm?: number | null
@@ -448,6 +492,8 @@ export interface CoachSanitizerRecord {
   directory?: string | null
   /** Phase 4：清道夫人工标定所需字段 */
   supportFootDistance?: number | null
+  support_ratio?: number | null
+  supportRatio?: number | null
   supportFootDistanceProvenance?: string | null
   max_folding_angle?: number | null
   maxFoldingAngleProvenance?: string | null
@@ -671,15 +717,30 @@ export type BiomechIndicatorKey =
   | 'ankle_rigidity'
   | 'support_knee_angle'
   | 'hip_torsion_angle'
+  | 'trunk_lean_angle'
+  /** 出球初速度（km/h）—— YOLO 轨迹结果型指标 */
+  | 'ball_speed_kmh'
+  /** 发射仰角（°）—— 水平地面为 0° */
+  | 'launch_angle_deg'
 
 /** 后端三级状态编码 */
 export type BiomechStatusCode = 'GREEN_OPTIMAL' | 'YELLOW_APPROACHING' | 'RED_DEVIATED'
+
+/**
+ * 数据血统层级（全链路透明化）：描述测量方法学置信度。
+ * 与小写 provenance（AIGC 复述门禁）并存。
+ */
+export type ProvenanceTier = 'MEASURED' | 'CALIBRATED' | 'ESTIMATED'
 
 /** 单条量纲实测条目 */
 export interface BiomechIndicatorValue {
   /** 对外实测值；缺测时可为 null（评分侧另有 scoring_value） */
   value?: number | null
   scoring_value?: number | null
+  /**
+   * 单位。支撑脚站位（distance_cm 键）现为肩宽归一化比例：`ratio` / `×肩宽`，
+   * 不再返回 PCR 绝对厘米。
+   */
   unit?: string
   status: BiomechStatusCode | string
   penalty?: number
@@ -691,8 +752,18 @@ export interface BiomechIndicatorValue {
   ankle_angles_window?: number[]
   /** Phase 1：measured|calibrated 才可视为可复述实测 */
   provenance?: string
+  /**
+   * 数据血统层级（UI / 报告徽章）。
+   * 后端字段为 snake_case ``provenance_tier``；同时接受 camelCase。
+   */
+  provenanceTier?: ProvenanceTier
+  provenance_tier?: ProvenanceTier
   method?: string
   confidence?: number
+  /** 支撑脚横距 / 肩宽（无量纲）；与 value 在 unit=ratio 时同源 */
+  support_ratio?: number | null
+  /** 可选估计厘米（仅展示参考，非 PCR 实测） */
+  distance_cm_estimate?: number | null
 }
 
 /** 整趟分析总体合规态：仅 PERFECT 允许右栏绿色「全部合规」提示 */
@@ -717,11 +788,28 @@ export interface JointHighlight {
 }
 
 /** POST /api/generate_report 返回的 scoreDetail 结构 */
+/** 射门结果闭环：出球初速度 / 发射仰角 */
+export interface BallOutcomePayload {
+  ball_speed_kmh?: number | null
+  launch_angle_deg?: number | null
+  ok?: boolean
+  scale_method?: string | null
+  displacement_m?: number | null
+  dt_sec?: number | null
+  reason?: string | null
+}
+
 export interface ScoreDetailPayload {
   TotalScore?: number
   t_impact?: number
   base_score?: number
   total_penalty?: number
+  /** 出球初速度（km/h），看板「射门时速」 */
+  ball_speed_kmh?: number | null
+  /** 发射仰角（°），水平地面为 0° */
+  launch_angle_deg?: number | null
+  /** 出球结果明细（标定方式 / 位移 / 时基） */
+  ball_outcome?: BallOutcomePayload | null
   /**
    * 整趟合规总览。仅当明确为 `PERFECT`（或 8 项均非 RED/YELLOW）时，
    * 前端才允许渲染绿色「全部合规」框。
@@ -729,6 +817,18 @@ export interface ScoreDetailPayload {
   overall_status?: OverallComplianceStatus | null
   overallStatus?: OverallComplianceStatus | null
   indicators?: Partial<Record<BiomechIndicatorKey, BiomechIndicatorValue>>
+  /**
+   * V3.5 扣分明细：reason 绑定与左侧展示相同的实测变量，杜绝文案/数据错位。
+   */
+  deductions?: Array<{
+    metric_key?: string
+    measured_value?: number
+    unit?: string
+    penalty?: number
+    status?: string
+    reason?: string
+    error_code?: string
+  }>
   metric_extreme_frames?: Partial<Record<BiomechIndicatorKey, number>>
   /** V3.1 五维独立量化雷达（每维满分 20） */
   radar_scores?: RadarScores

@@ -26,9 +26,72 @@ import type {
   BiomechStatusCode,
   MetricRenderMode,
   MetricSeekEvent,
+  ProvenanceTier,
   Quantified5dScores,
   ScoreDetailPayload,
 } from '../types'
+
+/** 数据血统徽章：色标 + Tooltip（全链路透明化） */
+const PROVENANCE_TIER_UI: Record<
+  ProvenanceTier,
+  { label: string; className: string; tooltip: string }
+> = {
+  MEASURED: {
+    label: 'MEASURED',
+    className:
+      'bg-emerald-500/20 text-emerald-300 ring-1 ring-emerald-400/40',
+    tooltip: '基于物理像素实测，置信度极高',
+  },
+  CALIBRATED: {
+    label: 'CALIBRATED',
+    className: 'bg-sky-500/20 text-sky-300 ring-1 ring-sky-400/40',
+    tooltip: '基于解剖学/环境标定推算，置信度高',
+  },
+  ESTIMATED: {
+    label: 'ESTIMATED',
+    className: 'bg-orange-500/20 text-orange-300 ring-1 ring-orange-400/40',
+    tooltip: '基于深度学习 3D 估算，仅供参考',
+  },
+}
+
+/** 无后端字段时的方法学回退（与 indicator_builder 默认映射对齐） */
+const DEFAULT_PROVENANCE_TIER: Partial<Record<BiomechIndicatorKey, ProvenanceTier>> = {
+  whipping_velocity: 'MEASURED',
+  trunk_lean_angle: 'MEASURED',
+  ball_speed_kmh: 'MEASURED',
+  launch_angle_deg: 'MEASURED',
+  impact_knee_angle: 'MEASURED',
+  max_folding_angle: 'MEASURED',
+  toe_angle: 'MEASURED',
+  ankle_rigidity: 'MEASURED',
+  support_knee_angle: 'MEASURED',
+  distance_cm: 'CALIBRATED',
+  hip_torsion_angle: 'ESTIMATED',
+}
+
+function resolveProvenanceTier(
+  key: BiomechIndicatorKey,
+  entry: BiomechIndicatorValue | undefined,
+): ProvenanceTier {
+  const raw = (entry?.provenanceTier ?? entry?.provenance_tier ?? '').toString().trim().toUpperCase()
+  if (raw === 'MEASURED' || raw === 'CALIBRATED' || raw === 'ESTIMATED') {
+    return raw
+  }
+  return DEFAULT_PROVENANCE_TIER[key] ?? 'ESTIMATED'
+}
+
+function ProvenanceTierBadge({ tier }: { tier: ProvenanceTier }) {
+  const ui = PROVENANCE_TIER_UI[tier]
+  return (
+    <span
+      className={`inline-flex flex-shrink-0 items-center rounded px-1 py-px text-[8px] font-bold uppercase tracking-wide ${ui.className}`}
+      title={ui.tooltip}
+      aria-label={`数据血统 ${ui.label}：${ui.tooltip}`}
+    >
+      {ui.label}
+    </span>
+  )
+}
 
 const API_BASE_URL = 'http://localhost:8000'
 
@@ -43,15 +106,22 @@ export const BIOMECH_CARD_DEFS: {
 }[] = [
   {
     key: 'distance_cm',
-    label: '支撑脚偏移',
-    shortLabel: '支撑偏移',
+    label: '支撑脚横距比例',
+    shortLabel: '支撑比例',
     Icon: Footprints,
-    format: (v) => (typeof v === 'number' ? `${v.toFixed(1)} cm` : '--'),
+    format: (v, unit) => {
+      if (typeof v !== 'number') return '--'
+      // V3.8：全面肩宽归一化比例（废除 PCR cm）
+      if (unit === 'ratio' || unit === '×肩宽' || v <= 3.5) {
+        return `支撑脚横距比例 ${v.toFixed(2)}`
+      }
+      return `支撑脚横距比例 ${v.toFixed(2)}`
+    },
     metaphors: {
-      green: '像大树的根扎稳了地面，支撑脚离球刚刚好！',
-      yellow: '再靠近球心一点点，像把根扎在标志盘正中。',
-      red: '下次把支撑脚挪到球旁，想象脚掌是树根要站稳。',
-      pending: '等待本次分析回填支撑脚偏移实测值…',
+      green: '像大树的根扎稳了地面，支撑脚离球刚刚好（约半个肩宽）！',
+      yellow: '再靠近球心一点点，把横距比例收进 0.4–0.7 肩宽。',
+      red: '下次把支撑脚挪到球旁，横距约半个肩宽，想象脚掌是树根要站稳。',
+      pending: '等待本次分析回填支撑脚横距比例…',
     },
   },
   {
@@ -113,9 +183,9 @@ export const BIOMECH_CARD_DEFS: {
     Icon: Shield,
     format: (v, unit) =>
       typeof v === 'number'
-        ? unit === 'variance' || unit === undefined
+        ? unit === 'variance'
           ? `σ² ${v.toFixed(2)}`
-          : `${v.toFixed(1)}${unit || ''}`
+          : `${v.toFixed(1)}${unit === 'deg' || !unit ? '°' : unit}`
         : '--',
     metaphors: {
       green: '脚踝锁成坚硬的铁板，力量一点都不漏！',
@@ -148,6 +218,45 @@ export const BIOMECH_CARD_DEFS: {
       yellow: '转髋再多一点，肩膀和骨盆轻轻拧一下。',
       red: '踢球时转开髋部，想象身体在轻轻拧毛巾。',
       pending: '等待髋扭转角回填…',
+    },
+  },
+  {
+    key: 'trunk_lean_angle',
+    label: '躯干倾角',
+    shortLabel: '躯干倾角',
+    Icon: Wind,
+    format: (v) => (typeof v === 'number' ? `${v.toFixed(1)}°` : '--'),
+    metaphors: {
+      green: '身体微微前倾压住重心，像轻轻压住弹簧！',
+      yellow: '别站得太直，上身再往前压一点点。',
+      red: '踢球前把胸口压向球，别往后仰够球。',
+      pending: '等待躯干倾角回填…',
+    },
+  },
+  {
+    key: 'ball_speed_kmh',
+    label: '射门时速',
+    shortLabel: '射门时速',
+    Icon: Zap,
+    format: (v) => (typeof v === 'number' ? `${v.toFixed(1)} km/h` : '--'),
+    metaphors: {
+      green: '球像离弦的箭一样飞出去了！',
+      yellow: '再把力量传到脚背，让球飞得更快一点。',
+      red: '触球时把髋和膝的力量甩出去，别轻飘飘捅球。',
+      pending: '等待射门时速回填…',
+    },
+  },
+  {
+    key: 'launch_angle_deg',
+    label: '发射仰角',
+    shortLabel: '发射仰角',
+    Icon: Target,
+    format: (v) => (typeof v === 'number' ? `${v.toFixed(1)}°` : '--'),
+    metaphors: {
+      green: '出球角度刚刚好，又平又有力！',
+      yellow: '脚背再压一点，别把球踢得太高。',
+      red: '触球点对准球心偏下，让球贴着草皮飞出去。',
+      pending: '等待发射仰角回填…',
     },
   },
 ]
@@ -284,6 +393,7 @@ export default function MetricCardList({
           ankle_rigidity: ['ankle_angle', 'ankle_rigidity_variance'],
           support_knee_angle: ['support_knee_angle'],
           hip_torsion_angle: ['hip_torsion_angle', 'torso_lateral_tilt'],
+          trunk_lean_angle: ['trunk_lean_angle', 'trunk_lean_t0_deg', 'torso_lateral_tilt'],
         }
         for (const alias of aliases[def.key] ?? []) {
           const raw = metrics[alias]
@@ -310,12 +420,14 @@ export default function MetricCardList({
           ankle_rigidity: ['ERR_C1_LOOSE_ANKLE', 'ERR_ANKLE_LOOSE'],
           support_knee_angle: ['ERR_KNEE_STIFF'],
           hip_torsion_angle: ['ERR_TORSO_TILT'],
+          trunk_lean_angle: ['ERR_D1_TRUNK_LEAN', 'ERR_TORSO_TILT'],
         }
         const hit = (related[def.key] ?? []).some((c) => (errorCodes ?? []).includes(c))
         level = hit ? 'red' : 'green'
       }
 
       const frameIndex = resolveExtremeFrame(def.key, entry, scoreDetail, impactFrame)
+      const provenanceTier = resolveProvenanceTier(def.key, entry)
 
       return {
         ...def,
@@ -324,6 +436,7 @@ export default function MetricCardList({
         level,
         frameIndex,
         metaphor: def.metaphors[level],
+        provenanceTier,
       }
     })
   }, [indicators, metrics, errorCodes, scoreDetail, impactFrame])
@@ -541,7 +654,12 @@ export default function MetricCardList({
 
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center justify-between gap-2">
-                    <span className="truncate text-[11px] font-medium text-slate-200">{card.label}</span>
+                    <span className="flex min-w-0 items-center gap-1.5">
+                      <span className="truncate text-[11px] font-medium text-slate-200">
+                        {card.label}
+                      </span>
+                      <ProvenanceTierBadge tier={card.provenanceTier} />
+                    </span>
                     <span
                       className={`inline-flex flex-shrink-0 items-center gap-1 rounded-md px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide ${tone.text}`}
                     >

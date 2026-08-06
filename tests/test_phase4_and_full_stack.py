@@ -33,7 +33,7 @@ def test_empirical_defaults_match_production_bands():
     assert (low, high) == (15.0, 20.0)
     assert get_ankle_half_window_ms() == 50.0
     cfg = load_empirical_thresholds(force_reload=True)
-    assert cfg["population"] == "production_defaults_v31"
+    assert cfg["population"] == "youth_amateur_v35"
     assert DEFAULT_THRESHOLDS["ankle_impact_half_window_ms"] == 50.0
 
 

@@ -60,6 +60,7 @@ import numpy as np
 
 import error_diagnoser
 import pose_tracker as pt
+from session_baseline import stamp_baseline_watermark, get_session_metadata_store
 
 # --------------------------------------------------------------------------
 # 常量（从 api_server.py 迁移；api_server.py 保留同名引用以向下兼容）
@@ -73,6 +74,33 @@ BLACK_FRAME_CONSECUTIVE_LIMIT = 15
 FRAME_PROGRESS_LOG_INTERVAL = 60
 CAMERA_READ_FAIL_LIMIT = 50
 CAMERA_REOPEN_SLEEP_SEC = 0.45
+
+# --------------------------------------------------------------------------
+# 【动作相位时序切分】五阶段帧索引区间，全部以 t_impact 为绝对基准点做相对偏移。
+#
+# 关键帧与实际视频错位的根因是各阶段各自用毫秒阈值/时间戳反查下标，
+# 一旦 fps 抖动或时间戳插值就会漂移。此处改为纯整数相对帧偏移：
+# t_impact 由空间距离极小值锁定（pose_tracker.locate_impact_frame_with_quality
+# 内 w_prox 距离极小门控），其余四段一律 t_impact ± N 帧，零漂移可复现。
+#
+# 取值为 (start_offset, end_offset)，闭区间，相对 t_impact，
+# 且相邻两段端点互不重叠（-16/-15、-11/-10 边界各归一段），避免同一帧被
+# 两个相位重复计数。
+#
+# 注意：下表的帧数是以 PHASE_OFFSET_REFERENCE_FPS（30fps）为基准标定的，
+# 代表的是固定的生理时长（助跑 -1.5s..-0.533s、支撑 -0.5s..-0.367s、
+# 折叠 -0.333s..-0.033s、随前 +0.033s..+0.5s）。实际视频 fps 不等于 30 时，
+# build_phase_windows() 会按 fps/30 整数取整重缩放，使各相位覆盖的时长恒定，
+# 同时保持"纯整数帧偏移、零漂移可复现"的原始约束（不引入时间戳反查）。
+# --------------------------------------------------------------------------
+PHASE_OFFSET_REFERENCE_FPS: float = 30.0
+PHASE_FRAME_OFFSETS: tuple[tuple[str, int, int], ...] = (
+    ("approach", -45, -16),        # 助跑
+    ("plant", -15, -11),           # 支撑
+    ("fold", -10, -1),             # 折叠
+    ("impact", 0, 0),              # 射门
+    ("follow_through", 1, 15),     # 随前
+)
 
 
 # --------------------------------------------------------------------------
@@ -158,13 +186,22 @@ class ShotAnalysisPipeline:
         self.impact_frame = None  # 已完成面部打码、未叠加骨骼线的 numpy 数组
         self.impact_metrics: Optional[dict] = None
         self._best_impact_score: float = -1.0
-        # 【V2.5】逐帧轨迹缓存，分析结束后用 locate_impact_frame 抛物线锁帧覆写
+        # 【V2.5/V2.6】逐帧轨迹缓存；结束后抛物线粗锁 + CubicSpline 120Hz 精修
         self._trajectory_angles: list[float] = []
         self._trajectory_omega: list[float] = []
         self._trajectory_ankle_px: list[tuple] = []
         self._trajectory_frames_blurred: list = []
         # 【Sprint 1】逐帧姿态关键点（支撑踝 / 摆腿踝等），供时空热力图坐标映射
         self._trajectory_pose_frames: list[dict] = []
+        # 【V3.11】YOLO 足球中心轨迹（与帧索引对齐；未检出为 None）
+        self._trajectory_ball_px: list[Optional[tuple]] = []
+        self._trajectory_ball_diameter_px: list[Optional[float]] = []
+        # 场地单应性 / pixel→meter 标定器（可选）
+        self._field_calibrator: Any = None
+        # 射门结果闭环：出球初速度 / 发射仰角
+        self.ball_speed_kmh: Optional[float] = None
+        self.launch_angle_deg: Optional[float] = None
+        self.ball_outcome_meta: dict = {}
         # 脱敏帧 JPEG 缓存：报告阶段按折叠极值帧重标定大小腿夹角标注
         self._blurred_jpeg_by_index: dict[int, bytes] = {}
         self._blurred_jpeg_ring: "collections.deque[tuple[int, bytes]]" = collections.deque(
@@ -387,12 +424,188 @@ class ShotAnalysisPipeline:
         omega_smooth = pt.KinematicSignalProcessor.smooth_joint_trajectories(
             list(self._trajectory_omega[:n])
         )
-        t_impact = pt.locate_impact_frame(omega_smooth, ankles, ball_coords)
+        t_impact, t0_quality = pt.locate_impact_frame_with_quality(
+            omega_smooth, ankles, ball_coords
+        )
         self.t_impact = int(t_impact)
         safe_print(
-            f"【shot_analysis_service】[V2.5] 抛物线触球锁帧 t_impact={self.t_impact} "
+            f"【shot_analysis_service】[V2.6] 触球锁帧 t_impact={self.t_impact} "
+            f"t0_quality={t0_quality} "
             f"（同步总帧数 frame_count={self.sync_frame_count}）",
             flush=True,
+        )
+        # T0 锁定后立刻结算出球初速度 / 发射仰角
+        self._finalize_ball_outcome()
+
+    def set_field_calibrator(self, calibrator: Any) -> None:
+        """注入场地单应性矩阵或 pixel_to_meter 标定器（可选）。"""
+        self._field_calibrator = calibrator
+
+    def _append_ball_detection(self, frame_bgr, yolo_model: Any) -> None:
+        """逐帧写入 YOLO 球心；失败时对齐填 None，保证与帧索引等长。"""
+        center = None
+        diameter = None
+        if yolo_model is not None and frame_bgr is not None:
+            try:
+                results = pt.yolo_detect_frame(yolo_model, frame_bgr)
+                extracted = pt.extract_sports_ball_center(results)
+                if extracted is not None:
+                    center = (float(extracted[0]), float(extracted[1]))
+                    diameter = float(extracted[2])
+            except Exception:  # noqa: BLE001
+                center = None
+                diameter = None
+        self._trajectory_ball_px.append(center)
+        self._trajectory_ball_diameter_px.append(diameter)
+
+    def _collect_ball_window_after_t0(self, t0: int, n_frames: int = 4) -> list:
+        """从轨迹缓冲（Rolling 全长序列）取 ``[T0, T0+n_frames)`` 球心。"""
+        balls = list(self._trajectory_ball_px)
+        n = len(balls)
+        if n <= 0 or t0 < 0 or t0 >= n:
+            return []
+        window = []
+        for i in range(t0, min(n, t0 + int(n_frames))):
+            window.append(balls[i])
+        return window
+
+    def _finalize_ball_outcome(self) -> None:
+        """T0 锁定后：取 T0..T0+3 球心 → calculate_ball_outcome。"""
+        self.ball_speed_kmh = None
+        self.launch_angle_deg = None
+        self.ball_outcome_meta = {"ok": False, "reason": "not_computed"}
+        try:
+            from biomech_primitives import (
+                DEFAULT_EMPIRICAL_PCR,
+                STANDARD_BALL_DIAMETER_CM,
+                calculate_ball_outcome,
+            )
+
+            t0 = int(self.t_impact) if self.t_impact is not None else -1
+            window = self._collect_ball_window_after_t0(t0, n_frames=4)
+            if sum(1 for p in window if p is not None) < 2:
+                self.ball_outcome_meta = {
+                    "ok": False,
+                    "reason": "insufficient_yolo_ball_points",
+                    "window_len": len(window),
+                }
+                return
+
+            fps = float(self._video_fps) if self._video_fps and self._video_fps > 1 else 30.0
+            if self._fixed_frame_dt and self._fixed_frame_dt > 0:
+                fps = float(1.0 / self._fixed_frame_dt)
+
+            # T0 球框直径 → PCR 覆盖；否则默认经验 PCR
+            pcr = None
+            if 0 <= t0 < len(self._trajectory_ball_diameter_px):
+                diam = self._trajectory_ball_diameter_px[t0]
+                if diam is not None and float(diam) >= 10.0:
+                    pcr = float(STANDARD_BALL_DIAMETER_CM) / float(diam)
+
+            outcome = calculate_ball_outcome(
+                window,
+                fps=fps,
+                calibrator=self._field_calibrator,
+                pcr_cm_per_px=pcr if pcr is not None else float(DEFAULT_EMPIRICAL_PCR),
+            )
+            self.ball_outcome_meta = dict(outcome)
+            if outcome.get("ok"):
+                self.ball_speed_kmh = outcome.get("ball_speed_kmh")
+                self.launch_angle_deg = outcome.get("launch_angle_deg")
+                safe_print(
+                    f"【shot_analysis_service】[V3.11] 出球结果 "
+                    f"speed={self.ball_speed_kmh} km/h "
+                    f"launch={self.launch_angle_deg}° "
+                    f"scale={outcome.get('scale_method')}",
+                    flush=True,
+                )
+            else:
+                safe_print(
+                    f"【shot_analysis_service】[V3.11] 出球结果未解算："
+                    f"{outcome.get('reason')}",
+                    flush=True,
+                )
+        except Exception as exc:  # noqa: BLE001
+            self.ball_outcome_meta = {"ok": False, "reason": f"exception:{exc}"}
+
+    def get_ball_outcome(self) -> dict:
+        """返回出球初速度 / 仰角（供 generate_report 注入 score_detail）。"""
+        return {
+            "ball_speed_kmh": self.ball_speed_kmh,
+            "launch_angle_deg": self.launch_angle_deg,
+            "meta": dict(self.ball_outcome_meta or {}),
+        }
+
+    def inject_ball_outcome_into_score_detail(self, score_detail: Optional[dict]) -> dict:
+        """把球速 / 仰角写入 score_detail 顶层与 indicators。"""
+        detail = dict(score_detail or {})
+        speed = self.ball_speed_kmh
+        angle = self.launch_angle_deg
+        meta = dict(self.ball_outcome_meta or {})
+        detail["ball_speed_kmh"] = speed
+        detail["launch_angle_deg"] = angle
+        detail["ball_outcome"] = {
+            "ball_speed_kmh": speed,
+            "launch_angle_deg": angle,
+            "ok": bool(meta.get("ok")),
+            "scale_method": meta.get("scale_method"),
+            "displacement_m": meta.get("displacement_m"),
+            "dt_sec": meta.get("dt_sec"),
+            "reason": meta.get("reason"),
+        }
+        indicators = dict(detail.get("indicators") or {})
+        t0 = int(self.t_impact) if self.t_impact is not None else 0
+        if speed is not None:
+            indicators["ball_speed_kmh"] = {
+                "value": round(float(speed), 2),
+                "unit": "km/h",
+                "status": "GREEN_OPTIMAL",
+                "penalty": 0.0,
+                "provenance": "measured",
+                "method": str(meta.get("scale_method") or "ball_outcome"),
+                "extreme_frame_index": t0,
+            }
+        else:
+            indicators["ball_speed_kmh"] = {
+                "value": None,
+                "unit": "km/h",
+                "status": "YELLOW_APPROACHING",
+                "penalty": 0.0,
+                "provenance": "missing",
+                "method": "ball_outcome_unavailable",
+                "note": meta.get("reason") or "未检出出球轨迹",
+                "extreme_frame_index": t0,
+            }
+        if angle is not None:
+            indicators["launch_angle_deg"] = {
+                "value": round(float(angle), 2),
+                "unit": "deg",
+                "status": "GREEN_OPTIMAL",
+                "penalty": 0.0,
+                "provenance": "measured",
+                "method": str(meta.get("scale_method") or "ball_outcome"),
+                "extreme_frame_index": t0,
+            }
+        else:
+            indicators["launch_angle_deg"] = {
+                "value": None,
+                "unit": "deg",
+                "status": "YELLOW_APPROACHING",
+                "penalty": 0.0,
+                "provenance": "missing",
+                "method": "ball_outcome_unavailable",
+                "note": meta.get("reason") or "未检出出球轨迹",
+                "extreme_frame_index": t0,
+            }
+        detail["indicators"] = indicators
+        # 实验防干扰：强制打上基线环境水印（含 is_baseline_trusted）
+        return self.stamp_session_baseline(detail)
+
+    def stamp_session_baseline(self, score_detail: Optional[dict]) -> dict:
+        """将锁定的 SessionCheckpoint 环境参数写入 score_detail。"""
+        return stamp_baseline_watermark(
+            score_detail,
+            analysis_session_id=getattr(self, "session_id", None),
         )
 
     # ------------------------------------------------------------------
@@ -414,37 +627,77 @@ class ShotAnalysisPipeline:
         if self._fixed_frame_dt and self._fixed_frame_dt > 0:
             fps = float(1.0 / self._fixed_frame_dt)
 
-        # 触球帧球心锚点：优先该帧右足尖（与 lock_absolute_t0 口径一致）
+        # 触球帧：按摆动腿推断支撑踝；无球框时用摆动足尖代理球心，但只计量「体侧横距」
         ball_center = None
         support_lateral_dist_cm = None
+        support_ratio = None
+        support_distance_method = None
         support_ankle_px = None
+        swing_side = "right"
         if pose_frames and 0 <= t_impact < len(pose_frames):
             rec = pose_frames[t_impact]
             world = rec.get("world") if isinstance(rec, dict) else None
-            if isinstance(world, dict) and world.get("right_foot_index") is not None:
-                ball_center = world["right_foot_index"]
-            elif isinstance(rec, dict):
-                ball_center = rec.get("right_foot_index") or rec.get("right_ankle")
-            # 无球框时：世界坐标左踝—球心（右足尖代理）额状面横距 → cm，供 Scorer 上游实测
-            if isinstance(world, dict):
-                la = world.get("left_ankle")
-                ball_w = (
-                    world.get("right_foot_index")
-                    or world.get("right_ankle")
-                    or ball_center
+            try:
+                from biomech_primitives import (
+                    calculate_support_offset_by_shoulder_ratio,
+                    infer_swing_leg_side,
                 )
-                if la is not None and ball_w is not None:
-                    try:
-                        support_lateral_dist_cm = abs(
-                            float(la[0]) - float(ball_w[0])
-                        ) * 100.0
-                    except (TypeError, ValueError, IndexError):
-                        support_lateral_dist_cm = None
+
+                swing_side = infer_swing_leg_side(pose_frames, t_impact)
+            except Exception:  # noqa: BLE001
+                swing_side = "right"
+            support_key = "left_ankle" if swing_side == "right" else "right_ankle"
+            swing_foot_key = (
+                "right_foot_index" if swing_side == "right" else "left_foot_index"
+            )
+            swing_ankle_key = "right_ankle" if swing_side == "right" else "left_ankle"
+
+            if isinstance(world, dict):
+                ball_center = (
+                    world.get(swing_foot_key)
+                    or world.get(swing_ankle_key)
+                    or world.get("right_foot_index")
+                    or world.get("right_ankle")
+                )
+            elif isinstance(rec, dict):
+                ball_center = (
+                    rec.get(swing_foot_key)
+                    or rec.get(swing_ankle_key)
+                    or rec.get("right_foot_index")
+                    or rec.get("right_ankle")
+                )
+            # 【V3.7】禁止 world ΔX×100；无球框时肩宽归一化 + 体侧向横距（不含前后步幅）
+            if isinstance(world, dict):
+                try:
+                    from biomech_primitives import calculate_support_offset_by_shoulder_ratio
+
+                    support_w = world.get(support_key)
+                    ball_w = (
+                        world.get(swing_foot_key)
+                        or world.get(swing_ankle_key)
+                        or ball_center
+                    )
+                    detail = calculate_support_offset_by_shoulder_ratio(
+                        support_w,
+                        ball_w,
+                        world.get("left_shoulder"),
+                        world.get("right_shoulder"),
+                        coord_space="world_m",
+                        distance_mode="lateral",
+                    )
+                    if detail.get("ok"):
+                        support_lateral_dist_cm = float(detail["distance_cm_estimate"])
+                        support_ratio = float(detail["support_ratio"])
+                        support_distance_method = "shoulder_width_ratio"
+                except Exception:  # noqa: BLE001
+                    support_lateral_dist_cm = None
+                    support_ratio = None
+                    support_distance_method = None
             if isinstance(rec, dict):
-                la_px = rec.get("left_ankle")
-                if la_px is not None:
+                support_px = rec.get(support_key)
+                if support_px is not None:
                     try:
-                        support_ankle_px = (float(la_px[0]), float(la_px[1]))
+                        support_ankle_px = (float(support_px[0]), float(support_px[1]))
                     except (TypeError, ValueError, IndexError):
                         support_ankle_px = None
 
@@ -464,14 +717,21 @@ class ShotAnalysisPipeline:
             "hip_torsion_angle": impact_metrics.get("hip_torsion_angle"),
         }
         if support_lateral_dist_cm is not None:
+            # 仅作估计 cm（肩宽归一化）；禁止再标成绝对 world 实测
             impact_frame_data["support_lateral_dist_cm"] = round(
                 float(support_lateral_dist_cm), 2
             )
-            impact_frame_data["world_support_lateral_cm"] = round(
+            impact_frame_data["distance_cm_estimate"] = round(
                 float(support_lateral_dist_cm), 2
             )
+            impact_frame_data["support_distance_method"] = (
+                support_distance_method or "shoulder_width_ratio"
+            )
+        if support_ratio is not None:
+            impact_frame_data["support_ratio"] = round(float(support_ratio), 4)
         if support_ankle_px is not None:
             impact_frame_data["support_ankle_px"] = support_ankle_px
+        impact_frame_data["swing_leg"] = swing_side
         dt = float(self._fixed_frame_dt) if self._fixed_frame_dt else (1.0 / fps)
         trajectory_data = {
             "task_id": self.session_id,
@@ -485,11 +745,31 @@ class ShotAnalysisPipeline:
             "ball_center": ball_center,
             "fps": fps,
             "whipping_velocity": float(max((abs(v) for v in omega), default=0.0)),
+            "swing_leg": swing_side,
         }
         if support_lateral_dist_cm is not None:
             trajectory_data["support_lateral_dist_cm"] = round(
                 float(support_lateral_dist_cm), 2
             )
+            trajectory_data["support_distance_method"] = (
+                support_distance_method or "shoulder_width_ratio"
+            )
+        if support_ratio is not None:
+            trajectory_data["support_ratio"] = round(float(support_ratio), 4)
+
+        # 【V3.11】出球结果：若尚未结算（例如摄像头峰值锁帧）则此处补算
+        if self.ball_speed_kmh is None and self.t_impact is not None:
+            self._finalize_ball_outcome()
+        if self.ball_speed_kmh is not None:
+            impact_frame_data["ball_speed_kmh"] = float(self.ball_speed_kmh)
+            trajectory_data["ball_speed_kmh"] = float(self.ball_speed_kmh)
+        if self.launch_angle_deg is not None:
+            impact_frame_data["launch_angle_deg"] = float(self.launch_angle_deg)
+            trajectory_data["launch_angle_deg"] = float(self.launch_angle_deg)
+        if self.ball_outcome_meta:
+            impact_frame_data["ball_outcome"] = dict(self.ball_outcome_meta)
+            trajectory_data["ball_outcome"] = dict(self.ball_outcome_meta)
+
         return impact_frame_data, trajectory_data
 
     def build_time_series_velocity_window(
@@ -522,6 +802,172 @@ class ShotAnalysisPipeline:
         return window, impact_index_in_window, int(roi_start), absolute_timestamps
 
     # ------------------------------------------------------------------
+    # 动作相位时序切分（以 t_impact 为绝对基准点）
+    # ------------------------------------------------------------------
+    def build_phase_windows(
+        self,
+        t_impact: Optional[int] = None,
+        total_frames: Optional[int] = None,
+    ) -> dict[str, dict]:
+        """按 :data:`PHASE_FRAME_OFFSETS` 切分五个动作相位的帧索引闭区间。
+
+        所有阶段一律以 ``t_impact`` 为绝对基准点做整数帧相对偏移，不再经由
+        毫秒阈值反查时间戳下标，因此同一段视频必然零漂移复现，前端按
+        ``start_frame / end_frame`` 直接 seek 即与实际画面对齐。
+
+        :data:`PHASE_FRAME_OFFSETS` 的帧数以 :data:`PHASE_OFFSET_REFERENCE_FPS`
+        （30fps）标定，代表固定生理时长。实际 fps 不等于 30 时，本方法按
+        ``scale = fps / 30`` 对每个偏移四舍五入重缩放，使各相位覆盖的时长恒定；
+        缩放全程只做整数帧运算，不引入时间戳反查。缩放后还会做两项归一：
+        ``impact`` 恒为 ``(0, 0)``，非零偏移不允许被取整成 0（即不跨越触球帧），
+        且按时间顺序强制 ``start > 上一段 end``，保证五段仍严格互不重叠。
+
+        参数:
+            t_impact: 触球帧绝对索引；``None`` 时取 ``self.t_impact``，
+                仍为空则回退到 |ω| 峰值帧。
+            total_frames: 序列总帧数；``None`` 时取轨迹长度。
+
+        返回:
+            ``{phase_name: {...}}``。每个相位含：
+
+            - ``start_frame`` / ``end_frame``：钳制到 ``[0, total_frames-1]``
+              的闭区间下标，可直接切片消费；
+            - ``start_offset`` / ``end_offset``：相对 ``t_impact`` 实际生效的
+              偏移（已按 fps 重缩放），便于前端标注"触球前 45 帧"等文案；
+            - ``reference_start_offset`` / ``reference_end_offset``：重缩放前的
+              30fps 基准偏移，便于排查缩放结果；
+            - ``clamped``：该区间是否因视频边界被裁剪；
+            - ``truncated``：区间是否已完全落在视频之外（越界空窗）。
+
+            ``_meta`` 额外给出 ``reference_fps`` / ``effective_fps`` /
+            ``offset_scale``，用于核对本次实际使用的缩放系数。
+
+        边界处理：相减后 < 0 或超出总帧数的下标一律钳制进合法范围；若整段
+        区间都在视频之外（例如只录到触球后 3 帧却要 +15 帧的随前），则退化为
+        贴边单帧并标记 ``truncated=True``，绝不返回负下标或倒序区间。
+        """
+        n = int(total_frames) if total_frames is not None else len(self._trajectory_omega)
+        if n <= 0:
+            return {}
+
+        if t_impact is None:
+            t_impact = self.t_impact
+        if t_impact is None:
+            omega = list(self._trajectory_omega)
+            t_impact = (
+                int(max(range(len(omega)), key=lambda i: abs(float(omega[i]))))
+                if omega
+                else 0
+            )
+        t0 = int(max(0, min(n - 1, int(t_impact))))
+
+        # --- fps 重缩放：把 30fps 基准标定的整数偏移换算到本视频的实际帧率 ---
+        # 仍然是纯整数帧运算（不做时间戳反查），因此"零漂移可复现"的约束不变。
+        fps = float(self._video_fps) if self._video_fps and self._video_fps > 1 else 30.0
+        reference_fps = float(PHASE_OFFSET_REFERENCE_FPS) or 30.0
+        scale = fps / reference_fps
+
+        def _scale_offset(value: int) -> int:
+            """按 fps 比例缩放单个偏移，且不允许跨越触球帧（符号必须保持）。"""
+            if value == 0:
+                return 0
+            scaled = int(round(float(value) * scale))
+            return min(-1, scaled) if value < 0 else max(1, scaled)
+
+        # 取整后相邻段可能出现端点重叠或倒序：按原表顺序（时间递增）逐段归一，
+        # 保证每段 start <= end 且严格晚于前一段的 end，维持互不重叠。
+        applied_offsets: list[tuple[str, int, int]] = []
+        prev_end: Optional[int] = None
+        for name, ref_start, ref_end in PHASE_FRAME_OFFSETS:
+            if name == "impact":
+                start_offset = end_offset = 0
+            else:
+                start_offset = _scale_offset(int(ref_start))
+                end_offset = _scale_offset(int(ref_end))
+            if prev_end is not None and start_offset <= prev_end:
+                start_offset = prev_end + 1
+            if end_offset < start_offset:
+                end_offset = start_offset
+            applied_offsets.append((name, start_offset, end_offset))
+            prev_end = end_offset
+
+        last = n - 1
+        windows: dict[str, dict] = {}
+        for (name, start_offset, end_offset), (_, ref_start, ref_end) in zip(
+            applied_offsets, PHASE_FRAME_OFFSETS
+        ):
+            raw_start = t0 + int(start_offset)
+            raw_end = t0 + int(end_offset)
+
+            start = max(0, min(last, raw_start))
+            end = max(0, min(last, raw_end))
+            # 整段越界（如 raw_start/raw_end 同时 < 0 或同时 > last）：贴边单帧
+            truncated = raw_end < 0 or raw_start > last
+            if end < start:
+                start = end
+            windows[name] = {
+                "start_frame": int(start),
+                "end_frame": int(end),
+                "start_offset": int(start_offset),
+                "end_offset": int(end_offset),
+                "reference_start_offset": int(ref_start),
+                "reference_end_offset": int(ref_end),
+                "frame_count": int(end - start + 1),
+                "clamped": bool(raw_start != start or raw_end != end),
+                "truncated": bool(truncated),
+            }
+
+        windows["_meta"] = {
+            "t_impact": int(t0),
+            "total_frames": int(n),
+            "reference": "t_impact",
+            "index_mode": "inclusive_closed_interval",
+            "reference_fps": float(reference_fps),
+            "effective_fps": float(fps),
+            "offset_scale": float(scale),
+        }
+        return windows
+
+    def build_phase_windows_rich(self) -> dict:
+        """调用 error_diagnoser.diagnose_with_temporal_isolation 对本会话轨迹
+        执行 T0 锁定 + 相位隔离诊断，返回包含每相位测量指标和 keyframe_index 的
+        enriched phase_windows 字典。
+
+        若轨迹不足（< 3 帧）或 diagnose 失败，透明降级为空字典，由调用方决定
+        是否 fallback 到 build_phase_windows() 的简化版本。
+
+        返回值字段（每个相位 key 如 "approach_phase"、"support_phase" 等）：
+            start_index / end_index / start_ms_rel / end_ms_rel / frame_count
+            keyframe_index
+            metrics  (仅含 provenance in {"measured","calibrated"} 的指标)
+        """
+        frames = list(self._trajectory_pose_frames)
+        if len(frames) < 3:
+            return {}
+
+        # 将 T0 前最近检出的球心作为辅助信号传给 diagnose
+        t0 = int(self.t_impact) if self.t_impact is not None else 0
+        ball_center = None
+        balls = list(self._trajectory_ball_px)
+        for idx in range(min(t0, len(balls) - 1), -1, -1):
+            if balls[idx] is not None:
+                import numpy as _np
+                ball_center = _np.array(balls[idx], dtype=float)
+                break
+
+        try:
+            result = error_diagnoser.diagnose_with_temporal_isolation(
+                frames, ball_center=ball_center
+            )
+        except Exception:  # noqa: BLE001 — 富相位诊断失败不阻断主流程
+            return {}
+
+        phase_windows = result.get("phase_windows")
+        if not phase_windows:
+            return {}
+        return phase_windows
+
+    # ------------------------------------------------------------------
     # 主分析循环
     # ------------------------------------------------------------------
     def run(self) -> None:
@@ -533,8 +979,12 @@ class ShotAnalysisPipeline:
         """
         cap = None
         landmarker = None
+        yolo_model = None
         is_video_file_mode = self.source == "file"
         video_fps = 30.0
+
+        # 实验防干扰：未锁定基线时强烈警告（跨日摄像头偏移污染 SPSS）
+        get_session_metadata_store().warn_if_unlocked(log_fn=safe_print)
 
         try:
             pt.ensure_model_downloaded()
@@ -573,8 +1023,23 @@ class ShotAnalysisPipeline:
                 frame_delay_seconds = 0.0
 
             # 【V2.5】每次分析任务：销毁旧 PoseLandmarker/YOLO 记忆并重建干净实例
-            task_handles = pt.start_analysis_task(reset_yolo=True)
+            # 【V3.11】尝试加载 YOLO 以采集足球中心序列（出球初速度闭环）
+            task_handles = pt.start_analysis_task(
+                reset_yolo=True, yolo_weights="yolov8n.pt"
+            )
             landmarker = task_handles["pose_landmarker"]
+            yolo_model = task_handles.get("yolo_model")
+            if yolo_model is None:
+                # 权重路径失败时再试一次显式创建；仍失败则球速降级为 missing
+                try:
+                    yolo_model = pt.create_fresh_yolo_model("yolov8n.pt")
+                except Exception:  # noqa: BLE001
+                    yolo_model = None
+            if yolo_model is None:
+                safe_print(
+                    "【shot_analysis_service】提示：YOLO 未就绪，出球初速度将标记为未检出。",
+                    flush=True,
+                )
 
             frame_interval_ms = int(round(1000.0 / float(video_fps)))
             frame_timestamp_ms = 0
@@ -683,6 +1148,9 @@ class ShotAnalysisPipeline:
 
                 if not is_video_file_mode:
                     frame = cv2.flip(frame, 1)
+
+                # 【V3.11】逐帧 YOLO 球心入库（与 sync_frame_count 对齐）
+                self._append_ball_detection(frame, yolo_model)
 
                 # 【新增：黑屏问题自动诊断】统计推送帧数 + 检测"疑似全黑帧"。
                 # 这一步只做统计判断，绝不修改 frame 本身，不影响后续任何画面处理。
@@ -909,9 +1377,12 @@ class ShotAnalysisPipeline:
                     if remaining > 0:
                         time.sleep(remaining)
 
-            # 录像跑完后：抛物线插值锁定全局唯一 t_impact
+            # 录像跑完后：抛物线插值锁定全局唯一 t_impact（内含出球结果结算）
             if is_video_file_mode:
                 self._finalize_impact_with_parabolic_lock()
+            elif self.t_impact is not None and not self.ball_outcome_meta.get("ok"):
+                # 摄像头路径：若已有触球帧则补算出球初速度
+                self._finalize_ball_outcome()
 
         except Exception as exc:  # noqa: BLE001 - 后台线程内的任何异常都不能让服务崩溃
             safe_print(f"【shot_analysis_service】后台推理线程发生异常，本次分析会话将提前结束：{exc}")
@@ -922,6 +1393,10 @@ class ShotAnalysisPipeline:
                 cap.release()
             if landmarker is not None:
                 pt.destroy_pose_landmarker(landmarker)
+            try:
+                pt.destroy_yolo_tracker(yolo_model)
+            except Exception:  # noqa: BLE001
+                pass
             # 【V2.5】必须在推送 stopped 之前标记 COMPLETED，唤醒挂起的 generate_report
             self._on_completed()
             self._push_fn({

@@ -105,6 +105,12 @@ LONG_FORMAT_COLUMNS = [
     "support_foot_distance_provenance",
     "fatigue_drop_flag",
     "primary_error_code",
+    # 实验防干扰：基线环境水印（跨日摄像头偏移清洗用）
+    "baseline_session_id",
+    "class_id",
+    "camera_height_cm",
+    "calibrator_status",
+    "is_baseline_trusted",
 ]
 
 PROVENANCE_MEASURED = "measured"
@@ -281,6 +287,57 @@ def build_long_format_dataframe(
         if primary_error_code not in (0, 1, 2, 3):
             primary_error_code = _derive_primary_error_code(record.get("biomechanicalErrors"))
 
+        # 实验防干扰水印：优先顶层字段，其次 scoreDetail / session_checkpoint
+        detail = record.get("scoreDetail") or record.get("score_detail") or {}
+        if not isinstance(detail, dict):
+            detail = {}
+        checkpoint = (
+            record.get("session_checkpoint")
+            or detail.get("session_checkpoint")
+            or {}
+        )
+        if not isinstance(checkpoint, dict):
+            checkpoint = {}
+
+        baseline_session_id = (
+            record.get("baseline_session_id")
+            or detail.get("baseline_session_id")
+            or checkpoint.get("session_id")
+            or ""
+        )
+        baseline_class_id = (
+            record.get("class_id")
+            or record.get("baseline_class_id")
+            or detail.get("class_id")
+            or checkpoint.get("class_id")
+            or ""
+        )
+        camera_height = (
+            record.get("camera_height_cm")
+            if record.get("camera_height_cm") is not None
+            else detail.get("camera_height_cm")
+        )
+        if camera_height is None:
+            camera_height = checkpoint.get("camera_height_cm")
+        try:
+            camera_height_out = (
+                float(camera_height) if camera_height is not None else None
+            )
+        except (TypeError, ValueError):
+            camera_height_out = None
+        calibrator_status = str(
+            record.get("calibrator_status")
+            or detail.get("calibrator_status")
+            or checkpoint.get("calibrator_status")
+            or "unknown"
+        )
+        if "is_baseline_trusted" in record:
+            is_trusted = bool(record.get("is_baseline_trusted"))
+        elif "is_baseline_trusted" in detail:
+            is_trusted = bool(detail.get("is_baseline_trusted"))
+        else:
+            is_trusted = bool(baseline_session_id)
+
         rows.append(
             {
                 "student_id": student_id,
@@ -294,6 +351,11 @@ def build_long_format_dataframe(
                 "support_foot_distance": round(float(support_foot_distance), 1),
                 "support_foot_distance_provenance": support_prov,
                 "primary_error_code": int(primary_error_code),
+                "baseline_session_id": str(baseline_session_id or ""),
+                "class_id": str(baseline_class_id or ""),
+                "camera_height_cm": camera_height_out,
+                "calibrator_status": calibrator_status,
+                "is_baseline_trusted": int(1 if is_trusted else 0),
                 "_timestamp_sort_key": timestamp,
                 "_group_key": f"{school}__{class_group}__{student_id}",
             }
@@ -422,11 +484,11 @@ ANKLE_STATUS_CODE_MAP: dict[str, int] = {
     "R": 1,
 }
 
-# 与 error_diagnoser 脚踝方差阈值对齐（用于由方差反推状态码 / 归一化刚性）
-ANKLE_VARIANCE_GREEN = 2.0
-ANKLE_VARIANCE_YELLOW_HIGH = 5.0
-# 方差 → [0,1] 刚性分数的软上界（> 此值视为刚性 0）
-ANKLE_VARIANCE_NORM_CEILING = 10.0
+# 与 error_diagnoser 脚踝形变落差阈值对齐（单位 °；兼容旧 variance 变量名）
+ANKLE_VARIANCE_GREEN = 10.0
+ANKLE_VARIANCE_YELLOW_HIGH = 20.0
+# 落差 → [0,1] 刚性分数的软上界（> 此值视为刚性 0）
+ANKLE_VARIANCE_NORM_CEILING = 40.0
 
 # 整群固定效应：Class_1…Class_6，以 Class_6 为参照类 → Class_Dummy_1…Class_Dummy_5
 CLUSTER_LEVELS: tuple[str, ...] = tuple(f"Class_{i}" for i in range(1, 7))

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import {
   CalendarDays,
+  ChevronRight,
   Filter,
   Loader2,
   PencilLine,
@@ -11,6 +12,9 @@ import {
   Users,
   X,
   FileText,
+  ClipboardList,
+  Eye,
+  Wrench,
 } from 'lucide-react'
 import { normalizeRadarScores, FIVE_D_DIMENSIONS } from './BiomechanicalRadar'
 import type {
@@ -33,9 +37,9 @@ interface CoachDataSanitizerGridProps {
   /** 当前筛选结果的五维均值（综合能力画像） */
   onRadarAverageChange?: (average: RadarAverageScores | null) => void
   showToast?: (message: string, success: boolean) => void
-  /** 仅展示该被试的历史尝试（右侧清道夫面板） */
+  /** 仅展示该被试的历史尝试（个体复盘 · 个人详细数据） */
   studentId?: string | null
-  /** 紧凑三列：时间 / 总分 / 删除 */
+  /** 紧凑模式：以查看个人尝试明细为主，删除为附加能力 */
   compact?: boolean
   /** 父级数据世代号：软删除或刷新后递增，强制重新拉取 */
   refreshKey?: number
@@ -53,7 +57,7 @@ const EMPTY_RADAR: RadarAverageScores = {
 }
 
 const CALIBRATE_OPTIONS: Array<{ key: CoachCalibrateMetricKey; label: string; unit: string }> = [
-  { key: 'distance_cm', label: '支撑脚横距', unit: 'cm' },
+  { key: 'distance_cm', label: '支撑脚横距比例', unit: 'ratio' },
   { key: 'max_folding_angle', label: '后摆折叠角', unit: '°' },
   { key: 'ankle_rigidity', label: '踝刚度方差', unit: 'var' },
 ]
@@ -125,12 +129,15 @@ export default function CoachDataSanitizerGrid({
   const [dateTo, setDateTo] = useState('')
   const [studentQuery, setStudentQuery] = useState('')
   const [groupFilter, setGroupFilter] = useState<GroupFilter>('all')
+  /** 紧凑模式：误测删除默认收起，避免干扰查看明细 */
+  const [manageMode, setManageMode] = useState(false)
 
   const scopedStudentId = studentId?.trim() || ''
   const onRadarAverageChangeRef = useRef(onRadarAverageChange)
   onRadarAverageChangeRef.current = onRadarAverageChange
   const showToastRef = useRef(showToast)
   showToastRef.current = showToast
+  const showManageControls = !compact || manageMode
 
   const fetchRecords = useCallback(async () => {
     setLoading(true)
@@ -157,13 +164,15 @@ export default function CoachDataSanitizerGrid({
       setRecords([])
       onRadarAverageChangeRef.current?.(null)
       showToastRef.current?.(
-        `⚠️ 数据清道夫列表加载失败：${error instanceof Error ? error.message : '请检查后端'}`,
+        `⚠️ ${compact ? '个人详细数据' : '数据清道夫'}加载失败：${
+          error instanceof Error ? error.message : '请检查后端'
+        }`,
         false,
       )
     } finally {
       setLoading(false)
     }
-  }, [dateFrom, dateTo, studentQuery, groupFilter, scopedStudentId])
+  }, [dateFrom, dateTo, studentQuery, groupFilter, scopedStudentId, compact])
 
   useEffect(() => {
     void fetchRecords()
@@ -172,6 +181,8 @@ export default function CoachDataSanitizerGrid({
   useEffect(() => {
     setSelectedIds(new Set())
     setDetailTarget(null)
+    setManageMode(false)
+    setConfirmBatch(false)
   }, [scopedStudentId])
 
   const visibleRecords = useMemo(
@@ -332,7 +343,8 @@ export default function CoachDataSanitizerGrid({
     }
   }
 
-  const colSpan = compact ? 4 : 8
+  // compact 查看态：时间 / 总分 / 诊断摘要 / 查看；管理态额外多选与删除
+  const colSpan = compact ? (showManageControls ? 6 : 4) : 8
   const detailRadar = detailTarget
     ? normalizeRadarScores(detailTarget.quantified5dScores ?? detailTarget.radar_scores)
     : null
@@ -340,26 +352,57 @@ export default function CoachDataSanitizerGrid({
   return (
     <section
       className={`flex min-h-0 flex-col rounded-3xl border border-white/10 bg-white/5 p-4 backdrop-blur-xl ${
-        compact ? 'h-full' : ''
+        compact ? 'h-full overflow-hidden' : ''
       } ${className}`.trim()}
     >
       <div className="mb-3 flex flex-shrink-0 flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
         <div>
           <h2 className="flex items-center gap-2 text-sm font-semibold text-white">
-            <span className="inline-flex h-7 w-7 items-center justify-center rounded-xl bg-rose-500/15 ring-1 ring-rose-400/30">
-              <ShieldAlert className="h-3.5 w-3.5 text-rose-300" />
+            <span
+              className={`inline-flex h-7 w-7 items-center justify-center rounded-xl ring-1 ${
+                compact
+                  ? 'bg-sky-500/15 ring-sky-400/30'
+                  : 'bg-rose-500/15 ring-rose-400/30'
+              }`}
+            >
+              {compact ? (
+                <ClipboardList className="h-3.5 w-3.5 text-sky-300" />
+              ) : (
+                <ShieldAlert className="h-3.5 w-3.5 text-rose-300" />
+              )}
             </span>
-            {compact ? '清道夫 · 尝试日志' : '数据清道夫 · 误测记录治理'}
+            {compact ? '个人详细数据' : '数据清道夫 · 误测记录治理'}
           </h2>
           <p className="mt-1 text-[11px] text-white/40">
             {compact
               ? scopedStudentId
-                ? `仅显示被试 ${scopedStudentId} 的历史尝试 · 点击行查看诊断报告`
+                ? `${scopedStudentId} 的历史尝试明细 · 点击行即可查看完整诊断`
                 : '请先在左侧选择被试'
               : '软删除仅标记无效；人工标定写入 provenance=calibrated，可进入科研实测过滤。'}
           </p>
         </div>
-        <span className="text-[11px] text-white/35">有效 {visibleRecords.length} 条</span>
+        <div className="flex items-center gap-2">
+          {compact && scopedStudentId && (
+            <button
+              type="button"
+              onClick={() => {
+                setManageMode((prev) => !prev)
+                setSelectedIds(new Set())
+                setConfirmBatch(false)
+              }}
+              className={`inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-[10px] transition ${
+                manageMode
+                  ? 'border border-rose-400/35 bg-rose-500/15 text-rose-100'
+                  : 'border border-white/10 bg-white/5 text-white/45 hover:bg-white/10 hover:text-white/70'
+              }`}
+              title={manageMode ? '退出误测管理' : '展开误测删除（附加功能）'}
+            >
+              <Wrench className="h-3 w-3" />
+              {manageMode ? '退出管理' : '管理误测'}
+            </button>
+          )}
+          <span className="text-[11px] text-white/35">共 {visibleRecords.length} 条</span>
+        </div>
       </div>
 
       {/* 日期筛选器：紧凑模式与完整模式均展示 */}
@@ -431,7 +474,7 @@ export default function CoachDataSanitizerGrid({
         )}
       </div>
 
-      {scopedStudentId || !compact ? (
+      {showManageControls && (scopedStudentId || !compact) ? (
         <div className="mb-2 flex flex-shrink-0 flex-wrap items-center gap-2">
           <button
             type="button"
@@ -455,40 +498,48 @@ export default function CoachDataSanitizerGrid({
               清空选择
             </button>
           )}
+          {compact && (
+            <span className="text-[10px] text-white/30">删除为附加操作，不影响查看明细</span>
+          )}
         </div>
       ) : null}
 
       {!scopedStudentId && compact ? (
         <div className="flex flex-1 flex-col items-center justify-center gap-2 rounded-2xl border border-dashed border-white/10 bg-black/20 px-4 py-16 text-center">
-          <Users className="h-8 w-8 text-white/20" />
-          <p className="text-xs text-white/35">选择左侧被试后，此处显示其可治理的尝试记录</p>
+          <ClipboardList className="h-8 w-8 text-sky-300/30" />
+          <p className="text-xs text-white/35">选择左侧被试后，此处展示其个人详细尝试数据</p>
         </div>
       ) : (
         <div
-          className={`min-h-0 flex-1 overflow-y-auto overflow-x-hidden rounded-2xl border border-white/8 bg-black/20 scrollbar-thin scrollbar-thumb-slate-700 scrollbar-track-transparent ${
-            compact ? '' : 'max-h-[480px]'
+          className={`min-h-0 flex-1 overflow-y-auto overflow-x-hidden overscroll-contain rounded-2xl border border-white/8 bg-black/20 scrollbar-thin scrollbar-thumb-slate-700 scrollbar-track-transparent ${
+            compact ? 'min-h-[120px]' : 'max-h-[480px]'
           }`}
         >
           <table className="min-w-full border-collapse text-left text-sm">
             <thead className="sticky top-0 z-10 bg-slate-900/95 backdrop-blur-md">
               <tr className="border-b border-white/10 text-[11px] uppercase tracking-wide text-white/40">
-                <th className="w-10 px-2 py-2.5 text-center font-medium">
-                  <input
-                    type="checkbox"
-                    checked={allVisibleSelected}
-                    onChange={toggleSelectAll}
-                    disabled={visibleRecords.length === 0}
-                    className="h-3.5 w-3.5 accent-rose-400"
-                    aria-label="全选"
-                  />
-                </th>
+                {showManageControls && (
+                  <th className="w-10 px-2 py-2.5 text-center font-medium">
+                    <input
+                      type="checkbox"
+                      checked={allVisibleSelected}
+                      onChange={toggleSelectAll}
+                      disabled={visibleRecords.length === 0}
+                      className="h-3.5 w-3.5 accent-rose-400"
+                      aria-label="全选"
+                    />
+                  </th>
+                )}
                 <th className="px-3 py-2.5 font-medium">时间</th>
                 {!compact && <th className="px-3 py-2.5 font-medium">被试编号</th>}
                 {!compact && <th className="px-3 py-2.5 font-medium">组别</th>}
                 <th className="px-3 py-2.5 font-medium">总分</th>
-                {!compact && <th className="px-3 py-2.5 font-medium">诊断快照</th>}
+                <th className="px-3 py-2.5 font-medium">{compact ? '诊断摘要' : '诊断快照'}</th>
                 {!compact && <th className="px-3 py-2.5 text-center font-medium">标定</th>}
-                <th className="px-3 py-2.5 text-center font-medium">删除</th>
+                {compact && <th className="px-3 py-2.5 text-center font-medium">详情</th>}
+                {showManageControls && (
+                  <th className="px-3 py-2.5 text-center font-medium">删除</th>
+                )}
               </tr>
             </thead>
             <tbody>
@@ -497,7 +548,7 @@ export default function CoachDataSanitizerGrid({
                   <td colSpan={colSpan} className="px-4 py-12 text-center text-white/40">
                     <span className="inline-flex items-center gap-2">
                       <Loader2 className="h-4 w-4 animate-spin text-emerald-400" />
-                      正在加载归档记录…
+                      正在加载个人尝试数据…
                     </span>
                   </td>
                 </tr>
@@ -506,7 +557,7 @@ export default function CoachDataSanitizerGrid({
                   <td colSpan={colSpan} className="px-4 py-12 text-center text-white/35">
                     <span className="inline-flex flex-col items-center gap-2">
                       <Users className="h-5 w-5 text-white/25" />
-                      当前没有可治理的记录
+                      {compact ? '当前没有可查看的尝试记录' : '当前没有可治理的记录'}
                     </span>
                   </td>
                 </tr>
@@ -514,6 +565,8 @@ export default function CoachDataSanitizerGrid({
                 <AnimatePresence initial={false}>
                   {records.map((record) => {
                     const isFading = fadingIds.has(record.id)
+                    const snapshot =
+                      record.diagnosisSnapshot || record.aiFeedback || '（无诊断批注）'
                     return (
                       <motion.tr
                         key={record.id}
@@ -525,22 +578,26 @@ export default function CoachDataSanitizerGrid({
                         onClick={() => {
                           if (!isFading) setDetailTarget(record)
                         }}
-                        className={`cursor-pointer border-b border-white/5 text-white/80 last:border-0 hover:bg-white/[0.03] ${
+                        className={`cursor-pointer border-b border-white/5 text-white/80 last:border-0 hover:bg-sky-500/[0.06] ${
                           isFading ? 'pointer-events-none bg-rose-500/10' : ''
-                        } ${selectedIds.has(record.id) ? 'bg-rose-500/[0.06]' : ''}`}
+                        } ${selectedIds.has(record.id) ? 'bg-rose-500/[0.06]' : ''} ${
+                          detailTarget?.id === record.id ? 'bg-sky-500/10 ring-1 ring-inset ring-sky-400/25' : ''
+                        }`}
                       >
-                        <td
-                          className="px-2 py-2.5 text-center align-middle"
-                          onClick={(e) => e.stopPropagation()}
-                        >
-                          <input
-                            type="checkbox"
-                            checked={selectedIds.has(record.id)}
-                            onChange={(e) => toggleSelectOne(record.id, e.target.checked)}
-                            className="h-3.5 w-3.5 accent-rose-400"
-                            aria-label={`选择 ${record.id}`}
-                          />
-                        </td>
+                        {showManageControls && (
+                          <td
+                            className="px-2 py-2.5 text-center align-middle"
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={selectedIds.has(record.id)}
+                              onChange={(e) => toggleSelectOne(record.id, e.target.checked)}
+                              className="h-3.5 w-3.5 accent-rose-400"
+                              aria-label={`选择 ${record.id}`}
+                            />
+                          </td>
+                        )}
                         <td className="whitespace-nowrap px-3 py-2.5 align-middle text-xs text-white/55">
                           {record.timestamp || record.testDate || '—'}
                         </td>
@@ -563,18 +620,14 @@ export default function CoachDataSanitizerGrid({
                             <span className="text-white/30">—</span>
                           )}
                         </td>
-                        {!compact && (
-                          <td className="max-w-[280px] px-3 py-2.5 align-middle text-xs leading-relaxed text-white/50">
-                            <span className="line-clamp-2">
-                              {record.diagnosisSnapshot || record.aiFeedback || '（无诊断批注）'}
+                        <td className="max-w-[220px] px-3 py-2.5 align-middle text-xs leading-relaxed text-white/50">
+                          <span className="line-clamp-2">{snapshot}</span>
+                          {record.supportFootDistanceProvenance === 'calibrated' && (
+                            <span className="mt-1 inline-block text-[10px] text-sky-300/80">
+                              横距已标定
                             </span>
-                            {record.supportFootDistanceProvenance === 'calibrated' && (
-                              <span className="mt-1 inline-block text-[10px] text-sky-300/80">
-                                横距已标定
-                              </span>
-                            )}
-                          </td>
-                        )}
+                          )}
+                        </td>
                         {!compact && (
                           <td
                             className="px-3 py-2.5 text-center align-middle"
@@ -590,24 +643,35 @@ export default function CoachDataSanitizerGrid({
                             </button>
                           </td>
                         )}
-                        <td
-                          className="px-3 py-2.5 text-center align-middle"
-                          onClick={(e) => e.stopPropagation()}
-                        >
-                          <button
-                            type="button"
-                            title="标记为无效误测"
-                            disabled={deletingId === record.id}
-                            onClick={() => setConfirmTarget(record)}
-                            className="inline-flex h-8 w-8 items-center justify-center rounded-xl bg-rose-500/10 text-rose-400 ring-1 ring-rose-400/25 transition hover:bg-rose-500/25 hover:text-rose-200 active:scale-95 disabled:cursor-not-allowed disabled:opacity-50"
+                        {compact && (
+                          <td className="px-3 py-2.5 text-center align-middle">
+                            <span className="inline-flex items-center gap-0.5 rounded-full bg-sky-500/15 px-2 py-1 text-[10px] font-medium text-sky-200 ring-1 ring-sky-400/25">
+                              <Eye className="h-3 w-3" />
+                              查看
+                              <ChevronRight className="h-3 w-3 opacity-70" />
+                            </span>
+                          </td>
+                        )}
+                        {showManageControls && (
+                          <td
+                            className="px-3 py-2.5 text-center align-middle"
+                            onClick={(e) => e.stopPropagation()}
                           >
-                            {deletingId === record.id ? (
-                              <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                            ) : (
-                              <Trash2 className="h-3.5 w-3.5" />
-                            )}
-                          </button>
-                        </td>
+                            <button
+                              type="button"
+                              title="标记为无效误测"
+                              disabled={deletingId === record.id}
+                              onClick={() => setConfirmTarget(record)}
+                              className="inline-flex h-8 w-8 items-center justify-center rounded-xl bg-rose-500/10 text-rose-400/80 ring-1 ring-rose-400/25 transition hover:bg-rose-500/25 hover:text-rose-200 active:scale-95 disabled:cursor-not-allowed disabled:opacity-50"
+                            >
+                              {deletingId === record.id ? (
+                                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                              ) : (
+                                <Trash2 className="h-3.5 w-3.5" />
+                              )}
+                            </button>
+                          </td>
+                        )}
                       </motion.tr>
                     )
                   })}
@@ -641,8 +705,8 @@ export default function CoachDataSanitizerGrid({
               <div className="flex items-start justify-between gap-3 border-b border-white/10 px-5 py-4">
                 <div>
                   <h3 className="flex items-center gap-2 text-base font-semibold text-white">
-                    <FileText className="h-4 w-4 text-emerald-300" />
-                    尝试诊断报告
+                    <FileText className="h-4 w-4 text-sky-300" />
+                    {compact ? '个人尝试详情' : '尝试诊断报告'}
                   </h3>
                   <p className="mt-1 text-xs text-white/40">
                     {detailTarget.studentId || '—'} · {detailTarget.timestamp || detailTarget.testDate || '未知时间'}
@@ -713,11 +777,16 @@ export default function CoachDataSanitizerGrid({
                     </p>
                   </div>
                   <div className="rounded-xl bg-black/30 px-3 py-2">
-                    <p className="text-white/35">支撑脚横距</p>
+                    <p className="text-white/35">支撑脚横距比例</p>
                     <p className="mt-0.5 font-semibold text-white/80">
-                      {typeof detailTarget.supportFootDistance === 'number'
-                        ? `${detailTarget.supportFootDistance} cm`
-                        : '—'}
+                      {typeof detailTarget.support_ratio === 'number'
+                        ? `支撑脚横距比例 ${detailTarget.support_ratio.toFixed(2)}`
+                        : typeof detailTarget.supportRatio === 'number'
+                          ? `支撑脚横距比例 ${detailTarget.supportRatio.toFixed(2)}`
+                          : typeof detailTarget.supportFootDistance === 'number' &&
+                              detailTarget.supportFootDistance <= 3.5
+                            ? `支撑脚横距比例 ${detailTarget.supportFootDistance.toFixed(2)}`
+                            : '—'}
                     </p>
                   </div>
                 </div>

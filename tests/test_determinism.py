@@ -181,7 +181,7 @@ def test_deterministic_scorer_bit_identical_across_1000_runs():
 
     # LLM 零参与标记
     assert first_detail["llm_participated"] is False
-    assert first_detail["scoring_engine"] == "DeterministicScorer_V3.1"
+    assert first_detail["scoring_engine"] == "DeterministicScorer_V3.5"
 
     # V3.1 五维雷达：键齐全、范围合法
     radar = first_detail["radar_scores"]
@@ -197,33 +197,33 @@ def test_deterministic_scorer_bit_identical_across_1000_runs():
     assert 16.0 <= float(radar["approach_rhythm"]) <= 20.0
 
 
-def test_ankle_rigidity_red_deducts_full_15():
-    """脚踝方差 > 5.0 必须 RED 且直接扣满分 15。"""
+def test_ankle_rigidity_red_deducts_full_cap():
+    """脚踝形变落差 > 20° 必须 RED 且直接扣单项上限（V3.5：8 分）。"""
     impact = {
         "t_impact": 1,
-        "ankle_angles_window": [120.0, 140.0, 160.0],  # 方差远大于 5
+        "ankle_angles_window": [120.0, 140.0, 160.0],  # deflection = 40° > 20
         "distance_cm": 17.5,
         "toe_angle": 5.0,
         "impact_knee_angle": 150.0,
         "support_knee_angle": 155.0,
         "hip_torsion_angle": 25.0,
     }
-    trajectory = {"max_folding_angle": 80.0, "whipping_velocity": 500.0}
+    trajectory = {"max_folding_angle": 70.0, "whipping_velocity": 500.0}
     score, detail = calculate_biomechanical_score(impact, trajectory)
     ankle = detail["indicators"]["ankle_rigidity"]
     assert ankle["status"] == "RED_DEVIATED"
-    assert ankle["penalty"] == 15.0
-    assert abs(score - 85.0) == 0.0  # 仅脚踝扣 15，其余 GREEN
-    # 雷达锁踝档位：方差 > 5 → 5.0 分
+    assert ankle["penalty"] == 8.0
+    assert abs(score - 92.0) == 0.0  # 仅脚踝扣 8，其余 GREEN
+    # 雷达锁踝档位：deflection > 20 → 5.0 分
     assert detail["radar_scores"]["ankle_rigidity"] == 5.0
 
 
 def test_radar_scores_whipping_and_ankle_buckets():
     """鞭打线性映射 + 脚踝三档分桶金标准。"""
-    # 鞭打 225 → 10.0；脚踝方差落在 [2,5] → 15
+    # 鞭打 225 → 10.0；形变落差落在 [10, 20] → 15
     impact = {
         "t_impact": 1,
-        "ankle_angles_window": [100.0, 102.0, 104.5],  # var ≈ 3.39
+        "ankle_angles_window": [130.0, 140.0, 145.0],  # deflection ≈ 15°
         "distance_cm": 17.5,
         "toe_angle": 5.0,
         "impact_knee_angle": 150.0,
