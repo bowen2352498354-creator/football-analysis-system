@@ -18,7 +18,10 @@ from error_diagnoser import (
     calculate_ankle_stiffness_variance,
     calculate_support_foot_offset_cm,
 )
-from biomech_primitives import calculate_support_foot_offset_detailed
+from biomech_primitives import (
+    SUPPORT_FOOT_OFFSET_MAX_CM,
+    calculate_support_foot_offset_detailed,
+)
 from pose_tracker import (
     calculate_3d_joint_angle as pt_calculate_3d_joint_angle,
     calculate_ankle_stiffness_variance as pt_calculate_ankle_stiffness_variance,
@@ -119,9 +122,12 @@ def test_support_foot_offset_rejects_tiny_bbox_uses_fallback_and_clamp():
     detail = calculate_support_foot_offset_detailed(ankle, tiny, body_h_px=290.0)
     assert detail["ok"] is False
     assert detail["method"] == "fallback_body_pcr"
-    # 钳制：超大像素距 × 经验 PCR 不得 > 60
-    far_ankle = (102.5 + 400.0, 102.5)  # 400*0.25=100 → clamp 60
-    assert calculate_support_foot_offset_cm(far_ankle, tiny) == 60.0
+    # 钳制：超大像素距 × 经验 PCR 不得超过唯一物理上限。
+    far_ankle = (102.5 + 400.0, 102.5)  # 400*0.25=100 → clamp
+    assert (
+        calculate_support_foot_offset_cm(far_ankle, tiny)
+        == SUPPORT_FOOT_OFFSET_MAX_CM
+    )
 
 
 def test_sagittal_knee_angle_stable_near_extension():
@@ -132,7 +138,7 @@ def test_sagittal_knee_angle_stable_near_extension():
     # 矢状面近乎伸直，但左右（X）同向偏移——3D arccos 会压到 ~118°
     hip = (0.3, 0.5, -0.05)
     ankle = (0.3, -0.5, 0.05)
-    sag = calculate_3d_joint_angle(hip, knee, ankle, is_knee_extension=True)
+    sag = calculate_sagittal_angle(hip, knee, ankle)
     raw_3d = calculate_3d_joint_angle(hip, knee, ankle, is_knee_extension=False)
     assert sag > 170.0
     assert raw_3d < 130.0
@@ -143,8 +149,8 @@ def test_sagittal_knee_angle_stable_near_extension():
     assert abs(sag - clean) < 5.0
 
     # 矢状面真实屈曲（Y-Z 上约 90°）保持锐角，不再做 180-angle 误补
-    flexed = calculate_3d_joint_angle(
-        (0.0, 1.0, 0.0), knee, (0.0, 0.0, 1.0), is_knee_extension=True
+    flexed = calculate_sagittal_angle(
+        (0.0, 1.0, 0.0), knee, (0.0, 0.0, 1.0)
     )
     assert abs(flexed - 90.0) < 1.0
 

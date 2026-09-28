@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import type { KeyboardEvent, MouseEvent as ReactMouseEvent } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
-import { Download, Wifi, Activity, Settings2, ChevronDown, School as SchoolIcon, Plus, Check, HardDrive, X } from 'lucide-react'
+import { Download, Wifi, Activity, Settings2, ChevronDown, School as SchoolIcon, Plus, Check, HardDrive, X, Target } from 'lucide-react'
 import type { ApiStatus, GlobalSettings, ViewMode } from '../types'
 import {
   getClassGroupDisplayName,
@@ -22,8 +22,11 @@ interface NavTab {
 const NAV_TABS: NavTab[] = [
   { id: 'realtime', label: '实时反馈系统 (实验A组)' },
   { id: 'zen', label: '延时反馈系统 (实验B组)' },
+  { id: 'control', label: '无反馈采集 (常规C组)' },
   { id: 'coach', label: '教练端数据看板' },
 ]
+
+const STUDY_TIMEPOINTS = ['T0', 'T1', 'T2', 'T3', 'T4'] as const
 
 interface NavbarProps {
   activeView: ViewMode
@@ -77,7 +80,7 @@ export default function Navbar({
     return () => document.removeEventListener('mousedown', handleClickOutside)
   }, [isSettingsOpen])
 
-  const summaryText = `${getSchoolDisplayName(globalSettings)} · ${getClassGroupDisplayName(globalSettings)}`
+  const summaryText = `${getSchoolDisplayName(globalSettings)} · ${getClassGroupDisplayName(globalSettings)} · ${globalSettings.studyTimepoint}`
 
   /**
    * 删除学校/机构（预设与自定义均可）：拦截冒泡防止误选中，同步 localStorage，
@@ -211,7 +214,7 @@ export default function Navbar({
                     label="班级 / 组别"
                     options={classList}
                     value={globalSettings.classGroupName}
-                    placeholder="请输入班级 / 分组名称，如「五年三班-实验A组」"
+                    placeholder="请输入班级名称，如「五年级一班」"
                     addButtonLabel="+ 新增自定义分组/班级"
                     onSelectValue={(val) => onChangeGlobalSettings({ ...globalSettings, classGroupName: val })}
                     onAddCustomValue={(val) => {
@@ -219,6 +222,51 @@ export default function Navbar({
                     }}
                     onDeleteOption={handleDeleteClass}
                   />
+
+                  <div className="mt-4 border-t border-white/10 pt-4">
+                    <div className="mb-2 flex items-center justify-between">
+                      <span className="text-xs font-medium text-white/65">实验测量时点</span>
+                      <span className="text-[10px] text-white/35">每次采集写入台账</span>
+                    </div>
+                    <div className="grid grid-cols-5 gap-1 rounded-lg bg-white/5 p-1" role="group" aria-label="实验测量时点">
+                      {STUDY_TIMEPOINTS.map((timepoint) => (
+                        <button
+                          key={timepoint}
+                          type="button"
+                          onClick={() => onChangeGlobalSettings({ ...globalSettings, studyTimepoint: timepoint })}
+                          className={`h-8 rounded-md text-xs font-semibold transition ${
+                            globalSettings.studyTimepoint === timepoint
+                              ? 'bg-emerald-500/20 text-emerald-300 ring-1 ring-emerald-400/40'
+                              : 'text-white/45 hover:bg-white/5 hover:text-white/75'
+                          }`}
+                        >
+                          {timepoint}
+                        </button>
+                      ))}
+                    </div>
+                    <label className="mt-3 flex items-center justify-between gap-3 rounded-lg bg-white/5 px-3 py-2">
+                      <span className="flex items-center gap-2 text-xs text-white/55">
+                        <Target className="h-3.5 w-3.5 text-sky-300" />
+                        计划有效次数
+                      </span>
+                      <input
+                        type="number"
+                        min={1}
+                        max={999}
+                        value={globalSettings.plannedAttempts}
+                        onChange={(event) => {
+                          const value = Number(event.target.value)
+                          if (Number.isFinite(value) && value >= 1) {
+                            onChangeGlobalSettings({
+                              ...globalSettings,
+                              plannedAttempts: Math.min(999, Math.round(value)),
+                            })
+                          }
+                        }}
+                        className="h-7 w-16 rounded-md border border-white/10 bg-black/25 px-2 text-right text-xs tabular-nums text-white outline-none focus:border-emerald-400/50"
+                      />
+                    </label>
+                  </div>
 
                   {/* 【核心新增】全局归档总闸：极其显眼的 Apple 风格切换开关，
                       控制本次训练数据是否自动本地落盘归档 + 同步至教练看板 */}
@@ -276,7 +324,7 @@ export default function Navbar({
                         </button>
                       </div>
                       <p className="border-t border-white/10 px-4 py-2.5 text-[11px] leading-relaxed text-white/50">
-                        开启后，实时与延时组的所有测试结果将自动生成 Word 并同步至教练看板。
+                        开启后，A/B/C 三组质量达标的测试结果将自动归档并同步至教练看板。
                       </p>
                     </div>
                   </div>

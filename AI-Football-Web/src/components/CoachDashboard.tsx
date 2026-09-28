@@ -13,6 +13,7 @@ import {
   CheckCircle2,
   XCircle,
   FileSpreadsheet,
+  Printer,
   CalendarDays,
   TrendingUp,
   Crosshair,
@@ -51,6 +52,8 @@ import CoachDataSanitizerGrid from './CoachDataSanitizerGrid'
 import CohortComparePanel from './CohortComparePanel'
 import ClassProfilingPanel from './ClassProfilingPanel'
 import InterventionDosageMonitor from './InterventionDosageMonitor'
+import IndividualSummaryReportDrawer from './IndividualSummaryReportDrawer'
+import GoldStandardValidationPanel from './GoldStandardValidationPanel'
 import type {
   AcademicExportResult,
   GlobalTrainingRecord,
@@ -61,13 +64,14 @@ import type {
   RadarAverageScores,
 } from '../types'
 
-type CoachAnalysisTab = 'classProfile' | 'individual' | 'cohortCompare' | 'dosage'
+type CoachAnalysisTab = 'classProfile' | 'individual' | 'cohortCompare' | 'dosage' | 'goldStandard'
 
 const COACH_ANALYSIS_TABS: Array<{ id: CoachAnalysisTab; label: string }> = [
   { id: 'classProfile', label: '班级群体画像' },
   { id: 'individual', label: '个体复盘' },
   { id: 'cohortCompare', label: '班级对比' },
   { id: 'dosage', label: '实验干预剂量' },
+  { id: 'goldStandard', label: '金标准验证' },
 ]
 
 const TAB_ICONS: Record<CoachAnalysisTab, typeof Activity> = {
@@ -75,9 +79,10 @@ const TAB_ICONS: Record<CoachAnalysisTab, typeof Activity> = {
   individual: UserRound,
   cohortCompare: GitCompareArrows,
   dosage: Activity,
+  goldStandard: FlaskConical,
 }
 
-const API_BASE_URL = 'http://localhost:8000'
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
 const SCHOOL_FALLBACK = '未设置学校'
 const CLASS_FALLBACK = '未设置班级'
 const DOSE_WARNING_THRESHOLD = 10
@@ -97,7 +102,7 @@ let dashboardToastSeq = 0
 
 type LoadState = 'loading' | 'ready'
 
-type ExperimentGroupId = 'GROUP_A' | 'GROUP_B' | 'OTHER'
+type ExperimentGroupId = 'GROUP_A' | 'GROUP_B' | 'GROUP_C' | 'OTHER'
 
 /** CTMS 级全局实验过滤器（学校 / 班级 / 组别 / 日期区间） */
 interface GlobalFilter {
@@ -153,17 +158,20 @@ const GROUP_META: Record<
 > = {
   GROUP_A: { label: 'A组 · 实时反馈', badge: 'A', shortLabel: 'A组' },
   GROUP_B: { label: 'B组 · 延时反馈', badge: 'B', shortLabel: 'B组' },
+  GROUP_C: { label: 'C组 · 无反馈采集', badge: 'C', shortLabel: 'C组' },
   OTHER: { label: '未归组', badge: '?', shortLabel: '未归组' },
 }
 
-const GROUP_ORDER: ExperimentGroupId[] = ['GROUP_A', 'GROUP_B', 'OTHER']
+const GROUP_ORDER: ExperimentGroupId[] = ['GROUP_A', 'GROUP_B', 'GROUP_C', 'OTHER']
 
 function resolveGroup(record: GlobalTrainingRecord): ExperimentGroupId {
   if (record.type === 'realtime' || record.groupTypeCode === 1) return 'GROUP_A'
   if (record.type === 'delayed' || record.groupTypeCode === 2) return 'GROUP_B'
+  if (record.type === 'control' || record.groupTypeCode === 3) return 'GROUP_C'
   const label = (record.classGroup || '').toUpperCase()
   if (label.includes('A') || label.includes('实时')) return 'GROUP_A'
   if (label.includes('B') || label.includes('延时')) return 'GROUP_B'
+  if (label.includes('C') || label.includes('无反馈') || label.includes('常规')) return 'GROUP_C'
   return 'OTHER'
 }
 
@@ -185,7 +193,7 @@ function normalizeClassGroup(value: string | undefined | null): string {
  * 教练端科研指挥中心（互斥 Tab 路由布局）
  *
  * 固定头部：KPI + 全局控制台 + Tab 栏
- * 动态区按 activeTab 互斥渲染：班级群体画像 | 个体复盘 | 班级对比 | 实验干预剂量
+ * 动态区按 activeTab 互斥渲染：班级群体画像 | 个体复盘 | 班级对比 | 实验干预剂量 | 金标准验证
  * 整页锁在一屏高度内，仅动态区内部滚动。
  */
 export default function CoachDashboard() {
@@ -200,6 +208,8 @@ export default function CoachDashboard() {
   const [filterOptionsEpoch, setFilterOptionsEpoch] = useState(0)
 
   const [isExportingMatrix, setIsExportingMatrix] = useState(false)
+  const [isGeneratingClassWord, setIsGeneratingClassWord] = useState(false)
+  const [studentsPerPrintPage, setStudentsPerPrintPage] = useState<2 | 3>(2)
   const [selectedStudent, setSelectedStudent] = useState<StudentAggregate | null>(null)
   const [selectedAttemptIndex, setSelectedAttemptIndex] = useState(0)
   /** 软删除后递增：驱动中栏曲线 / 雷达 / 右栏列表 re-fetch */
@@ -396,6 +406,65 @@ export default function CoachDashboard() {
     }
   }
 
+  async function handleGenerateClassWord() {
+    if (isGeneratingClassWord) return
+    if (globalFilter.school === 'all' || globalFilter.class === 'all') {
+      showToast('⚠️ 请先在全局控制台选择具体学校和班级', false)
+      return
+    }
+
+    setIsGeneratingClassWord(true)
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/coach/class-print-report`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          school: globalFilter.school,
+          classGroup: globalFilter.class,
+          group: globalFilter.group === 'all' ? null : globalFilter.group,
+          dateFrom: globalFilter.dateRange[0],
+          dateTo: globalFilter.dateRange[1],
+          studentsPerPage: studentsPerPrintPage,
+        }),
+      })
+      if (!response.ok) {
+        let message = `接口返回状态码 ${response.status}`
+        try {
+          const data = (await response.json()) as { detail?: string; message?: string }
+          message = data.detail || data.message || message
+        } catch {
+          // Keep the status-code fallback for non-JSON server errors.
+        }
+        throw new Error(message)
+      }
+
+      const blob = await response.blob()
+      const objectUrl = URL.createObjectURL(blob)
+      const anchor = document.createElement('a')
+      anchor.href = objectUrl
+      anchor.download = `${globalFilter.class}_个人总体分析_${studentsPerPrintPage}人每页.docx`
+      document.body.appendChild(anchor)
+      anchor.click()
+      anchor.remove()
+      URL.revokeObjectURL(objectUrl)
+
+      const studentCount = response.headers.get('X-Report-Student-Count')
+      const skippedCount = response.headers.get('X-Skipped-Student-Count')
+      const skippedSuffix = skippedCount && Number(skippedCount) > 0 ? `，跳过 ${skippedCount} 名无A级有效数据学生` : ''
+      showToast(
+        `✅ 班级 Word 已生成${studentCount ? `（${studentCount} 名）` : ''}，A4 每页 ${studentsPerPrintPage} 人${skippedSuffix}`,
+        true,
+      )
+    } catch (error) {
+      showToast(
+        `⚠️ 生成班级 Word 失败：${error instanceof Error ? error.message : '请检查后端服务是否已启动'}`,
+        false,
+      )
+    } finally {
+      setIsGeneratingClassWord(false)
+    }
+  }
+
   /** KPI 与花名册同源：仅反映全局过滤器穿透后的数据集 */
   const kpi = useMemo(() => {
     const uniqueStudents = new Set(
@@ -411,6 +480,11 @@ export default function CoachDashboard() {
         .filter((r) => resolveGroup(r) === 'GROUP_B')
         .map((r) => `${normalizeSchool(r.school)}__${normalizeClassGroup(r.classGroup)}__${r.studentId}`),
     )
+    const controlStudents = new Set(
+      filteredDataset
+        .filter((r) => resolveGroup(r) === 'GROUP_C')
+        .map((r) => `${normalizeSchool(r.school)}__${normalizeClassGroup(r.classGroup)}__${r.studentId}`),
+    )
     const validScores = filteredDataset.filter((r) => typeof r.score === 'number') as (GlobalTrainingRecord & {
       score: number
     })[]
@@ -423,6 +497,7 @@ export default function CoachDashboard() {
       totalStudents: uniqueStudents.size,
       realtimeStudents: realtimeStudents.size,
       delayedStudents: delayedStudents.size,
+      controlStudents: controlStudents.size,
       avgScore,
     }
   }, [filteredDataset])
@@ -596,6 +671,7 @@ export default function CoachDashboard() {
           <MiniKpi icon={Users} label="总人数" value={kpi.totalStudents} accent="emerald" />
           <MiniKpi icon={Radio} label="A 组" value={kpi.realtimeStudents} accent="sky" />
           <MiniKpi icon={Clock3} label="B 组" value={kpi.delayedStudents} accent="teal" />
+          <MiniKpi icon={ClipboardList} label="C 组" value={kpi.controlStudents} accent="amber" />
           <MiniKpi
             icon={Gauge}
             label="均分"
@@ -604,6 +680,41 @@ export default function CoachDashboard() {
           />
 
           <div className="ml-auto flex flex-wrap items-center gap-2">
+            <label
+              className="inline-flex items-center gap-1 rounded-full border border-emerald-400/25 bg-emerald-500/8 px-2 py-1 text-[10px] text-emerald-100"
+              title="选择每张 A4 纸排版 2 名或 3 名学生，生成后可直接打印并沿卡片边框裁剪"
+            >
+              <span className="whitespace-nowrap text-emerald-200/75">A4</span>
+              <select
+                value={studentsPerPrintPage}
+                onChange={(event) => setStudentsPerPrintPage(Number(event.target.value) === 3 ? 3 : 2)}
+                disabled={isGeneratingClassWord}
+                className="bg-transparent font-semibold text-white outline-none [color-scheme:dark] [&>option]:bg-zinc-900"
+                aria-label="每页打印学生人数"
+              >
+                <option value={2}>2 人/页</option>
+                <option value={3}>3 人/页</option>
+              </select>
+            </label>
+            <button
+              type="button"
+              onClick={() => void handleGenerateClassWord()}
+              disabled={
+                isGeneratingClassWord ||
+                globalFilter.school === 'all' ||
+                globalFilter.class === 'all' ||
+                filteredDataset.length === 0
+              }
+              title={
+                globalFilter.school === 'all' || globalFilter.class === 'all'
+                  ? '请先选择具体学校和班级'
+                  : '按当前学校、班级、组别和日期筛选生成可裁剪 Word'
+              }
+              className="inline-flex items-center gap-1.5 rounded-full border border-emerald-400/45 bg-emerald-500/12 px-3 py-1.5 text-[11px] font-semibold text-emerald-50 transition hover:bg-emerald-500/25 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              {isGeneratingClassWord ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Printer className="h-3.5 w-3.5" />}
+              {isGeneratingClassWord ? '生成班级 Word…' : '班级一键打印'}
+            </button>
             <button
               type="button"
               onClick={() => void handleExportAcademicMatrix()}
@@ -795,6 +906,8 @@ export default function CoachDashboard() {
             <Loader2 className="h-7 w-7 animate-spin text-emerald-400" />
             <p className="text-sm">正在加载全量历史归档数据……</p>
           </div>
+        ) : activeTab === 'goldStandard' ? (
+          <GoldStandardValidationPanel />
         ) : activeRecords.length === 0 ? (
           <div className="flex flex-1 items-center justify-center">
             <EmptyStateCard />
@@ -815,6 +928,12 @@ export default function CoachDashboard() {
           <CohortComparePanel
             cohortOptions={cohortOptions}
             filteredDataset={filteredDataset}
+            filterScope={{
+              school: globalFilter.school,
+              experimentalGroup: globalFilter.group,
+              dateFrom: globalFilter.dateRange[0],
+              dateTo: globalFilter.dateRange[1],
+            }}
           />
         ) : activeTab === 'dosage' ? (
           /* 实验干预剂量：全屏热力图 */
@@ -1345,6 +1464,8 @@ function LeftSidebar({
                                       ? 'bg-sky-500/20 text-sky-300'
                                       : groupNode.group === 'GROUP_B'
                                         ? 'bg-teal-500/20 text-teal-300'
+                                        : groupNode.group === 'GROUP_C'
+                                          ? 'bg-amber-500/20 text-amber-200'
                                         : 'bg-white/10 text-white/50'
                                   }`}
                                 >
@@ -1546,26 +1667,53 @@ function MainCanvas({
 
 type LlmSummaryStatus = 'idle' | 'loading' | 'ready' | 'error'
 
-/** 从被试归档记录汇总评分序列与错误次数，供 /api/generate_individual_summary 消费 */
+/** 组装不含图像的逐次证据；后端再次执行A级科研门控和确定性纵向聚合。 */
 function buildIndividualSummaryPayload(records: GlobalTrainingRecord[]): {
   scoreHistory: number[]
   errorCounter: Record<string, number>
+  attempts: Array<Record<string, unknown>>
 } {
   const chronological = records
     .slice()
     .sort((a, b) => (a.timestamp < b.timestamp ? -1 : a.timestamp > b.timestamp ? 1 : 0))
-  const scoreHistory = chronological
+  const formal = chronological.filter(
+    (record) => record.qualityGrade === 'A' && record.researchEligible === true,
+  )
+  const scoreHistory = formal
     .map((r) => r.score)
     .filter((s): s is number => typeof s === 'number' && Number.isFinite(s))
   const errorCounter: Record<string, number> = {}
-  for (const record of chronological) {
+  for (const record of formal) {
     for (const err of record.biomechanicalErrors ?? []) {
       const label = String(err).trim()
       if (!label) continue
       errorCounter[label] = (errorCounter[label] || 0) + 1
     }
   }
-  return { scoreHistory, errorCounter }
+
+  const attempts = chronological.map((record) => ({
+    id: record.id,
+    timestamp: record.timestamp,
+    testDate: record.testDate,
+    timepoint: record.timepoint,
+    experimentalGroup: record.experimentalGroup ?? record.experimental_group,
+    type: record.type,
+    score: record.score,
+    qualityGrade: record.qualityGrade,
+    researchEligible: record.researchEligible,
+    scoreDetail: record.scoreDetail ?? null,
+    quantified5dScores: record.quantified5dScores ?? record.scoreDetail?.radar_scores ?? null,
+    biomechanicalErrors: record.biomechanicalErrors ?? [],
+    protocolVersion: record.protocolVersion,
+  }))
+  return { scoreHistory, errorCounter, attempts }
+}
+
+function formatLocalIsoDate(date: Date): string {
+  const year = date.getFullYear()
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+  return `${year}-${month}-${day}`
 }
 
 /**
@@ -1582,13 +1730,64 @@ function IndividualLlmSummaryCard({
   const [status, setStatus] = useState<LlmSummaryStatus>('idle')
   const [report, setReport] = useState<IndividualSummaryReport | null>(null)
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
+  const [showFullReport, setShowFullReport] = useState(false)
+  const [analysisStartDate, setAnalysisStartDate] = useState('')
+  const [analysisEndDate, setAnalysisEndDate] = useState('')
 
-  const { scoreHistory, errorCounter } = useMemo(
-    () => buildIndividualSummaryPayload(records),
+  const availableDates = useMemo(
+    () => records.map(getRecordTestDate).filter((date) => /^\d{4}-\d{2}-\d{2}$/.test(date)).sort(),
     [records],
   )
-  const sampleCount = records.length
-  const canAnalyze = scoreHistory.length > 0
+  const earliestDate = availableDates[0] || ''
+  const latestDate = availableDates[availableDates.length - 1] || ''
+  const rangeInvalid = Boolean(
+    analysisStartDate && analysisEndDate && analysisStartDate > analysisEndDate,
+  )
+  const scopedAnalysisRecords = useMemo(
+    () => records.filter((record) => {
+      const date = getRecordTestDate(record)
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return !analysisStartDate && !analysisEndDate
+      if (analysisStartDate && date < analysisStartDate) return false
+      if (analysisEndDate && date > analysisEndDate) return false
+      return true
+    }),
+    [analysisEndDate, analysisStartDate, records],
+  )
+
+  const { scoreHistory, errorCounter, attempts } = useMemo(
+    () => buildIndividualSummaryPayload(scopedAnalysisRecords),
+    [scopedAnalysisRecords],
+  )
+  const sampleCount = scopedAnalysisRecords.length
+  const canAnalyze = scoreHistory.length > 0 && !rangeInvalid
+
+  function resetGeneratedReport() {
+    setStatus('idle')
+    setReport(null)
+    setErrorMessage(null)
+    setShowFullReport(false)
+  }
+
+  function updateAnalysisRange(kind: 'start' | 'end', value: string) {
+    if (kind === 'start') setAnalysisStartDate(value)
+    else setAnalysisEndDate(value)
+    resetGeneratedReport()
+  }
+
+  function selectAllDates() {
+    setAnalysisStartDate('')
+    setAnalysisEndDate('')
+    resetGeneratedReport()
+  }
+
+  function selectRecentThirtyDays() {
+    if (!latestDate) return
+    const start = new Date(`${latestDate}T12:00:00`)
+    start.setDate(start.getDate() - 29)
+    setAnalysisStartDate(formatLocalIsoDate(start))
+    setAnalysisEndDate(latestDate)
+    resetGeneratedReport()
+  }
 
   async function handleUploadAndAnalyze() {
     if (!canAnalyze || status === 'loading') return
@@ -1602,6 +1801,9 @@ function IndividualLlmSummaryCard({
           studentId,
           scoreHistory,
           errorCounter,
+          attempts,
+          dateFrom: analysisStartDate || null,
+          dateTo: analysisEndDate || null,
         }),
       })
       if (!response.ok) {
@@ -1611,12 +1813,9 @@ function IndividualLlmSummaryCard({
       if (!data?.strengths && !data?.weaknesses) {
         throw new Error('后端未返回有效分析内容')
       }
-      setReport({
-        strengths: data.strengths || '',
-        weaknesses: data.weaknesses || '',
-        generatedAt: data.generatedAt || '',
-      })
+      setReport({ ...data, strengths: data.strengths || '', weaknesses: data.weaknesses || '' })
       setStatus('ready')
+      setShowFullReport(true)
     } catch (error) {
       setReport(null)
       setErrorMessage(error instanceof Error ? error.message : '分析失败，请稍后重试')
@@ -1639,8 +1838,8 @@ function IndividualLlmSummaryCard({
             <h4 className="text-sm font-semibold text-violet-100">LLM 个人总体分析</h4>
             <p className="text-[11px] text-white/35">
               上传筛选内 {sampleCount} 次尝试
-              {scoreHistory.length > 0 ? ` · ${scoreHistory.length} 个有效评分` : ''}
-              ，生成优势 / 盲区总结
+              {scoreHistory.length > 0 ? ` · ${scoreHistory.length} 个A级有效评分` : ''}
+              ，生成完整总体报告
             </p>
           </div>
         </div>
@@ -1659,6 +1858,37 @@ function IndividualLlmSummaryCard({
         </button>
       </div>
 
+      <div className="mb-3 rounded-2xl border border-white/8 bg-black/20 p-3">
+        <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-1.5 text-[11px] font-semibold text-white/65">
+            <CalendarDays className="h-3.5 w-3.5 text-violet-300" />
+            总体分析时间范围
+          </div>
+          <div className="flex items-center gap-1.5">
+            <button type="button" disabled={status === 'loading'} onClick={selectAllDates} className="rounded-lg border border-white/10 bg-white/5 px-2.5 py-1 text-[10px] text-white/55 transition hover:bg-white/10 disabled:opacity-40">全部时间</button>
+            <button type="button" disabled={status === 'loading' || !latestDate} onClick={selectRecentThirtyDays} className="rounded-lg border border-violet-400/20 bg-violet-500/10 px-2.5 py-1 text-[10px] text-violet-200 transition hover:bg-violet-500/20 disabled:opacity-40">最近30天</button>
+          </div>
+        </div>
+        <div className="grid items-end gap-2 sm:grid-cols-[1fr_auto_1fr_auto]">
+          <label className="space-y-1">
+            <span className="text-[10px] text-white/35">开始日期（含）</span>
+            <input type="date" value={analysisStartDate} disabled={status === 'loading'} onChange={(event) => updateAnalysisRange('start', event.target.value)} className="w-full rounded-xl border border-white/10 bg-slate-950/70 px-3 py-2 text-xs text-white/75 outline-none transition focus:border-violet-400/45 disabled:opacity-50" />
+          </label>
+          <span className="pb-2 text-xs text-white/25">至</span>
+          <label className="space-y-1">
+            <span className="text-[10px] text-white/35">结束日期（含）</span>
+            <input type="date" value={analysisEndDate} disabled={status === 'loading'} onChange={(event) => updateAnalysisRange('end', event.target.value)} className="w-full rounded-xl border border-white/10 bg-slate-950/70 px-3 py-2 text-xs text-white/75 outline-none transition focus:border-violet-400/45 disabled:opacity-50" />
+          </label>
+          <span className="pb-2 text-[10px] text-white/35">范围内 {sampleCount} 条 / A级 {scoreHistory.length} 条</span>
+        </div>
+        {rangeInvalid && <p className="mt-2 text-xs text-rose-300">开始日期不能晚于结束日期，请重新选择。</p>}
+        {!rangeInvalid && sampleCount === 0 && <p className="mt-2 text-xs text-amber-200/75">当前时间范围内没有测试记录。</p>}
+        {!rangeInvalid && sampleCount > 0 && scoreHistory.length === 0 && <p className="mt-2 text-xs text-amber-200/75">当前时间范围内没有A级科研有效记录。</p>}
+        {!analysisStartDate && !analysisEndDate && earliestDate && latestDate && (
+          <p className="mt-2 text-[10px] text-white/25">全部数据覆盖 {earliestDate} 至 {latestDate}</p>
+        )}
+      </div>
+
       {topErrors.length > 0 && status === 'idle' && (
         <p className="mb-3 text-[11px] text-white/30">
           待上传高频偏差：
@@ -1671,8 +1901,8 @@ function IndividualLlmSummaryCard({
           <Upload className="h-6 w-6 text-violet-300/50" />
           <p className="text-sm text-white/55">
             {canAnalyze
-              ? '点击上方按钮，将本生历史评分与错误统计上传给 LLM 分析个人总体情况'
-              : '当前筛选内暂无有效评分，无法上传分析'}
+              ? '点击上方按钮，生成骨骼定格、五维画像、AIGC 处方与自查任务'
+              : '当前筛选内暂无A级科研有效评分，无法生成正式个人总结'}
           </p>
         </div>
       )}
@@ -1709,6 +1939,20 @@ function IndividualLlmSummaryCard({
 
       {status === 'ready' && report && (
         <div className="flex flex-col gap-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <p className="text-[11px] text-white/35">
+              纳入A级尝试 {report.formalAttemptCount ?? scoreHistory.length} 次
+              {' · '}排除 {report.excludedAttemptCount ?? 0} 次非正式记录
+            </p>
+            <button
+              type="button"
+              onClick={() => setShowFullReport(true)}
+              className="inline-flex items-center gap-1.5 rounded-full border border-violet-400/30 bg-violet-500/15 px-3 py-1.5 text-[11px] font-semibold text-violet-100 transition hover:bg-violet-500/25"
+            >
+              <ClipboardList className="h-3.5 w-3.5" />
+              查看完整报告
+            </button>
+          </div>
           <article className="rounded-xl border border-emerald-400/20 bg-emerald-500/8 px-4 py-3">
             <p className="mb-1.5 flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wider text-emerald-300/80">
               <ThumbsUp className="h-3 w-3" />
@@ -1728,6 +1972,16 @@ function IndividualLlmSummaryCard({
           )}
         </div>
       )}
+      <AnimatePresence>
+        {showFullReport && report && (
+          <IndividualSummaryReportDrawer
+            report={report}
+            studentId={studentId}
+            onClose={() => setShowFullReport(false)}
+            onTaskChange={(task) => setReport((current) => current ? { ...current, selfCheckTask: task } : current)}
+          />
+        )}
+      </AnimatePresence>
     </section>
   )
 }

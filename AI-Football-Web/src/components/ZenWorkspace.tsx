@@ -64,6 +64,14 @@ interface ZenWorkspaceProps {
  * 后台服务网关地址，与 RealtimeWorkspace.tsx 保持完全一致的联调配置。
  * ========================================================================== */
 const API_BASE_URL = 'http://localhost:8000'
+
+function currentLessonId(): string {
+  const now = new Date()
+  const year = now.getFullYear()
+  const month = String(now.getMonth() + 1).padStart(2, '0')
+  const day = String(now.getDate()).padStart(2, '0')
+  return `${year}-${month}-${day}`
+}
 const WS_ANALYZE_URL = 'ws://localhost:8000/ws/analyze'
 
 /** 后端 WebSocket 推送的消息结构（B组只关心 image/session_id/error，不消费角度三色判定字段） */
@@ -443,7 +451,28 @@ export default function ZenWorkspace({ globalSettings }: ZenWorkspaceProps) {
           school: getSchoolDisplayName(globalSettings),
           classGroup: getClassGroupDisplayName(globalSettings),
           studentNumber: studentIdForReport || '未填写编号',
+          experimentalGroup: 'GROUP_B_DELAYED',
+          timepoint: globalSettings.studyTimepoint,
+          lessonId: report?.lessonId ?? currentLessonId(),
+          feedbackSuppressed: true,
+          sourceType: attempt.videoSource === 'file' ? 'local_video' : 'webcam',
+          videoHash: report?.sourceVideoHash ?? null,
+          interventionAudit: {
+            feedbackShown: false,
+            trafficLightShown: false,
+            replayShown: false,
+            aiAdviceShown: false,
+            immediateFeedbackShown: false,
+            delayedPresentation: true,
+            operatorPreviewOnly: true,
+          },
+          attemptLedger: report?.attemptLedger ?? null,
           score: toFixedFloat(report?.score),
+          reportStatus: report?.reportStatus ?? null,
+          formalReportAllowed: report?.formalReportAllowed ?? null,
+          referenceFeedbackAllowed: report?.referenceFeedbackAllowed ?? null,
+          researchEligible: report?.researchEligible ?? null,
+          qualityGate: report?.qualityGate ?? null,
           totalAttempts: toFixedFloat(report?.totalAttempts),
           overview: report?.overview || report?.clinical_echo || report?.clinicalEcho || '',
           biomechanical_analysis:
@@ -477,6 +506,14 @@ export default function ZenWorkspace({ globalSettings }: ZenWorkspaceProps) {
             '',
           clinical_echo:
             report?.overview || report?.clinical_echo || report?.clinicalEcho || null,
+          aigc_source: report?.aigc_source || report?.aigcSource || null,
+          clinical_brief: report?.clinical_brief || report?.clinicalBrief || null,
+          prescriptionEvidence:
+            report?.prescriptionEvidence || report?.prescription_evidence || null,
+          historyContext: report?.historyContext || report?.history_context || null,
+          priorityTarget: report?.priorityTarget || report?.priority_target || null,
+          postprocessAudit: report?.postprocessAudit || null,
+          fallbackReason: report?.fallbackReason || null,
           t_impact: report?.t_impact ?? report?.tImpact ?? null,
           generatedAt: report?.generatedAt ?? null,
           impactFrameImage: attempt.impactFrameBase64 ?? report?.impactFrameImage ?? null,
@@ -734,10 +771,25 @@ export default function ZenWorkspace({ globalSettings }: ZenWorkspaceProps) {
       const response = await fetch(`${API_BASE_URL}/api/generate_report`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ session_id: sessionId, student_number: activeStudentId }),
+        body: JSON.stringify({
+          session_id: sessionId,
+          student_number: activeStudentId,
+          school: getSchoolDisplayName(globalSettings),
+          class_group: getClassGroupDisplayName(globalSettings),
+          experimental_group: 'GROUP_B_DELAYED',
+          timepoint: globalSettings.studyTimepoint,
+          lesson_id: currentLessonId(),
+          suppress_feedback: false,
+          planned_attempts: globalSettings.plannedAttempts,
+        }),
       })
       if (!response.ok) throw new Error(`报告接口返回状态码 ${response.status}`)
       const report = (await response.json()) as FinalDiagnosisReport
+      if (report.qualityGate?.grade === 'C' || report.reportStatus === 'rejected') {
+        const reason = report.qualityGate?.issues?.[0]?.label || '采集质量未达标'
+        showToast(`第 ${attemptNumber} 次尝试无效：${reason}，请重新采集`)
+        return
+      }
 
       const newAttempt: ZenAttemptRecord = {
         attemptNumber,
@@ -786,14 +838,17 @@ export default function ZenWorkspace({ globalSettings }: ZenWorkspaceProps) {
     if (globalSettings.enableDataArchiving) {
       void (async () => {
         let successCount = 0
-        for (const attempt of newRecord.attempts) {
+        const archivableAttempts = newRecord.attempts.filter(
+          (attempt) => attempt.reportData?.reportStatus !== 'rejected',
+        )
+        for (const attempt of archivableAttempts) {
           const ok = await saveAttemptToWord(finishedStudentId, attempt)
           if (ok) successCount += 1
         }
-        if (successCount === newRecord.attempts.length) {
+        if (successCount === archivableAttempts.length) {
           showToast(`💾 ${finishedStudentId} 的 ${successCount} 份 Word 报告已自动归档至本地硬盘`)
         } else {
-          showToast(`⚠️ ${finishedStudentId} 仅成功归档 ${successCount}/${newRecord.attempts.length} 份 Word 报告，请检查后端服务`)
+          showToast(`⚠️ ${finishedStudentId} 仅成功归档 ${successCount}/${archivableAttempts.length} 份 Word 报告，请检查后端服务`)
         }
       })()
     }

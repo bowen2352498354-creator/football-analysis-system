@@ -238,7 +238,7 @@ def test_scorer_ankle_includes_dorsiflex_drop_when_measured():
     assert ankle.get("unit") == "deg"
     assert ankle.get("deflection_deg") is not None or ankle.get("dorsiflex_drop_deg") is not None
     assert float(ankle.get("dorsiflex_drop_deg") or ankle.get("deflection_deg") or 0) > 0
-    assert ankle.get("window_half_frames") == 2
+    assert ankle.get("window_half_frames") == ankle_half_window_frames(30.0, 50.0)
 
 
 def test_default_empirical_pcr_constant():

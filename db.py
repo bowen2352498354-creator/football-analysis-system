@@ -30,6 +30,8 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from models import Base
+from experiment_ledger import canonical_group, normalize_timepoint
+from research_integrity import is_explicit_formal_record
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DB_PATH = os.path.join(SCRIPT_DIR, "cluster_rct.db")
@@ -47,7 +49,7 @@ _backup_daemon_started = False
 _backup_stop_event = threading.Event()
 _backup_thread: Optional[threading.Thread] = None
 _backup_last_run_lock = threading.Lock()
-_backup_last_run_at: Optional[datetime] = None
+_backup_last_run_by_dir: dict[str, datetime] = {}
 
 # 可通过环境变量覆盖；默认落在项目根目录本地文件，符合全边缘架构
 DATABASE_URL = os.environ.get(
@@ -55,7 +57,7 @@ DATABASE_URL = os.environ.get(
     f"sqlite:///{DEFAULT_DB_PATH.replace(os.sep, '/')}",
 )
 
-# 班级对比：单侧有效成绩条数低于该阈值时视为样本量不足
+# 班级对比以独立学生数为样本量，不再把多次射门当成独立被试。
 MIN_COHORT_SAMPLES = 2
 
 # 五维雷达：助跑 / 支撑 / 后摆 / 踝锁 / 鞭打
@@ -480,7 +482,26 @@ def empty_compare_cohorts_payload(
     }
 
 
-def _filter_cohort_records(records: Sequence[dict], cohort: str) -> list[dict]:
+def _record_student_key(record: Mapping[str, Any]) -> str:
+    return str(
+        record.get("studentId")
+        or record.get("student_id")
+        or record.get("anonymous_id")
+        or ""
+    ).strip()
+
+
+def _filter_cohort_records(
+    records: Sequence[dict],
+    cohort: str,
+    *,
+    school: str = "",
+    experimental_group: str = "",
+    timepoints: Sequence[str] = (),
+    date_from: str = "",
+    date_to: str = "",
+    strict_quality: bool = False,
+) -> list[dict]:
     name = (cohort or "").strip()
     if not name:
         return []
@@ -490,12 +511,36 @@ def _filter_cohort_records(records: Sequence[dict], cohort: str) -> list[dict]:
             continue
         if _record_class_group(record) != name:
             continue
+        if school and str(record.get("school") or "").strip() != school:
+            continue
+        if experimental_group:
+            raw_group = (
+                record.get("experimentalGroup")
+                or record.get("experimental_group")
+                or record.get("type")
+            )
+            if canonical_group(str(raw_group or "")) != canonical_group(experimental_group):
+                continue
+        if timepoints:
+            point = normalize_timepoint(str(record.get("timepoint") or ""))
+            if point not in set(timepoints):
+                continue
+        day = _record_test_date(record)
+        if date_from and (not day or day < date_from):
+            continue
+        if date_to and (not day or day > date_to):
+            continue
+        if strict_quality and not is_explicit_formal_record(record):
+            continue
+        if not _record_student_key(record):
+            continue
         out.append(record)
     return out
 
 
 def _daily_trend(records: Sequence[dict]) -> list[dict[str, Any]]:
-    buckets: dict[str, list[float]] = defaultdict(list)
+    # 先求每名学生当日均值，再求班级均值，避免多次射门者获得额外权重。
+    student_buckets: dict[tuple[str, str], list[float]] = defaultdict(list)
     for record in records:
         day = _record_test_date(record)
         if not day:
@@ -503,7 +548,13 @@ def _daily_trend(records: Sequence[dict]) -> list[dict[str, Any]]:
         score = _record_score(record)
         if score is None:
             continue
-        buckets[day].append(score)
+        student_buckets[(day, _record_student_key(record))].append(score)
+
+    buckets: dict[str, list[float]] = defaultdict(list)
+    attempt_counts: Counter[str] = Counter()
+    for (day, _student), values in student_buckets.items():
+        buckets[day].append(statistics.fmean(values))
+        attempt_counts[day] += len(values)
 
     points: list[dict[str, Any]] = []
     for day in sorted(buckets.keys()):
@@ -522,13 +573,15 @@ def _daily_trend(records: Sequence[dict]) -> list[dict[str, Any]]:
                 "average_score": avg,
                 "score_variance": variance,
                 "n": len(vals),
+                "student_n": len(vals),
+                "attempt_n": int(attempt_counts[day]),
             }
         )
     return points
 
 
 def _radar_means(records: Sequence[dict]) -> dict[str, Optional[float]]:
-    buckets: dict[str, list[float]] = {k: [] for k, _ in RADAR_COMPARE_DIMS}
+    per_student: dict[tuple[str, str], list[float]] = defaultdict(list)
     for record in records:
         radar = _extract_radar_dict(record)
         if not isinstance(radar, dict):
@@ -536,7 +589,10 @@ def _radar_means(records: Sequence[dict]) -> dict[str, Optional[float]]:
         for dim_key, _ in RADAR_COMPARE_DIMS:
             num = _pick_radar_dim(radar, dim_key)
             if num is not None:
-                buckets[dim_key].append(num)
+                per_student[(_record_student_key(record), dim_key)].append(num)
+    buckets: dict[str, list[float]] = {k: [] for k, _ in RADAR_COMPARE_DIMS}
+    for (_student, key), values in per_student.items():
+        buckets[key].append(statistics.fmean(values))
     return {
         key: (round(sum(vals) / len(vals), 2) if vals else None)
         for key, vals in buckets.items()
@@ -544,13 +600,16 @@ def _radar_means(records: Sequence[dict]) -> dict[str, Optional[float]]:
 
 
 def _error_rate_rows(records: Sequence[dict]) -> list[dict[str, Any]]:
-    total = len(records)
+    students: dict[str, set[str]] = defaultdict(set)
+    for record in records:
+        students[_record_student_key(record)].update(_extract_error_codes(record))
+    total = len(students)
     if total <= 0:
         return []
     counter: Counter[str] = Counter()
-    for record in records:
-        # 同一条记录同一错误码只计一次
-        for code in _extract_error_codes(record):
+    for codes in students.values():
+        # 同一学生在筛选窗口内同一错误码只计一次。
+        for code in codes:
             counter[code] += 1
     rows = [
         {
@@ -564,6 +623,40 @@ def _error_rate_rows(records: Sequence[dict]) -> list[dict[str, Any]]:
     return rows
 
 
+def _cohort_descriptive(records: Sequence[dict]) -> dict[str, Any]:
+    per_student: dict[str, list[float]] = defaultdict(list)
+    for record in records:
+        score = _record_score(record)
+        if score is not None:
+            per_student[_record_student_key(record)].append(score)
+    values = [statistics.fmean(items) for items in per_student.values() if items]
+    if not values:
+        return {
+            "student_n": 0,
+            "attempt_n": len(records),
+            "mean": None,
+            "sd": None,
+            "median": None,
+            "ci95_low": None,
+            "ci95_high": None,
+        }
+    mean = statistics.fmean(values)
+    sd = statistics.stdev(values) if len(values) >= 2 else 0.0
+    margin = 1.96 * sd / math.sqrt(len(values)) if len(values) >= 2 else 0.0
+    quartiles = statistics.quantiles(values, n=4, method="inclusive") if len(values) >= 2 else [values[0]] * 3
+    return {
+        "student_n": len(values),
+        "attempt_n": len(records),
+        "mean": round(mean, 2),
+        "sd": round(sd, 2),
+        "median": round(statistics.median(values), 2),
+        "q1": round(quartiles[0], 2),
+        "q3": round(quartiles[2], 2),
+        "ci95_low": round(mean - margin, 2),
+        "ci95_high": round(mean + margin, 2),
+    }
+
+
 def compare_cohorts(
     cohort_a: str,
     cohort_b: str,
@@ -571,6 +664,12 @@ def compare_cohorts(
     records: Sequence[dict] | None = None,
     min_samples: int = MIN_COHORT_SAMPLES,
     global_db_path: str | None = None,
+    school: str = "",
+    experimental_group: str = "",
+    timepoints: Sequence[str] = (),
+    date_from: str = "",
+    date_to: str = "",
+    strict_quality: bool = False,
 ) -> dict[str, Any]:
     """聚合两个班级/实验组的三维对比数据。
 
@@ -599,9 +698,23 @@ def compare_cohorts(
 
     try:
         source = list(records) if records is not None else load_global_training_records(global_db_path)
-        rows_a = _filter_cohort_records(source, name_a)
-        rows_b = _filter_cohort_records(source, name_b)
-        n_a, n_b = len(rows_a), len(rows_b)
+        filter_kwargs = {
+            "school": school,
+            "experimental_group": experimental_group,
+            "timepoints": list(timepoints),
+            "date_from": date_from,
+            "date_to": date_to,
+            "strict_quality": bool(strict_quality),
+        }
+        scope = {
+            **filter_kwargs,
+            "aggregation_unit": "student",
+        }
+        rows_a = _filter_cohort_records(source, name_a, **filter_kwargs)
+        rows_b = _filter_cohort_records(source, name_b, **filter_kwargs)
+        desc_a = _cohort_descriptive(rows_a)
+        desc_b = _cohort_descriptive(rows_b)
+        n_a, n_b = int(desc_a["student_n"]), int(desc_b["student_n"])
 
         if n_a < min_samples or n_b < min_samples:
             return empty_compare_cohorts_payload(
@@ -643,6 +756,9 @@ def compare_cohorts(
             "cohort_a": name_a,
             "cohort_b": name_b,
             "sample_counts": {"a": n_a, "b": n_b},
+            "attempt_counts": {"a": len(rows_a), "b": len(rows_b)},
+            "descriptive": {"cohort_a": desc_a, "cohort_b": desc_b},
+            "filter_scope": scope,
             "trend": {
                 "dates": dates,
                 "cohort_a": trend_a,
@@ -1187,6 +1303,30 @@ def _iter_backup_files(backup_dir: str) -> list[str]:
     return out
 
 
+def _backup_dir_key(backup_dir: str) -> str:
+    """Return a stable key so independent backup roots cannot share state."""
+    return os.path.normcase(os.path.abspath(backup_dir))
+
+
+def _backup_logical_time(path: str) -> Optional[datetime]:
+    """Read the timestamp encoded in a backup name, falling back to mtime."""
+    name = os.path.basename(path)
+    if name.startswith(BACKUP_FILENAME_PREFIX) and name.endswith(
+        BACKUP_FILENAME_SUFFIX
+    ):
+        token = name[
+            len(BACKUP_FILENAME_PREFIX) : len(name) - len(BACKUP_FILENAME_SUFFIX)
+        ]
+        try:
+            return datetime.strptime(token[:13], "%Y%m%d_%H%M")
+        except (TypeError, ValueError):
+            pass
+    try:
+        return datetime.fromtimestamp(os.path.getmtime(path))
+    except OSError:
+        return None
+
+
 def prune_old_backups(
     backup_dir: str | None = None,
     *,
@@ -1215,15 +1355,14 @@ def prune_old_backups(
 
 
 def latest_backup_mtime(backup_dir: str | None = None) -> Optional[datetime]:
-    """返回备份目录中最新 ``.bak`` 的修改时间。"""
+    """返回最新备份的逻辑创建时间；旧命名文件回退到修改时间。"""
     newest: Optional[datetime] = None
     for path in _iter_backup_files(backup_dir or DEFAULT_BACKUP_DIR):
-        try:
-            mtime = datetime.fromtimestamp(os.path.getmtime(path))
-        except OSError:
+        backup_time = _backup_logical_time(path)
+        if backup_time is None:
             continue
-        if newest is None or mtime > newest:
-            newest = mtime
+        if newest is None or backup_time > newest:
+            newest = backup_time
     return newest
 
 
@@ -1235,9 +1374,11 @@ def should_run_backup(
 ) -> bool:
     """距上次成功备份已超过 ``interval_hours``（或尚无备份）时返回 True。"""
     anchor = now or datetime.now()
+    root = backup_dir or DEFAULT_BACKUP_DIR
+    root_key = _backup_dir_key(root)
     with _backup_last_run_lock:
-        last_memory = _backup_last_run_at
-    last_disk = latest_backup_mtime(backup_dir)
+        last_memory = _backup_last_run_by_dir.get(root_key)
+    last_disk = latest_backup_mtime(root)
     last = last_memory
     if last_disk is not None and (last is None or last_disk > last):
         last = last_disk
@@ -1258,8 +1399,6 @@ def create_database_backup(
 
     返回备份文件绝对路径；若无需备份或无可备份源则返回 ``None``。
     """
-    global _backup_last_run_at
-
     root = backup_dir or DEFAULT_BACKUP_DIR
     os.makedirs(root, exist_ok=True)
     if not force and not should_run_backup(root, now=now):
@@ -1300,7 +1439,7 @@ def create_database_backup(
         raise
 
     with _backup_last_run_lock:
-        _backup_last_run_at = now or datetime.now()
+        _backup_last_run_by_dir[_backup_dir_key(root)] = now or datetime.now()
     prune_old_backups(root, now=now)
     return dest_path
 

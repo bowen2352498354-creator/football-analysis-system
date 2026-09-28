@@ -230,3 +230,26 @@ def test_backup_creates_bak_and_prunes(tmp_path: Path):
     assert removed >= 1
     assert not old.exists()
     assert latest_backup_mtime(str(backup_dir)) is not None
+
+
+def test_backup_schedule_is_isolated_by_directory(tmp_path: Path):
+    first_dir = tmp_path / "first"
+    second_dir = tmp_path / "second"
+    source = tmp_path / "global_training_db.json"
+    source.write_text("[]", encoding="utf-8")
+
+    created_at = datetime(2026, 8, 3, 8, 44)
+    assert create_database_backup(
+        backup_dir=str(first_dir),
+        global_db_path=str(source),
+        sqlite_db_path=str(tmp_path / "missing.db"),
+        force=True,
+        now=created_at,
+    ) is not None
+
+    assert should_run_backup(
+        str(first_dir), interval_hours=12, now=datetime(2026, 8, 3, 8, 50)
+    ) is False
+    assert should_run_backup(
+        str(second_dir), interval_hours=12, now=datetime(2026, 8, 3, 8, 50)
+    ) is True

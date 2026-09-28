@@ -29,6 +29,26 @@ from error_diagnoser import (
     is_aigc_measurable_provenance,
 )
 
+try:
+    from diagnostic_trace import (
+        record_feedback_trace,
+        sanitize_for_trace,
+        summarize_llm_result,
+        text_fingerprint,
+    )
+except Exception:  # noqa: BLE001 - tracing must never block report generation
+    def record_feedback_trace(*args, **kwargs):  # type: ignore[no-redef]
+        return False
+
+    def sanitize_for_trace(value, **kwargs):  # type: ignore[no-redef]
+        return value
+
+    def summarize_llm_result(result):  # type: ignore[no-redef]
+        return result
+
+    def text_fingerprint(text):  # type: ignore[no-redef]
+        return ""
+
 # --------------------------------------------------------------------------
 # 第一步：配置 DeepSeek 的 API Key 与接口地址
 # --------------------------------------------------------------------------
@@ -125,7 +145,7 @@ LLM_TEMPERATURE = 0.65
 _OVERVIEW_MAX_CHARS = 160
 _BIOMECH_MAX_CHARS = 420
 _MAGIC_MAX_CHARS = 50
-_ACTION_MAX_CHARS = 30
+_ACTION_MAX_CHARS = 140
 
 # 兼容旧常量名（部分测试 / 内部调用仍引用）
 _CLINICAL_ECHO_MAX_CHARS = _OVERVIEW_MAX_CHARS
@@ -155,11 +175,14 @@ SYSTEM_PROMPT = (
     '  "magic_metaphor": "【具身隐喻处方】(针对最核心的病灶，生成通俗、'
     "有画面感且带有一点幽默的纠错比喻，避免与之前的提示重复，"
     f'{_MAGIC_MAX_CHARS}字)",\n'
-    '  "action_plan": "【下一步训练指令】(给出明确的身体部位控制指令，'
+    '  "action_plan": "【下一步训练指令】(只能训练传入 priorityTarget 指定的唯一目标；'
+    "写清练习名称、动作口令、组次数量和复测标准，禁止同时纠正其他问题，"
     f'{_ACTION_MAX_CHARS}字)"\n'
     "}\n"
     "【铁律】绝不计算或修改分数；不得编造未提供的测量值；"
-    "四个字段都必须填写且互不重复；只返回合法 JSON，禁止 Markdown 围栏；"
+    "四个字段都必须填写且互不重复；Top 2/3 扣分项只能作为因果解释，不能变成额外训练目标；"
+    "有历史对比数据时才能声称进步或退步，没有数据必须明确不作比较；"
+    "只返回合法 JSON，禁止 Markdown 围栏；"
     "必须使用简体中文。"
 )
 
@@ -710,7 +733,7 @@ def _rank_deduction_rows(diagnosis: Optional[dict] = None) -> list[dict]:
             continue
         if not isinstance(row, dict):
             continue
-        metric = row.get("metric") or row.get("key")
+        metric = row.get("metric") or row.get("metric_key") or row.get("key")
         pen = 0.0
         try:
             pen = float(row.get("penalty") or 0.0)
@@ -718,11 +741,11 @@ def _rank_deduction_rows(diagnosis: Optional[dict] = None) -> list[dict]:
             pen = 0.0
         reason = str(row.get("reason") or "").strip()
         item = indicators.get(metric) if isinstance(metric, str) else None
-        measured = None
-        threshold = None
+        measured = row.get("measured_value")
+        threshold = row.get("threshold")
         if isinstance(item, dict):
-            measured = _format_indicator_value_unit(str(metric), item) or None
-            threshold = _format_green_band(item) or None
+            measured = measured or _format_indicator_value_unit(str(metric), item) or None
+            threshold = threshold or _format_green_band(item) or None
             if not reason:
                 reason = _coach_fact_for_indicator(
                     str(metric),
@@ -736,6 +759,7 @@ def _rank_deduction_rows(diagnosis: Optional[dict] = None) -> list[dict]:
                 "reason": reason or "未命名扣分项",
                 "measured_value": measured,
                 "threshold": threshold,
+                "error_code": row.get("error_code"),
             }
         )
     # 若 deductions 为空，从 indicators.penalty 构造
@@ -971,6 +995,60 @@ def _clamp_report_phrase(text: str, limit: int) -> str:
     return cleaned
 
 
+def _prescription_evidence_from_diagnosis(diagnosis: Optional[dict]) -> dict:
+    diagnosis = diagnosis if isinstance(diagnosis, dict) else {}
+    detail = diagnosis.get("score_detail") or {}
+    evidence = diagnosis.get("prescription_evidence")
+    if not isinstance(evidence, dict) and isinstance(detail, dict):
+        evidence = detail.get("prescription_evidence")
+    return evidence if isinstance(evidence, dict) else {}
+
+
+def _canonical_priority_action(diagnosis: Optional[dict]) -> str:
+    evidence = _prescription_evidence_from_diagnosis(diagnosis)
+    target = evidence.get("priorityTarget") or {}
+    if not isinstance(target, dict) or not target:
+        return ""
+    label = str(target.get("label") or "核心动作").strip()
+    exercise = str(target.get("exercise") or "分解练习").strip()
+    cue = str(target.get("cue") or "围绕本次最大扣分项做慢动作控制").strip()
+    dosage = str(target.get("dosage") or "3组×5次").strip()
+    criterion = str(target.get("retestCriterion") or "复测时进入目标区").strip()
+    return f"本次只练{label}：{exercise}，{cue}；{dosage}；{criterion}。"
+
+
+def _primary_evidence_sentence(diagnosis: Optional[dict]) -> str:
+    evidence = _prescription_evidence_from_diagnosis(diagnosis)
+    top = evidence.get("topDeductions") or []
+    primary = top[0] if isinstance(top, list) and top and isinstance(top[0], dict) else {}
+    if not primary:
+        return ""
+    label = str(primary.get("label") or primary.get("metricKey") or "首要指标")
+    value = primary.get("measuredValue")
+    unit = str(primary.get("unit") or "")
+    standard = (primary.get("standardRange") or {}).get("text")
+    direction = primary.get("deviationDirection")
+    penalty = primary.get("penalty")
+    bits = [f"核心证据：{label}{value}{unit}" if value is not None else f"核心证据：{label}"]
+    if standard:
+        bits.append(f"目标{standard}")
+    if direction and direction != "未知":
+        bits.append(str(direction))
+    if penalty is not None:
+        bits.append(f"扣{penalty}分")
+
+    comparison = primary.get("historyComparison") or {}
+    delta = comparison.get("deltaFromPersonalMean") if isinstance(comparison, dict) else None
+    if delta is not None:
+        sign = "+" if float(delta) > 0 else ""
+        bits.append(f"较本人历史均值{sign}{float(delta):.2f}{unit}")
+    peer_delta = comparison.get("deltaFromClassPeerMean") if isinstance(comparison, dict) else None
+    if peer_delta is not None:
+        sign = "+" if float(peer_delta) > 0 else ""
+        bits.append(f"较同班同伴均值{sign}{float(peer_delta):.2f}{unit}")
+    return "，".join(bits) + "。"
+
+
 def _depth_fallback_report(diagnosis: Optional[dict] = None) -> dict:
     """动态四维兜底：必须拼接 TotalScore 与最严重扣分项，禁止纯静态串。"""
     diagnosis = diagnosis or {}
@@ -1064,7 +1142,7 @@ def _depth_fallback_report(diagnosis: Optional[dict] = None) -> dict:
         f"核心病灶是「{reason}」{measured_bit}{threshold_bit}{secondary_text}。"
         "该原发性偏差会沿动力链向远端传导，影响膝盖伸展控制或脚踝刚度，需优先纠正。"
     )
-    action = (
+    action = _canonical_priority_action(diagnosis) or (
         f"针对{reason_hint}做 5 次慢动作定点控制"
         + (f"（目标靠近 {threshold}）" if threshold else "。")
     )
@@ -1413,6 +1491,7 @@ def _parse_optimal_dual_feedback(
         print(f"【llm_agent】四维 JSON 解析/校验失败，启用动态数据兜底：{exc}")
         hard = _hard_fallback_dual(primary_error, diagnosis)
         hard["clinical_brief"] = brief
+        hard["fallback_reason"] = f"invalid_llm_json:{type(exc).__name__}:{exc}"
         return hard
 
 
@@ -1448,6 +1527,11 @@ def _dual_to_report_fields(dual: dict, diagnosis: Optional[dict] = None) -> dict
     magic = dual.get("magic_metaphor") or _STATIC_OPTIMAL_FALLBACK["magic_metaphor"]
     action = dual.get("action_plan") or _STATIC_OPTIMAL_FALLBACK["action_plan"]
     source = dual.get("aigc_source") or "fallback"
+    evidence = _prescription_evidence_from_diagnosis(diagnosis)
+    history = (diagnosis or {}).get("history_context") if isinstance(diagnosis, dict) else {}
+    if not isinstance(history, dict):
+        history = evidence.get("historyContext") if isinstance(evidence, dict) else {}
+    priority = evidence.get("priorityTarget") if isinstance(evidence, dict) else None
     return {
         # 四维主字段
         "overview": overview,
@@ -1465,6 +1549,16 @@ def _dual_to_report_fields(dual: dict, diagnosis: Optional[dict] = None) -> dict
         "aigcSource": source,
         "clinical_brief": brief,
         "clinicalBrief": brief,
+        "prescription_evidence": evidence,
+        "prescriptionEvidence": evidence,
+        "priority_target": priority,
+        "priorityTarget": priority,
+        "history_context": history or {},
+        "historyContext": history or {},
+        "postprocess_audit": dual.get("postprocess_audit"),
+        "postprocessAudit": dual.get("postprocess_audit"),
+        "fallback_reason": dual.get("fallback_reason"),
+        "fallbackReason": dual.get("fallback_reason"),
     }
 
 
@@ -2073,10 +2167,23 @@ def build_aigc_safe_payload(diagnosis: dict) -> dict:
     measurement = build_measurement_context(diagnosis)
     chain = build_kinematic_chain_data(diagnosis)
     extremes = _radar_extreme_dims(measurement.get("radar_scores") or {})
+    detail = diagnosis.get("score_detail") or {}
+    prescription_evidence = _prescription_evidence_from_diagnosis(diagnosis)
+    history_context = diagnosis.get("history_context")
+    if not isinstance(history_context, dict):
+        history_context = prescription_evidence.get("historyContext") or {}
+    t_impact = diagnosis.get("t_impact")
+    if t_impact is None:
+        t_impact = diagnosis.get("t0_index")
+    if t_impact is None:
+        t_impact = detail.get("t_impact")
+    if t_impact is None:
+        t_impact = detail.get("t0_index")
     return {
-        "primary_error_code": diagnosis.get("primary_error_code"),
+        "primary_error_code": diagnosis.get("primary_error_code")
+        or detail.get("primary_error_code"),
         "primary_error_description": primary_error_description,
-        "t_impact": diagnosis.get("t_impact", diagnosis.get("t0_index")),
+        "t_impact": t_impact,
         "red_defect_priority_hint": _pick_primary_red_defect(diagnosis),
         "TotalScore": measurement.get("TotalScore"),
         "radar_scores": measurement.get("radar_scores"),
@@ -2088,6 +2195,10 @@ def build_aigc_safe_payload(diagnosis: dict) -> dict:
         "kinematic_chain": chain,
         "clinical_brief": brief,
         "indicators": _extract_indicator_payload(diagnosis),
+        "prescriptionEvidence": prescription_evidence,
+        "priorityTarget": prescription_evidence.get("priorityTarget"),
+        "historyContext": history_context,
+        "qualityGate": diagnosis.get("quality_gate") or detail.get("quality_gate") or {},
     }
 
 
@@ -2102,7 +2213,8 @@ def build_aigc_user_message(diagnosis: dict) -> str:
         f"{panorama}\n\n"
         "请基于上方「全景体检表」做动力链因果推演：从近端支撑偏差如何传导到"
         "蓄力折叠、触球释放与动量表现；必须锚定系统判定的 Primary Error，"
-        "不得另起炉灶猜测病因。\n"
+        "不得另起炉灶猜测病因。action_plan 只能围绕 priorityTarget 指定的唯一指标，"
+        "Top 2/3 只允许用于解释；必须写明练习、剂量和复测标准。\n"
         "请严格按系统命令只返回 JSON，字段仅允许 "
         "overview、biomechanical_analysis、magic_metaphor、action_plan；"
         "必须引用上方真实测量数据（总分/雷达/扣分测得值与阈值/动力链时序）；"
@@ -2165,6 +2277,7 @@ def generate_optimal_dual_feedback(diagnosis_json, status=None) -> dict:
         print(f"【llm_agent】调用 DeepSeek 接口失败，使用动态数据 Fallback。错误信息：{exc}")
         dual = _optimal_fallback_dual(diagnosis)
         dual["clinical_brief"] = build_clinical_brief(diagnosis)
+        dual["fallback_reason"] = f"llm_request_failed:{type(exc).__name__}:{exc}"
         return dual
 
 
@@ -2256,6 +2369,9 @@ def generate_session_report(
     sample_angles=None,
     deterministic_score=None,
     diagnosis_json=None,
+    trace_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    source: Optional[str] = None,
 ):
     """把「一整次训练」的 ClinicalBrief / 红黄绿统计转译为 OPTIMAL 话术；评分绝不经 LLM。
 
@@ -2284,7 +2400,19 @@ def generate_session_report(
                 "aigc_source": "fallback",
             }
         )
-        return {"score": 0.0, **_dual_to_report_fields(empty_dual)}
+        result = {"score": 0.0, **_dual_to_report_fields(empty_dual)}
+        record_feedback_trace(
+            "llm_empty_attempt_fallback",
+            trace_id=trace_id,
+            session_id=session_id,
+            source=source,
+            payload={
+                "student_number": student_number,
+                "hit_stats": hit_stats,
+                "result": summarize_llm_result(result),
+            },
+        )
+        return result
 
     diagnosis = _normalize_diagnosis_json(diagnosis_json)
     # 将会话确定性总分写回 score_detail，确保 Prompt / 兜底 / 载荷同源
@@ -2328,15 +2456,44 @@ def generate_session_report(
         or "结合雷达优势给予肯定"
     )
     measurement_text = measurement_context.get("readable_text") or ""
+    prescription_evidence = _prescription_evidence_from_diagnosis(diagnosis)
+    priority_target = prescription_evidence.get("priorityTarget") or {}
+    top_deductions = prescription_evidence.get("topDeductions") or []
+    history_context = diagnosis.get("history_context") or prescription_evidence.get("historyContext") or {}
     user_message = (
         f"【ClinicalBrief 首要事实】{primary_fact}。\n"
         f"【全量测量数据】\n{measurement_text}\n"
         f"【可夸优点/雷达优势】{strength_hint}\n"
+        f"【Top 3 扣分证据】{json.dumps(top_deductions, ensure_ascii=False)}\n"
+        f"【唯一优先训练目标】{json.dumps(priority_target, ensure_ascii=False)}\n"
+        f"【个人/同班历史对比】{json.dumps(history_context, ensure_ascii=False)}\n"
         "请严格按系统命令只返回 JSON，字段仅允许 "
         "overview、biomechanical_analysis、magic_metaphor、action_plan；"
-        "必须引用上方真实测量数据；绝不能每次说一样的话；"
+        "必须引用上方真实测量数据；action_plan 只能训练唯一优先目标，"
+        "且必须包含练习、剂量、复测标准；绝不能每次说一样的话；"
         "四个字段必须互不重复：\n"
         f"{json.dumps(safe_payload, ensure_ascii=False)}"
+    )
+    record_feedback_trace(
+        "llm_request_built",
+        trace_id=trace_id,
+        session_id=session_id,
+        source=source,
+        payload={
+            "student_number": student_number,
+            "score": score,
+            "total_attempts": total_attempts,
+            "hit_stats": hit_stats,
+            "primary_error_description": primary_error_description,
+            "primary_fact": primary_fact,
+            "strength_hint": strength_hint,
+            "measurement_text_length": len(measurement_text),
+            "system_prompt_length": len(system_prompt),
+            "system_prompt_fingerprint": text_fingerprint(system_prompt),
+            "user_message_length": len(user_message),
+            "user_message_fingerprint": text_fingerprint(user_message),
+            "safe_payload": sanitize_for_trace(safe_payload),
+        },
     )
 
     try:
@@ -2349,59 +2506,136 @@ def generate_session_report(
             response_format={"type": "json_object"},
         )
         raw_text = response.choices[0].message.content or ""
+        record_feedback_trace(
+            "llm_raw_response",
+            trace_id=trace_id,
+            session_id=session_id,
+            source=source,
+            payload={
+                "length": len(raw_text),
+                "fingerprint": text_fingerprint(raw_text),
+                "raw_text": raw_text,
+            },
+        )
         dual = _parse_optimal_dual_feedback(raw_text, diagnosis)
+        record_feedback_trace(
+            "llm_parsed_response",
+            trace_id=trace_id,
+            session_id=session_id,
+            source=source,
+            payload={
+                "parsed": summarize_llm_result(
+                    {"score": score, **_dual_to_report_fields(dual, diagnosis)}
+                )
+            },
+        )
+        dual_before_measurement_guard = dict(dual)
         dual = _ensure_report_cites_measurements(dual, diagnosis)
+        result = {"score": score, **_dual_to_report_fields(dual, diagnosis)}
+        record_feedback_trace(
+            "llm_postprocessed_response",
+            trace_id=trace_id,
+            session_id=session_id,
+            source=source,
+            payload={
+                "changed_by_measurement_guard": dual != dual_before_measurement_guard,
+                "result": summarize_llm_result(result),
+            },
+        )
 
         # 【铁律】即便模型幻觉输出了 score，也一律丢弃，强制使用确定性分数
-        return {"score": score, **_dual_to_report_fields(dual, diagnosis)}
+        return result
 
     except Exception as exc:  # noqa: BLE001 - 网络异常/解析失败等都需要兜底
         print(f"【llm_agent】调用 DeepSeek 生成综合报告失败，使用动态数据 Fallback。错误信息：{exc}")
-        return _build_fallback_report(
+        fallback_result = _build_fallback_report(
             hit_stats, total_attempts, deterministic_score=score, diagnosis=diagnosis
         )
+        fallback_reason = f"llm_request_failed:{type(exc).__name__}:{exc}"
+        fallback_result["fallback_reason"] = fallback_reason
+        fallback_result["fallbackReason"] = fallback_reason
+        record_feedback_trace(
+            "llm_fallback_exception",
+            trace_id=trace_id,
+            session_id=session_id,
+            source=source,
+            payload={
+                "error_type": type(exc).__name__,
+                "error_message": str(exc),
+                "score": score,
+                "primary_error_description": primary_error_description,
+                "fallback_result": summarize_llm_result(fallback_result),
+            },
+        )
+        return fallback_result
 
 
 def _ensure_report_cites_measurements(
     report: Optional[dict], diagnosis: Optional[dict]
 ) -> dict:
-    """若模型文案未引用任何实测数字，用动态兜底覆盖，杜绝千篇一律空话。"""
+    """Preserve valid LLM prose and append only missing evidence or protocol details."""
     report = _attach_legacy_aliases(report or {})
-    ctx = build_measurement_context(diagnosis)
-    primary = ctx.get("primary_deduction") or {}
-    measured = str(primary.get("measured_value") or "").strip()
-    total = ctx.get("TotalScore")
-    total_txt = f"{total}" if total is not None else ""
-
-    def _has_digit(text: str) -> bool:
-        return bool(re.search(r"\d", text or ""))
-
-    biomech = report.get("biomechanical_analysis") or ""
-    overview = report.get("overview") or ""
-    magic = report.get("magic_metaphor") or ""
-    cites_ok = (
-        _has_digit(biomech)
-        and _has_digit(overview)
-        and (not measured or measured.split()[0] in biomech or measured in biomech or measured in magic)
-    )
-    if cites_ok and (not total_txt or total_txt in overview or total_txt in biomech):
+    if report.get("aigc_source") != "llm":
         return report
 
-    # 模型空话 / 未引用数据 → 用测量上下文重写，保留 LLM 隐喻若其已含数字
-    fallback = _depth_fallback_report(diagnosis)
-    merged = {
-        "overview": fallback.get("overview") or overview,
-        "biomechanical_analysis": fallback.get("biomechanical_analysis") or biomech,
-        "magic_metaphor": magic if _has_digit(magic) else fallback.get("magic_metaphor"),
-        "action_plan": report.get("action_plan")
-        if _has_digit(report.get("action_plan") or "")
-        else fallback.get("action_plan"),
-        "aigc_source": report.get("aigc_source") or "fallback",
-        "clinical_brief": report.get("clinical_brief"),
-    }
-    if report.get("aigc_source") == "llm":
-        merged["aigc_source"] = "llm_enriched"
-    return _attach_legacy_aliases(merged)
+    ctx = build_measurement_context(diagnosis)
+    total = ctx.get("TotalScore")
+    evidence = _prescription_evidence_from_diagnosis(diagnosis)
+    top = evidence.get("topDeductions") or []
+    primary = top[0] if isinstance(top, list) and top and isinstance(top[0], dict) else {}
+    target = evidence.get("priorityTarget") or {}
+    changed_fields: list[str] = []
+
+    overview = str(report.get("overview") or "").strip()
+    total_token = "" if total is None else f"{float(total):g}"
+    if total_token and total_token not in overview:
+        overview = f"{overview} 数据依据：本次总分{float(total):.1f}分。".strip()
+        changed_fields.append("overview:evidence_appended")
+
+    biomech = str(report.get("biomechanical_analysis") or "").strip()
+    measured = primary.get("measuredValue")
+    measured_token = "" if measured is None else f"{float(measured):g}"
+    if primary and measured_token and measured_token not in biomech:
+        sentence = _primary_evidence_sentence(diagnosis)
+        if sentence:
+            biomech = f"{biomech} {sentence}".strip()
+            changed_fields.append("biomechanical_analysis:evidence_appended")
+
+    action = str(report.get("action_plan") or "").strip()
+    canonical_action = _canonical_priority_action(diagnosis)
+    if canonical_action and isinstance(target, dict):
+        primary_label = str(target.get("label") or "").strip()
+        secondary_labels = [
+            str(item.get("label") or "").strip()
+            for item in top[1:]
+            if isinstance(item, dict) and item.get("label")
+        ]
+        mentions_secondary = any(label and label in action for label in secondary_labels)
+        mentions_primary = bool(primary_label and primary_label in action)
+        has_dosage = bool(re.search(r"\d+\s*(?:组|次|秒|分钟)", action))
+        has_retest = "复测" in action or "目标区" in action or "达标" in action
+        if mentions_secondary:
+            action = canonical_action
+            changed_fields.append("action_plan:restricted_to_priority_target")
+        elif not (mentions_primary and has_dosage and has_retest):
+            action = f"{action} {canonical_action}".strip()
+            changed_fields.append("action_plan:protocol_appended")
+
+    enriched = dict(report)
+    enriched.update(
+        {
+            "overview": overview,
+            "biomechanical_analysis": biomech,
+            "action_plan": action,
+            "aigc_source": "llm_augmented" if changed_fields else "llm",
+            "postprocess_audit": {
+                "policy": "preserve_llm_and_append_missing_evidence",
+                "changedFields": changed_fields,
+                "fallbackUsed": False,
+            },
+        }
+    )
+    return _attach_legacy_aliases(enriched)
 
 
 # --------------------------------------------------------------------------
@@ -2674,45 +2908,104 @@ INDIVIDUAL_SUMMARY_SYSTEM_PROMPT = """你是严谨的高校运动生物力学专
 【输出格式】
 - 只返回合法 JSON，禁止 Markdown 代码围栏。
 - 字段仅允许：
-    1. "strengths"：40-80字，最稳定的生物力学优势（无比喻）；
-    2. "weaknesses"：40-80字，最需纠正的习惯性偏差及厘米级/角度级方向（无比喻、无情绪词）。
+    1. "overallAssessment"：50-100字，总体技术表现和数据可信范围；
+    2. "progressAnalysis"：40-90字，首末变化、波动和趋势；
+    3. "strengths"：40-80字，最稳定的生物力学优势（无比喻）；
+    4. "weaknesses"：40-80字，最需纠正的习惯性偏差及厘米级/角度级方向（无比喻、无情绪词）；
+    5. "prescription"：50-100字，可执行的分解练习顺序和动作要求；
+    6. "dosage"：20-50字，组数、次数、间歇和复测条件。
 - 必须使用简体中文。
 """
 
 
-def _build_fallback_individual_summary(scores, error_counter):
+def _build_fallback_individual_summary(scores, error_counter, longitudinal_summary=None):
     """DeepSeek 接口调用失败或解析失败时的规则化兜底个体总结。"""
     if not scores:
         return {
+            "overallAssessment": "当前A级科研有效样本不足，不能形成可靠的个人总体技术画像。",
+            "progressAnalysis": "缺少可比较的连续有效记录，暂不判断进步或退步趋势。",
             "strengths": "历史测试样本不足，尚无法判定稳定的生物力学优势指标。",
             "weaknesses": "数据不足，暂不能给出针对性纠正区间；需补充完整踢球采样。",
+            "prescription": "补充标准流程下的完整踢球测试，确认画面、关键帧和五维指标均达到A级质量后再制定专项训练。",
+            "dosage": "至少完成3次A级有效测试后复评。",
         }
 
     avg_score = sum(scores) / len(scores)
-    strengths = (
-        "全周期发力稳定性评分维持在较高区间，运动链时序重复性较好。"
-        if avg_score >= 70
-        else "已形成基本的后摆-伸展击球时序，近端到远端的动量传递仍有提升空间。"
+    score_summary = (
+        longitudinal_summary.get("scoreSummary", {})
+        if isinstance(longitudinal_summary, dict)
+        else {}
     )
+    first = score_summary.get("first")
+    latest = score_summary.get("latest")
+    change = score_summary.get("change")
+    if first is not None and latest is not None and len(scores) >= 2:
+        strengths = (
+            f"A级有效尝试综合分由 {float(first):.1f} 变化至 {float(latest):.1f}"
+            f"（变化 {float(change or 0):+.1f} 分）；当前有效样本均分为 {avg_score:.1f}。"
+        )
+    else:
+        strengths = f"当前A级有效样本均分为 {avg_score:.1f}；样本较少，暂不判定稳定趋势。"
+
+    if first is not None and latest is not None and len(scores) >= 2:
+        progress_analysis = (
+            f"首末A级有效评分由 {float(first):.1f} 变为 {float(latest):.1f}，"
+            f"变化 {float(change or 0):+.1f} 分；需结合后续同条件复测确认趋势稳定性。"
+        )
+    else:
+        progress_analysis = "目前仅有少量A级有效记录，尚不足以判断稳定的纵向变化趋势。"
 
     if error_counter:
         top_label = max(error_counter.items(), key=lambda item: item[1])[0]
         weakness_map = {
-            "支撑脚位置偏离": "高频偏差为支撑脚横距失控；落地应约束在球心侧方 15-20 厘米。",
+            "支撑脚位置偏离": "高频偏差为支撑脚横向落位不稳定；训练时按系统当前肩宽归一化标准纠正。",
             "膝关节过度屈曲": "触球膝角偏屈；触球瞬间将摆动腿膝角回调至可控伸展区间。",
             "随摆转髋不足": "髋扭转不足导致角动量传递受限；击球过程完成与助跑方向一致的骨盆旋转。",
             "身体重心偏移": "重心投影偏离支撑基面；击球前先稳定支撑腿刚度再启动摆动腿。",
         }
         weaknesses = weakness_map.get(
-            top_label, f"高频问题集中于「{top_label}」，需在分解练习中做厘米级/角度级定点纠正。"
+            top_label, f"高频问题集中于「{top_label}」，需依据该指标的实测值安排分解练习。"
         )
+        rates = (
+            longitudinal_summary.get("errorRates", {})
+            if isinstance(longitudinal_summary, dict)
+            else {}
+        )
+        if rates.get(top_label) is not None:
+            weaknesses += f" 该问题在A级尝试中的发生率为 {float(rates[top_label]) * 100:.0f}%。"
     else:
         weaknesses = "未形成显著集中的错误分类；维持现有技术结构并定期复查关键角与支撑横距。"
 
-    return {"strengths": strengths, "weaknesses": weaknesses}
+    prescription_map = {
+        "支撑脚位置偏离": "先进行无球支撑脚落点定位，再进行半程助跑击球；每次落脚后暂停检查支撑基面与躯干稳定。",
+        "膝关节过度屈曲": "先进行慢速摆腿伸膝练习，再过渡到半速击球；触球前保持膝关节连续伸展，避免提前收腿。",
+        "随摆转髋不足": "采用半程助跑完成送髋和自然随摆练习；击球后摆动腿继续向目标方向通过，不主动制动。",
+        "身体重心偏移": "先做单脚支撑稳定练习，再衔接低强度击球；支撑腿稳定后再启动摆动腿和骨盆旋转。",
+    }
+    top_label = max(error_counter.items(), key=lambda item: item[1])[0] if error_counter else ""
+    prescription = prescription_map.get(
+        top_label,
+        "按最低五维指标安排慢速分解动作，确认关键位置达标后逐步增加助跑速度，并在同一采集条件下复测。",
+    )
+    return {
+        "overallAssessment": (
+            f"本报告纳入 {len(scores)} 次A级科研有效尝试，综合均分为 {avg_score:.1f}。"
+            "结论仅适用于当前测试流程与有效样本范围。"
+        ),
+        "progressAnalysis": progress_analysis,
+        "strengths": strengths,
+        "weaknesses": weaknesses,
+        "prescription": prescription,
+        "dosage": "每项练习5次为1组，共3组，组间休息30秒；完成3次稳定动作后复测。",
+    }
 
 
-def generate_individual_summary(student_id, score_history, error_counter):
+def generate_individual_summary(
+    student_id,
+    score_history,
+    error_counter,
+    longitudinal_summary=None,
+):
     """调用 DeepSeek 大模型，基于某学生全周期历史评分序列与生物力学错误分类
     出现次数统计，生成结构化的「个体优缺点总结」。
 
@@ -2730,7 +3023,9 @@ def generate_individual_summary(student_id, score_history, error_counter):
     error_counter = error_counter or {}
 
     if not score_history:
-        return _build_fallback_individual_summary(score_history, error_counter)
+        return _build_fallback_individual_summary(
+            score_history, error_counter, longitudinal_summary
+        )
 
     scores_text = " -> ".join(str(s) for s in score_history)
     error_text = (
@@ -2738,11 +3033,21 @@ def generate_individual_summary(student_id, score_history, error_counter):
         or "暂无明显集中的错误分类"
     )
 
+    evidence_text = ""
+    if isinstance(longitudinal_summary, dict):
+        evidence_text = (
+            "确定性纵向证据（仅A级科研有效尝试）："
+            + json.dumps(longitudinal_summary, ensure_ascii=False, default=str)
+            + "。"
+        )
     user_message = (
         f"学生编号：{student_id or '未填写'}。"
         f"该生全周期历史评分序列（从第一次到最近一次）：{scores_text}。"
         f"该生历史错误分类出现次数：{error_text}。"
-        f"禁止比喻与寒暄。严格按系统提示词返回 JSON（strengths / weaknesses）。"
+        f"{evidence_text}"
+        "只引用证据中存在的指标、变化量和时间点；不得把 estimated/default/missing "
+        "描述成直接测量。禁止比喻与寒暄。严格按系统提示词返回 JSON"
+        "（overallAssessment / progressAnalysis / strengths / weaknesses / prescription / dosage）。"
     )
 
     try:
@@ -2757,16 +3062,34 @@ def generate_individual_summary(student_id, score_history, error_counter):
         raw_text = response.choices[0].message.content.strip()
         parsed = json.loads(raw_text)
 
-        strengths = str(parsed["strengths"]).strip()
-        weaknesses = str(parsed["weaknesses"]).strip()
+        fallback = _build_fallback_individual_summary(
+            score_history, error_counter, longitudinal_summary
+        )
+        strengths = str(parsed.get("strengths") or fallback["strengths"]).strip()
+        weaknesses = str(parsed.get("weaknesses") or fallback["weaknesses"]).strip()
         if not strengths or not weaknesses:
             raise ValueError("DeepSeek 返回的个体总结字段为空")
 
-        return {"strengths": strengths, "weaknesses": weaknesses}
+        return {
+            "overallAssessment": str(
+                parsed.get("overallAssessment") or fallback["overallAssessment"]
+            ).strip(),
+            "progressAnalysis": str(
+                parsed.get("progressAnalysis") or fallback["progressAnalysis"]
+            ).strip(),
+            "strengths": strengths,
+            "weaknesses": weaknesses,
+            "prescription": str(
+                parsed.get("prescription") or fallback["prescription"]
+            ).strip(),
+            "dosage": str(parsed.get("dosage") or fallback["dosage"]).strip(),
+        }
 
     except Exception as exc:  # noqa: BLE001 - 网络异常/JSON 解析失败等都需要兜底
         print(f"【llm_agent】调用 DeepSeek 生成个体纵向进化总结失败，使用静态模板 Fallback。错误信息：{exc}")
-        return _build_fallback_individual_summary(score_history, error_counter)
+        return _build_fallback_individual_summary(
+            score_history, error_counter, longitudinal_summary
+        )
 
 
 # --------------------------------------------------------------------------

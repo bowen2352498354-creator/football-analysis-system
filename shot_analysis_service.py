@@ -61,6 +61,7 @@ import numpy as np
 import error_diagnoser
 import pose_tracker as pt
 from session_baseline import stamp_baseline_watermark, get_session_metadata_store
+from workers.auto_shot_capture import AutoShotCaptureEngine
 
 # --------------------------------------------------------------------------
 # 常量（从 api_server.py 迁移；api_server.py 保留同名引用以向下兼容）
@@ -74,6 +75,8 @@ BLACK_FRAME_CONSECUTIVE_LIMIT = 15
 FRAME_PROGRESS_LOG_INTERVAL = 60
 CAMERA_READ_FAIL_LIMIT = 50
 CAMERA_REOPEN_SLEEP_SEC = 0.45
+LIVE_OMEGA_PEAK_THRESHOLD = float(getattr(pt, "SHOT_OMEGA_PEAK_THRESHOLD", 80.0))
+LIVE_POST_PEAK_FRAMES = 8
 
 # --------------------------------------------------------------------------
 # 【动作相位时序切分】五阶段帧索引区间，全部以 t_impact 为绝对基准点做相对偏移。
@@ -196,6 +199,7 @@ class ShotAnalysisPipeline:
         # 【V3.11】YOLO 足球中心轨迹（与帧索引对齐；未检出为 None）
         self._trajectory_ball_px: list[Optional[tuple]] = []
         self._trajectory_ball_diameter_px: list[Optional[float]] = []
+        self._ball_detector_available: bool = False
         # 场地单应性 / pixel→meter 标定器（可选）
         self._field_calibrator: Any = None
         # 射门结果闭环：出球初速度 / 发射仰角
@@ -210,6 +214,40 @@ class ShotAnalysisPipeline:
         self._store_all_blurred_jpeg: bool = source == "file"
         self.t_impact: Optional[int] = None
         self.sync_frame_count: int = 0
+
+        # Phase 1 observability only; these counters never affect scoring.
+        self._reported_frame_count: int = -1
+        self._capture_width: int = 0
+        self._capture_height: int = 0
+        self._analysis_elapsed_sec: float = 0.0
+        self._capture_started_monotonic: Optional[float] = None
+        self._read_failure_count: int = 0
+        self._pose_detected_frame_count: int = 0
+        self._pose_missing_frame_count: int = 0
+        self._pose_error_frame_count: int = 0
+        self._brightness_sum: float = 0.0
+        self._brightness_min: Optional[float] = None
+        self._brightness_max: Optional[float] = None
+        self._focus_sum: float = 0.0
+        self._focus_min: Optional[float] = None
+        self._focus_sample_count: int = 0
+        self._last_frame_monotonic: Optional[float] = None
+        self._frame_intervals_ms: "collections.deque[float]" = collections.deque(
+            maxlen=240
+        )
+        self._t0_quality: str = getattr(
+            pt, "T0_QUALITY_FALLBACK", "fallback_midframe"
+        )
+
+        # Phase 2 dual-channel webcam path: low-latency preview remains on the
+        # current pipeline while privacy-safe frames feed an attempt buffer.
+        self._auto_capture: Optional[AutoShotCaptureEngine] = None
+        self._auto_capture_clips: list[dict] = []
+        self._auto_capture_lock = threading.Lock()
+        self._live_peak_omega_abs: float = 0.0
+        self._live_peak_frame_index: int = -1
+        self._live_frames_since_peak: int = 0
+        self._live_awaiting_post_peak: bool = False
 
         # 【黑屏问题自动诊断】累计推送帧数 + 连续疑似全黑帧计数
         self._pushed_frame_count = 0
@@ -333,8 +371,12 @@ class ShotAnalysisPipeline:
         score_detail: Optional[dict] = None,
         *,
         t_impact: Optional[int] = None,
+        force_impact_frame: bool = False,
     ) -> tuple:
-        """按折叠极值帧 + 摆动腿重建大小腿夹角标注（画面与关键点同源）。
+        """按目标语义重建大小腿夹角标注（画面与关键点同源）。
+
+        ``force_impact_frame=True`` 时只在触球帧及其邻域寻找可用画面；
+        否则优先折叠极值帧，并在不可用时回退触球帧。
 
         返回 ``(frame_bgr|None, metrics|None)``；失败时回退流式 impact_frame。
         """
@@ -345,6 +387,8 @@ class ShotAnalysisPipeline:
         frame_idx, side, label = resolve_leg_annotation_target(
             score_detail, t_impact=t_ref
         )
+        if force_impact_frame:
+            frame_idx = t_ref
         if isinstance(score_detail, dict) and score_detail.get("swing_leg") in (
             "left",
             "right",
@@ -355,7 +399,8 @@ class ShotAnalysisPipeline:
 
         n = len(frames)
         candidates: list[int] = []
-        for base in (frame_idx, t_ref):
+        candidate_bases = (t_ref,) if force_impact_frame else (frame_idx, t_ref)
+        for base in candidate_bases:
             b = int(base)
             if b not in candidates:
                 candidates.append(b)
@@ -428,6 +473,7 @@ class ShotAnalysisPipeline:
             omega_smooth, ankles, ball_coords
         )
         self.t_impact = int(t_impact)
+        self._t0_quality = str(t0_quality)
         safe_print(
             f"【shot_analysis_service】[V2.6] 触球锁帧 t_impact={self.t_impact} "
             f"t0_quality={t0_quality} "
@@ -535,6 +581,219 @@ class ShotAnalysisPipeline:
             "launch_angle_deg": self.launch_angle_deg,
             "meta": dict(self.ball_outcome_meta or {}),
         }
+
+    def get_capture_diagnostics(self) -> dict:
+        """Return bounded capture statistics for the Phase 1 trace."""
+        elapsed = float(self._analysis_elapsed_sec or 0.0)
+        if self._capture_started_monotonic is not None and elapsed <= 0.0:
+            elapsed = max(0.0, time.monotonic() - self._capture_started_monotonic)
+        effective_fps = (
+            float(self.sync_frame_count) / elapsed if elapsed > 0.0 else None
+        )
+        mean_brightness = (
+            self._brightness_sum / float(self.sync_frame_count)
+            if self.sync_frame_count > 0
+            else None
+        )
+        mean_focus = (
+            self._focus_sum / float(self._focus_sample_count)
+            if self._focus_sample_count > 0
+            else None
+        )
+        intervals = list(self._frame_intervals_ms)
+        interval_mean = float(np.mean(intervals)) if intervals else None
+        interval_std = float(np.std(intervals)) if intervals else None
+        interval_cv = (
+            interval_std / interval_mean
+            if interval_mean is not None and interval_mean > 0 and interval_std is not None
+            else None
+        )
+        detected_ball_frames = sum(
+            1 for center in self._trajectory_ball_px if center is not None
+        )
+        ball_frame_count = len(self._trajectory_ball_px)
+        latest_clip = self.get_latest_auto_capture_clip()
+        latest_clip_summary = None
+        if latest_clip is not None:
+            latest_clip_summary = {
+                "filename": latest_clip.get("filename"),
+                "attempt_number": latest_clip.get("attempt_number"),
+                "frame_count": latest_clip.get("frame_count"),
+                "t_impact": latest_clip.get("t_impact"),
+                "ok": bool(latest_clip.get("ok")),
+            }
+        return {
+            "source": self.source,
+            "camera_index": self.camera_index if self.source == "webcam" else None,
+            "declared_fps": round(float(self._video_fps), 3),
+            "effective_processing_fps": round(effective_fps, 3)
+            if effective_fps is not None
+            else None,
+            "resolution": {
+                "width": int(self._capture_width),
+                "height": int(self._capture_height),
+            },
+            "reported_frame_count": int(self._reported_frame_count),
+            "read_frame_count": int(self.sync_frame_count),
+            "read_failure_count": int(self._read_failure_count),
+            "pose_detected_frame_count": int(self._pose_detected_frame_count),
+            "pose_missing_frame_count": int(self._pose_missing_frame_count),
+            "pose_error_frame_count": int(self._pose_error_frame_count),
+            "analysis_elapsed_sec": round(elapsed, 3),
+            "brightness": {
+                "mean": round(mean_brightness, 3)
+                if mean_brightness is not None
+                else None,
+                "min": round(self._brightness_min, 3)
+                if self._brightness_min is not None
+                else None,
+                "max": round(self._brightness_max, 3)
+                if self._brightness_max is not None
+                else None,
+            },
+            "focus": {
+                "method": "variance_of_laplacian",
+                "sample_count": int(self._focus_sample_count),
+                "laplacian_variance_mean": round(mean_focus, 3)
+                if mean_focus is not None
+                else None,
+                "laplacian_variance_min": round(self._focus_min, 3)
+                if self._focus_min is not None
+                else None,
+            },
+            "frame_timing": {
+                "interval_sample_count": len(intervals),
+                "interval_mean_ms": round(interval_mean, 3)
+                if interval_mean is not None
+                else None,
+                "interval_std_ms": round(interval_std, 3)
+                if interval_std is not None
+                else None,
+                "interval_cv": round(interval_cv, 4)
+                if interval_cv is not None
+                else None,
+            },
+            "ball_detection": {
+                "model_available": self._ball_detector_available,
+                "sample_count": ball_frame_count,
+                "detected_frame_count": detected_ball_frames,
+                "detected_frame_ratio": round(
+                    detected_ball_frames / float(ball_frame_count), 4
+                )
+                if ball_frame_count > 0
+                else None,
+            },
+            "impact_signal": {
+                "t_impact": self.t_impact,
+                "t0_quality": self._t0_quality,
+                "peak_angular_velocity_abs": round(
+                    max((abs(float(v)) for v in self._trajectory_omega), default=0.0),
+                    3,
+                ),
+                "impact_is_interior": bool(
+                    self.t_impact is not None
+                    and len(self._trajectory_omega) >= 5
+                    and 1 < int(self.t_impact) < len(self._trajectory_omega) - 2
+                ),
+            },
+            "auto_capture": {
+                "enabled": self._auto_capture is not None,
+                "clip_count": len(self.get_auto_capture_clips()),
+                "latest_clip": latest_clip_summary,
+            },
+        }
+
+    def _on_auto_clip_saved(self, info: dict) -> None:
+        """Store bounded clip metadata and notify the WebSocket consumer."""
+        item = dict(info or {})
+        path = str(item.get("path") or "")
+        if path:
+            item["filename"] = os.path.basename(path)
+        with self._auto_capture_lock:
+            self._auto_capture_clips.append(item)
+        self._push_fn(
+            {
+                "type": "clip_saved",
+                "ok": bool(item.get("ok")),
+                "attempt_number": item.get("attempt_number"),
+                "frame_count": item.get("frame_count"),
+                "t_impact": item.get("t_impact"),
+                "filename": item.get("filename"),
+                "error": item.get("error"),
+            }
+        )
+
+    def get_auto_capture_clips(self) -> list[dict]:
+        with self._auto_capture_lock:
+            return [dict(item) for item in self._auto_capture_clips]
+
+    def get_latest_auto_capture_clip(self) -> Optional[dict]:
+        clips = self.get_auto_capture_clips()
+        for item in reversed(clips):
+            path = str(item.get("path") or "")
+            if item.get("ok") and path and os.path.isfile(path):
+                return item
+        return None
+
+    def _update_live_auto_capture(self, angular_velocity: float, frame_index: int) -> None:
+        """Lock a webcam attempt after a strong angular-velocity peak falls."""
+        engine = self._auto_capture
+        if engine is None or not engine.accepts_impact_triggers():
+            return
+        abs_omega = abs(float(angular_velocity))
+        if (
+            abs_omega >= LIVE_OMEGA_PEAK_THRESHOLD
+            and abs_omega >= self._live_peak_omega_abs
+        ):
+            self._live_peak_omega_abs = abs_omega
+            self._live_peak_frame_index = int(frame_index)
+            self._live_frames_since_peak = 0
+            self._live_awaiting_post_peak = True
+            engine.notify_approach(omega=abs_omega)
+            return
+        if not self._live_awaiting_post_peak:
+            return
+        self._live_frames_since_peak += 1
+        dropped = abs_omega < self._live_peak_omega_abs * 0.45
+        if dropped or self._live_frames_since_peak >= LIVE_POST_PEAK_FRAMES:
+            t_guess = int(self._live_peak_frame_index)
+            self._live_awaiting_post_peak = False
+            self._live_peak_omega_abs = 0.0
+            self._live_peak_frame_index = -1
+            if t_guess >= 0 and engine.notify_impact_locked(t_guess):
+                self.t_impact = t_guess
+
+    def _finalize_auto_capture(self) -> None:
+        """Flush the best webcam attempt and wait for its MP4 to close."""
+        engine = self._auto_capture
+        if engine is None:
+            return
+        if engine.attempt_count == 0:
+            peak_index: Optional[int] = None
+            peak_value = 0.0
+            if self._trajectory_omega:
+                candidate = max(
+                    range(len(self._trajectory_omega)),
+                    key=lambda i: abs(float(self._trajectory_omega[i])),
+                )
+                candidate_value = abs(float(self._trajectory_omega[candidate]))
+                # A non-zero sub-threshold peak still carries useful timing.
+                # All-zero trajectories have no timing evidence, so the engine
+                # uses the newest complete buffer window instead.
+                if candidate_value > 0.01:
+                    peak_index = int(candidate)
+                    peak_value = candidate_value
+            if engine.save_buffered_window(peak_index):
+                if peak_index is not None:
+                    self.t_impact = peak_index
+                safe_print(
+                    "【shot_analysis_service】未检测到可靠射门触发，"
+                    f"已用脱敏滚动缓冲生成兜底回放（peak={peak_value:.2f}）。"
+                )
+        engine.finalize()
+        if not engine.wait_for_pending_save(timeout=8.0):
+            safe_print("【shot_analysis_service】自动切片写盘等待超时，将回退实时轨迹报告。")
+        engine.reset()
 
     def inject_ball_outcome_into_score_detail(self, score_detail: Optional[dict]) -> dict:
         """把球速 / 仰角写入 score_detail 顶层与 indicators。"""
@@ -1014,6 +1273,24 @@ class ShotAnalysisPipeline:
                 return
 
             self._video_fps = float(video_fps) if video_fps and video_fps > 1 else 30.0
+            self._reported_frame_count = int(_reported or 0)
+            self._capture_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+            self._capture_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+            if not is_video_file_mode:
+                self._auto_capture = AutoShotCaptureEngine(
+                    fps=self._video_fps,
+                    pre_frames=max(1, round(1.5 * self._video_fps)),
+                    post_frames=max(1, round(1.0 * self._video_fps)),
+                    cooldown_sec=float(
+                        getattr(pt, "SHOT_IMPACT_COOLDOWN_SEC", 3.5)
+                    ),
+                    filename_prefix=f"web_{self.session_id}",
+                    video_container="webm",
+                    on_log=lambda message: safe_print(
+                        f"【shot_analysis_service】{message}", flush=True
+                    ),
+                    on_clip_saved=self._on_auto_clip_saved,
+                )
             if is_video_file_mode:
                 # 【V2.5】录像分析：固定 Δt，角速度与 MediaPipe 时间戳完全由 fps 决定
                 self._fixed_frame_dt = 1.0 / float(self._video_fps)
@@ -1035,6 +1312,7 @@ class ShotAnalysisPipeline:
                     yolo_model = pt.create_fresh_yolo_model("yolov8n.pt")
                 except Exception:  # noqa: BLE001
                     yolo_model = None
+            self._ball_detector_available = yolo_model is not None
             if yolo_model is None:
                 safe_print(
                     "【shot_analysis_service】提示：YOLO 未就绪，出球初速度将标记为未检出。",
@@ -1043,10 +1321,12 @@ class ShotAnalysisPipeline:
 
             frame_interval_ms = int(round(1000.0 / float(video_fps)))
             frame_timestamp_ms = 0
+            camera_clock_start = time.monotonic()
             self.sync_frame_count = 0
             consecutive_read_fails = 0
             camera_lost_emitted = False
             fps_timestamps: collections.deque = collections.deque(maxlen=60)
+            self._capture_started_monotonic = time.monotonic()
 
             # 【V2.5】同步阻断式 while cap.read()：录像路径严禁跳帧/丢帧
             # 录像文件模式：忽略 stop_event，必须读到 EOF，避免报告竞态截断在 300/414 帧。
@@ -1066,6 +1346,7 @@ class ShotAnalysisPipeline:
                 if _is_empty_or_failed_frame(ret, frame):
                     if is_video_file_mode:
                         if self._pushed_frame_count == 0:
+                            self._read_failure_count += 1
                             failure_reason = (
                                 f"未能从本地视频文件读取到任何一帧画面数据："
                                 f"cv2.VideoCapture 显示已成功打开，但第一次 cap.read() 就直接失败。"
@@ -1084,6 +1365,7 @@ class ShotAnalysisPipeline:
                         break
 
                     # 【Sprint 5】摄像头空帧保护：连续失败达阈值 → camera_lost + release/open 自愈
+                    self._read_failure_count += 1
                     consecutive_read_fails += 1
                     if self._pushed_frame_count == 0 and consecutive_read_fails >= CAMERA_READ_FAIL_LIMIT:
                         # 开场就读不到任何帧：仍按原逻辑报错结束（设备不可用）
@@ -1146,6 +1428,39 @@ class ShotAnalysisPipeline:
 
                 self.sync_frame_count += 1
 
+                frame_monotonic = time.monotonic()
+                if self._last_frame_monotonic is not None:
+                    interval_ms = (
+                        frame_monotonic - self._last_frame_monotonic
+                    ) * 1000.0
+                    if 0.0 < interval_ms < 2000.0:
+                        self._frame_intervals_ms.append(float(interval_ms))
+                self._last_frame_monotonic = frame_monotonic
+
+                if self.sync_frame_count == 1:
+                    self._capture_height, self._capture_width = frame.shape[:2]
+
+                # 摄像头标称 FPS 往往高于 MediaPipe/YOLO 实际采样 FPS。滚动
+                # 缓冲按最近 1 秒真实吞吐校准，保证切片始终约为前 1.5s + 后 1s。
+                now_ts = time.time()
+                fps_timestamps.append(now_ts)
+                while fps_timestamps and (now_ts - fps_timestamps[0]) > 1.0:
+                    fps_timestamps.popleft()
+                live_fps = int(len(fps_timestamps))
+                if (
+                    self._auto_capture is not None
+                    and live_fps >= 5
+                    and self.sync_frame_count % 15 == 0
+                ):
+                    calibrated_fps = float(live_fps)
+                    self._auto_capture.fps = calibrated_fps
+                    self._auto_capture.pre_frames = max(
+                        1, round(1.5 * calibrated_fps)
+                    )
+                    self._auto_capture.post_frames = max(
+                        1, round(1.0 * calibrated_fps)
+                    )
+
                 if not is_video_file_mode:
                     frame = cv2.flip(frame, 1)
 
@@ -1156,6 +1471,31 @@ class ShotAnalysisPipeline:
                 # 这一步只做统计判断，绝不修改 frame 本身，不影响后续任何画面处理。
                 self._pushed_frame_count += 1
                 mean_brightness = float(frame.mean())
+                self._brightness_sum += mean_brightness
+                self._brightness_min = (
+                    mean_brightness
+                    if self._brightness_min is None
+                    else min(self._brightness_min, mean_brightness)
+                )
+                self._brightness_max = (
+                    mean_brightness
+                    if self._brightness_max is None
+                    else max(self._brightness_max, mean_brightness)
+                )
+                # Sampling every third frame keeps the blur metric inexpensive
+                # while still covering the whole attempt.
+                if self.sync_frame_count % 3 == 1:
+                    gray_for_focus = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    focus_value = float(
+                        cv2.Laplacian(gray_for_focus, cv2.CV_64F).var()
+                    )
+                    self._focus_sum += focus_value
+                    self._focus_sample_count += 1
+                    self._focus_min = (
+                        focus_value
+                        if self._focus_min is None
+                        else min(self._focus_min, focus_value)
+                    )
 
                 if self._pushed_frame_count == 1:
                     safe_print(
@@ -1196,7 +1536,13 @@ class ShotAnalysisPipeline:
                 rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
                 # MediaPipe VIDEO 时间戳按真实 fps 递增，杜绝写死 33ms 造成的跨次漂移
-                frame_timestamp_ms += frame_interval_ms
+                if is_video_file_mode:
+                    frame_timestamp_ms += frame_interval_ms
+                else:
+                    elapsed_ms = int(
+                        round((time.monotonic() - camera_clock_start) * 1000.0)
+                    )
+                    frame_timestamp_ms = max(frame_timestamp_ms + 1, elapsed_ms)
                 results = landmarker.detect_for_video(mp_image, frame_timestamp_ms)
 
                 angle_value = None
@@ -1212,6 +1558,7 @@ class ShotAnalysisPipeline:
                 # 明确报错"，因为循环提前 return 之后就再也没有新的画面帧推送过来了。
                 try:
                     if results.pose_landmarks:
+                        self._pose_detected_frame_count += 1
                         landmarks = results.pose_landmarks[0]
                         angle, status, color, hip_px, knee_px, ankle_px = pt.compute_right_knee_diagnosis(
                             frame, landmarks
@@ -1261,6 +1608,15 @@ class ShotAnalysisPipeline:
                         #顺序严格保持：先打码，再捕捉击球关键帧，最后叠加染色骨骼线。
                         frame = pt.apply_facial_anonymization(frame, landmarks)
 
+                        # Phase 2 precision channel: only anonymized, unannotated
+                        # frames enter the rolling buffer used for replay clips.
+                        if self._auto_capture is not None:
+                            frame_index = self.sync_frame_count - 1
+                            self._auto_capture.push_frame(frame, frame_index)
+                            self._update_live_auto_capture(
+                                angular_velocity, frame_index
+                            )
+
                         # 脱敏帧入缓存（报告阶段按折叠极值帧重取画面）
                         self._cache_blurred_frame(self.sync_frame_count - 1, frame)
 
@@ -1301,6 +1657,7 @@ class ShotAnalysisPipeline:
                         with self._records_lock:
                             self.records.append(record)
                     else:
+                        self._pose_missing_frame_count += 1
                         # 无姿态帧：仍计入同步帧序列长度，用中性值填轨迹以保持索引对齐
                         self._trajectory_angles.append(
                             float(self._trajectory_angles[-1]) if self._trajectory_angles else 150.0
@@ -1317,6 +1674,7 @@ class ShotAnalysisPipeline:
                         self._trajectory_pose_frames.append(pt.empty_pose_frame_record(ts_sec))
 
                 except Exception as diagnosis_exc:  # noqa: BLE001 - 单帧诊断异常绝不能打断整条视频流
+                    self._pose_error_frame_count += 1
                     safe_print(f"【shot_analysis_service】单帧姿态诊断/角速度计算发生异常（已跳过该帧诊断信息，画面仍会继续推送）：{diagnosis_exc}")
                     angle_value = None
                     status_value = None
@@ -1342,7 +1700,11 @@ class ShotAnalysisPipeline:
                     scale = MAX_TRANSMIT_WIDTH / width
                     frame = cv2.resize(frame, (MAX_TRANSMIT_WIDTH, int(height * scale)))
 
-                ok, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+                # cv2.imencode 接收 OpenCV 的 BGR 帧并按标准 JPEG 色彩写出；
+                # 浏览器解码后会得到正确 RGB。此处不可预先交换红蓝通道。
+                ok, buffer = cv2.imencode(
+                    ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
+                )
                 if not ok:
                     safe_print("【shot_analysis_service】警告：本帧 JPEG 编码失败，已跳过，不影响后续帧的实时推送。")
                     continue
@@ -1351,13 +1713,6 @@ class ShotAnalysisPipeline:
                 # 【规范格式防呆】显式拼接标准的 data URI 前缀，确保前端 <img src={...}>
                 # 拿到的永远是浏览器能够直接识别渲染的合法 "data:image/jpeg;base64,xxxx" 格式。
                 image_data_uri = f"data:image/jpeg;base64,{base64_jpeg}"
-
-                # Sprint 5：近 1 秒到达帧数 → 推流 FPS，供 Ghost Monitor 浮层显示
-                now_ts = time.time()
-                fps_timestamps.append(now_ts)
-                while fps_timestamps and (now_ts - fps_timestamps[0]) > 1.0:
-                    fps_timestamps.popleft()
-                live_fps = int(len(fps_timestamps))
 
                 self._push_fn({
                     "type": "frame",
@@ -1389,6 +1744,17 @@ class ShotAnalysisPipeline:
             self._push_fn({"type": "error", "message": f"后台推理线程发生异常：{exc}"})
 
         finally:
+            if self._auto_capture is not None:
+                try:
+                    self._finalize_auto_capture()
+                except Exception as capture_exc:  # noqa: BLE001
+                    safe_print(
+                        f"【shot_analysis_service】自动切片收尾失败，回退实时轨迹：{capture_exc}"
+                    )
+            if self._capture_started_monotonic is not None:
+                self._analysis_elapsed_sec = max(
+                    0.0, time.monotonic() - self._capture_started_monotonic
+                )
             if cap is not None:
                 cap.release()
             if landmarker is not None:

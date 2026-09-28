@@ -1,5 +1,5 @@
 import { useMemo, useState, type ReactNode } from 'react'
-import { Filter, Sparkles } from 'lucide-react'
+import { Crosshair, Filter, Sparkles } from 'lucide-react'
 import {
   DeductionList,
   ERROR_CODE_LABELS,
@@ -125,6 +125,14 @@ export default function AIAssistantPanel({
     report?.aigcSource ||
     ''
   ).toLowerCase()
+  const prescriptionEvidence =
+    report?.prescriptionEvidence || report?.prescription_evidence || null
+  const priorityTarget =
+    report?.priorityTarget || report?.priority_target || prescriptionEvidence?.priorityTarget || null
+  const priorityMeasurement = priorityTarget
+    ? `${priorityTarget.measuredValue ?? '未测'}${priorityTarget.unit || ''}`
+    : ''
+  const priorityStandard = priorityTarget?.standardRange?.text || '目标区'
   const liveStatusText = !report ? (displayText || '').trim() : ''
 
   const filterCount = (id: DefectFilterId): number => {
@@ -214,6 +222,24 @@ export default function AIAssistantPanel({
                   </div>
                 )}
 
+                {priorityTarget && (
+                  <div className="rounded-lg border border-cyan-400/40 bg-cyan-500/10 px-3 py-2.5">
+                    <div className="mb-1.5 flex items-center gap-1.5 text-[10px] font-semibold text-cyan-200">
+                      <Crosshair className="h-3.5 w-3.5" />
+                      本次唯一优先目标
+                    </div>
+                    <p className="text-[13px] font-semibold text-slate-100">
+                      {priorityTarget.label} · {priorityTarget.exercise}
+                    </p>
+                    <p className="mt-1 text-[11px] leading-relaxed text-slate-300">
+                      实测 {priorityMeasurement}，目标 {priorityStandard}，{priorityTarget.deviationDirection}。
+                    </p>
+                    <p className="mt-1 text-[11px] leading-relaxed text-cyan-100">
+                      {priorityTarget.cue}；{priorityTarget.dosage}；{priorityTarget.retestCriterion}。
+                    </p>
+                  </div>
+                )}
+
                 {(overviewText || aigcSource) && (
                   <div className="rounded-lg border border-slate-600/70 bg-slate-900/50 px-3 py-2">
                     <div className="mb-1 flex items-center justify-between gap-2">
@@ -223,12 +249,16 @@ export default function AIAssistantPanel({
                       {aigcSource && (
                         <span
                           className={`rounded px-1.5 py-0.5 text-[9px] font-medium ${
-                            aigcSource === 'llm'
+                            aigcSource.startsWith('llm')
                               ? 'bg-sky-500/20 text-sky-200'
                               : 'bg-slate-600/40 text-slate-300'
                           }`}
                         >
-                          {aigcSource === 'llm' ? 'AI 解读' : '模板兜底'}
+                          {aigcSource === 'llm_augmented'
+                            ? 'AI 解读 + 数据补证'
+                            : aigcSource.startsWith('llm')
+                              ? 'AI 解读'
+                              : '模板兜底'}
                         </span>
                       )}
                     </div>

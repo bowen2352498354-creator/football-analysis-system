@@ -263,3 +263,53 @@ def test_checkpoint_meta_reports_fps_derived_values(tmp_path: Path):
     assert meta.get("buffer_frames_persisted") is False
     for key, value in meta.items():
         assert isinstance(value, (int, float, str, bool)), f"{key} 疑似承载像素数据"
+
+
+def test_unique_filename_prefix_and_pending_save_barrier(tmp_path: Path):
+    saved: list[dict] = []
+    engine = AutoShotCaptureEngine(
+        output_dir=str(tmp_path),
+        fps=30.0,
+        pre_frames=2,
+        post_frames=1,
+        cooldown_sec=0.0,
+        filename_prefix="web_session-abc",
+        on_clip_saved=lambda info: saved.append(info),
+    )
+    for index in range(6):
+        engine.push_frame(_fake_frame(index), index)
+    engine.notify_approach(omega=120.0)
+    engine.notify_impact_locked(4)
+    assert engine.wait_for_pending_save(timeout=3.0) is True
+    assert saved and saved[0]["ok"] is True
+    assert os.path.basename(saved[0]["path"]).startswith("web_session-abc_")
+
+
+def test_session_end_fallback_saves_latest_buffer_window(tmp_path: Path):
+    saved: list[dict] = []
+    engine = AutoShotCaptureEngine(
+        output_dir=str(tmp_path),
+        fps=10.0,
+        pre_frames=4,
+        post_frames=2,
+        cooldown_sec=0.0,
+        filename_prefix="web_fallback",
+        on_clip_saved=lambda info: saved.append(info),
+    )
+    for index in range(20):
+        engine.push_frame(_fake_frame(index), index)
+
+    assert engine.save_buffered_window() is True
+    assert engine.wait_for_pending_save(timeout=3.0) is True
+    assert saved and saved[0]["ok"] is True
+    assert saved[0]["t_impact"] == 17
+    assert saved[0]["frame_count"] == 7
+
+
+def test_web_capture_uses_browser_compatible_container(tmp_path: Path):
+    engine = AutoShotCaptureEngine(
+        output_dir=str(tmp_path),
+        filename_prefix="web_browser",
+        video_container="webm",
+    )
+    assert engine._build_clip_filename(2).endswith("attempt_2.webm")

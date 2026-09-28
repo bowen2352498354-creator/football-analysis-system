@@ -184,8 +184,8 @@ _SCORING_BAND_FALLBACK: dict[str, tuple[float, ...]] = {
     # folding depth（XY-2D）：70–100 绿；55–120 黄带；外红
     "max_folding_angle": (70.0, 100.0, 55.0, 120.0, 85.0),
     "whipping_velocity": (450.0, 320.0, 0.55),
-    # 触球膝角：仅 >165° 进入直腿黄/红带
-    "impact_knee_angle": (135.0, 165.0, 120.0, 172.0, 150.0),
+    # 论文冻结口径：140–160° 绿；130–170° 黄带外沿
+    "impact_knee_angle": (140.0, 160.0, 130.0, 170.0, 150.0),
     "support_knee_angle": (135.0, 170.0, 120.0, 175.0, 155.0),
     "hip_torsion_angle": (15.0, 40.0, 5.0, 55.0, 25.0),
 }
@@ -1104,7 +1104,9 @@ class DeterministicScorer:
         ankle_deflection = 0.0
         stiffness_status = ANKLE_STIFFNESS_LOCKED
         ankle_dorsi_drop: Optional[float] = None
-        ankle_half_frames = int(ANKLE_DEFLECTION_HALF_WINDOW_FRAMES)
+        ankle_half_frames = int(
+            ankle_half_window_frames(video_fps, ankle_half_ms)
+        )
 
         precomputed_window = impact_frame_data.get("ankle_angles_window") or trajectory_data.get(
             "ankle_angles_window"
@@ -1272,13 +1274,11 @@ class DeterministicScorer:
         if kinematic_guards.get("distance_clamped") and st_dist == STATUS_GREEN:
             st_dist = STATUS_YELLOW
 
-        # 【T0 精度等级】fallback_midframe 时 T0 定位精度不足（无抛物线三点），
-        # 放宽膝关节黄灯阈值 ±5°，避免因帧级抖动触发误扣分
+        # T0 质量不足由质量门控降级报告，不得暗改论文冻结的触球膝角阈值。
+        # 支撑膝并非本次冻结指标，仍保留原有的 ±5° 测量容错。
         _T0_FALLBACK_KNEE_SLACK = 5.0
         _t0_quality = (impact_frame_data.get("t0_quality") or "")
         if _t0_quality == "fallback_midframe":
-            ik_yl = ik_yl - _T0_FALLBACK_KNEE_SLACK
-            ik_yh = ik_yh + _T0_FALLBACK_KNEE_SLACK
             sk_yl = sk_yl - _T0_FALLBACK_KNEE_SLACK
             sk_yh = sk_yh + _T0_FALLBACK_KNEE_SLACK
 

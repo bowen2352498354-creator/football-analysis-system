@@ -9,7 +9,9 @@ node_modules/
 
 # ignore auto-generated local report/data files, keep only source code tracked
 student feedback report/
+report-assets/
 academic_data_export/
+gold_standard_data/
 telestration_annotations/
 *.docx
 *.csv
@@ -40,8 +42,10 @@ __pycache__/
 # 忽略临时媒体文件与生成的科研报告，坚守隐私伦理红线
 uploads/
 video/
+auto_capture_clips/
 student feedback report/
 *.mp4
+*.webm
 *.MOV
 *.mov
 *.docx

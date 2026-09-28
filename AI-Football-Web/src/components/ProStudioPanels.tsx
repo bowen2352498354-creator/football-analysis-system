@@ -29,7 +29,7 @@ function foldingDepthToSwingInterior(foldingDepth: number): number {
 /**
  * 按实测值选择错误码，杜绝「测得 120° 却挂 >170° 直腿文案」的错位。
  * - max_folding_angle：深度过小（膝内角 >140）→ B1；过大（膝内角 <70）→ SWING_FOLD
- * - impact_knee_angle：仅 >165° → B1 直腿；其余 → KNEE_STIFF
+ * - impact_knee_angle：按后端冻结的 140–160° 绿带判定
  * - distance_cm：肩宽比 >0.9 → A2 严重偏宽；否则 SUPPORT_LATERAL
  */
 function resolveIndicatorErrorCode(
@@ -212,7 +212,7 @@ export const ERROR_CODE_LABELS: Record<string, string> = {
   ERR_WARMUP_CLOSE: '支撑脚距球心过近（<5cm）',
   ERR_A1_SUPPORT_BACK: '支撑脚尖落后球心超过 10cm',
   ERR_A2_SUPPORT_WIDE: '支撑脚横距比例过远（>0.9 个肩宽，严重外挂）',
-  ERR_B1_STRAIGHT_LEG: '后摆/触球膝角过大：后摆膝内角>140° 或触球膝角>165°（折叠不足/直腿）',
+  ERR_B1_STRAIGHT_LEG: '后摆/触球膝角过大：后摆膝内角>140° 或触球膝角>160°（折叠不足/直腿）',
   ERR_B2_SHANK_ONLY: '浅折叠且大腿后伸≈0°（仅小腿弹射；90–130° 合理区不触发）',
   ERR_C1_LOOSE_ANKLE: '击球窗踝关节松弛泄力（方差/背屈骤降超标）',
   ERR_C2_TOE_POKE: '足背未外展，脚尖直捅球体',
@@ -221,7 +221,7 @@ export const ERROR_CODE_LABELS: Record<string, string> = {
   ERR_SUPPORT_LATERAL: '支撑脚横距比例略偏（理想约 0.4–0.7 个肩宽）',
   ERR_SUPPORT_TOO_CLOSE: '支撑脚横距比例过近（<0.25 个肩宽）',
   ERR_SUPPORT_AP: '支撑脚尖相对球心前后位置不合理',
-  ERR_KNEE_STIFF: '触球/支撑膝角偏离缓冲带（触球直腿仅 >165° 触发）',
+  ERR_KNEE_STIFF: '触球/支撑膝角偏离缓冲带（触球膝角绿带 140–160°）',
   ERR_SWING_FOLD: '后摆折叠偏离 90–130° 合理发力区（过度折叠或略浅）',
   ERR_TORSO_TILT: '躯干侧倾角度不合理（僵硬直立或侧倾失衡）',
   ERR_ANKLE_LOOSE: '触球瞬间踝关节未绷紧锁死，力量在此环节泄漏',

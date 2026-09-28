@@ -11,12 +11,11 @@ import {
   Trash2,
   Users,
   X,
-  FileText,
   ClipboardList,
   Eye,
   Wrench,
 } from 'lucide-react'
-import { normalizeRadarScores, FIVE_D_DIMENSIONS } from './BiomechanicalRadar'
+import AttemptReportDrawer from './AttemptReportDrawer'
 import type {
   CoachCalibrateMetricKey,
   CoachRecordsResponse,
@@ -46,7 +45,7 @@ interface CoachDataSanitizerGridProps {
   className?: string
 }
 
-type GroupFilter = 'all' | 'realtime' | 'delayed'
+type GroupFilter = 'all' | 'realtime' | 'delayed' | 'control'
 
 const EMPTY_RADAR: RadarAverageScores = {
   approach_rhythm: null,
@@ -66,6 +65,7 @@ function groupLabel(record: CoachSanitizerRecord): string {
   const type = String(record.type || '').toLowerCase()
   if (type === 'realtime' || record.groupTypeCode === 1) return '实时 A 组'
   if (type === 'delayed' || record.groupTypeCode === 2) return '延时 B 组'
+  if (type === 'control' || record.groupTypeCode === 3) return '无反馈 C 组'
   return record.classGroup || '未分组'
 }
 
@@ -345,10 +345,6 @@ export default function CoachDataSanitizerGrid({
 
   // compact 查看态：时间 / 总分 / 诊断摘要 / 查看；管理态额外多选与删除
   const colSpan = compact ? (showManageControls ? 6 : 4) : 8
-  const detailRadar = detailTarget
-    ? normalizeRadarScores(detailTarget.quantified5dScores ?? detailTarget.radar_scores)
-    : null
-
   return (
     <section
       className={`flex min-h-0 flex-col rounded-3xl border border-white/10 bg-white/5 p-4 backdrop-blur-xl ${
@@ -468,6 +464,7 @@ export default function CoachDataSanitizerGrid({
                 <option value="all">全部组别</option>
                 <option value="realtime">实时反馈 A 组</option>
                 <option value="delayed">延时反馈 B 组</option>
+                <option value="control">无反馈采集 C 组</option>
               </select>
             </label>
           </>
@@ -685,121 +682,11 @@ export default function CoachDataSanitizerGrid({
       {/* 详情 Drawer / Modal */}
       <AnimatePresence>
         {detailTarget && (
-          <motion.div
-            className="fixed inset-0 z-[70] flex justify-end bg-black/55 backdrop-blur-sm"
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            onClick={() => setDetailTarget(null)}
-          >
-            <motion.aside
-              role="dialog"
-              aria-modal="true"
-              initial={{ x: 36, opacity: 0 }}
-              animate={{ x: 0, opacity: 1 }}
-              exit={{ x: 36, opacity: 0 }}
-              transition={{ type: 'spring', stiffness: 360, damping: 30 }}
-              className="relative flex h-full w-full max-w-md flex-col border-l border-white/10 bg-zinc-950/96 shadow-2xl"
-              onClick={(e) => e.stopPropagation()}
-            >
-              <div className="flex items-start justify-between gap-3 border-b border-white/10 px-5 py-4">
-                <div>
-                  <h3 className="flex items-center gap-2 text-base font-semibold text-white">
-                    <FileText className="h-4 w-4 text-sky-300" />
-                    {compact ? '个人尝试详情' : '尝试诊断报告'}
-                  </h3>
-                  <p className="mt-1 text-xs text-white/40">
-                    {detailTarget.studentId || '—'} · {detailTarget.timestamp || detailTarget.testDate || '未知时间'}
-                  </p>
-                </div>
-                <button
-                  type="button"
-                  className="rounded-full p-1.5 text-white/40 hover:bg-white/10 hover:text-white"
-                  onClick={() => setDetailTarget(null)}
-                >
-                  <X className="h-4 w-4" />
-                </button>
-              </div>
-
-              <div className="flex-1 space-y-4 overflow-y-auto px-5 py-4 scrollbar-thin scrollbar-thumb-slate-700">
-                <div className="rounded-2xl border border-white/8 bg-white/[0.03] p-4">
-                  <p className="text-[11px] text-white/40">综合总分</p>
-                  <p className="mt-1 text-3xl font-bold tabular-nums text-amber-200">
-                    {typeof detailTarget.score === 'number' ? detailTarget.score : '—'}
-                    <span className="ml-1 text-sm font-medium text-white/30">/ 100</span>
-                  </p>
-                </div>
-
-                {(detailTarget.biomechanicalErrors?.length ?? 0) > 0 && (
-                  <div>
-                    <p className="mb-2 text-[11px] font-medium text-white/45">生物力学错误标签</p>
-                    <div className="flex flex-wrap gap-1.5">
-                      {detailTarget.biomechanicalErrors!.map((err) => (
-                        <span
-                          key={err}
-                          className="rounded-lg bg-rose-500/15 px-2 py-1 text-[11px] text-rose-200 ring-1 ring-rose-400/25"
-                        >
-                          {err}
-                        </span>
-                      ))}
-                    </div>
-                  </div>
-                )}
-
-                <div>
-                  <p className="mb-2 text-[11px] font-medium text-white/45">五维雷达（本趟）</p>
-                  <div className="grid grid-cols-1 gap-2">
-                    {FIVE_D_DIMENSIONS.map((dim) => {
-                      const value = detailRadar ? detailRadar[dim.key] : null
-                      return (
-                        <div
-                          key={dim.key}
-                          className="flex items-center justify-between rounded-xl bg-black/30 px-3 py-2 text-xs"
-                        >
-                          <span className="text-white/60">{dim.label}</span>
-                          <span className="font-semibold tabular-nums text-emerald-300">
-                            {typeof value === 'number' ? value : '—'}
-                            <span className="text-white/30"> / 20</span>
-                          </span>
-                        </div>
-                      )
-                    })}
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-2 gap-2 text-xs">
-                  <div className="rounded-xl bg-black/30 px-3 py-2">
-                    <p className="text-white/35">膝屈曲角</p>
-                    <p className="mt-0.5 font-semibold text-white/80">
-                      {typeof detailTarget.kneeFlexionAngle === 'number'
-                        ? `${detailTarget.kneeFlexionAngle}°`
-                        : '—'}
-                    </p>
-                  </div>
-                  <div className="rounded-xl bg-black/30 px-3 py-2">
-                    <p className="text-white/35">支撑脚横距比例</p>
-                    <p className="mt-0.5 font-semibold text-white/80">
-                      {typeof detailTarget.support_ratio === 'number'
-                        ? `支撑脚横距比例 ${detailTarget.support_ratio.toFixed(2)}`
-                        : typeof detailTarget.supportRatio === 'number'
-                          ? `支撑脚横距比例 ${detailTarget.supportRatio.toFixed(2)}`
-                          : typeof detailTarget.supportFootDistance === 'number' &&
-                              detailTarget.supportFootDistance <= 3.5
-                            ? `支撑脚横距比例 ${detailTarget.supportFootDistance.toFixed(2)}`
-                            : '—'}
-                    </p>
-                  </div>
-                </div>
-
-                <div>
-                  <p className="mb-2 text-[11px] font-medium text-white/45">AI 诊断批注</p>
-                  <p className="whitespace-pre-wrap rounded-2xl border border-white/8 bg-black/25 px-3 py-3 text-sm leading-relaxed text-white/70">
-                    {detailTarget.aiFeedback || detailTarget.diagnosisSnapshot || '（无诊断批注）'}
-                  </p>
-                </div>
-              </div>
-            </motion.aside>
-          </motion.div>
+          <AttemptReportDrawer
+            recordId={detailTarget.id}
+            fallbackRecord={detailTarget}
+            onClose={() => setDetailTarget(null)}
+          />
         )}
       </AnimatePresence>
 

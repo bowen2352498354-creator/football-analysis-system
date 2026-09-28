@@ -15,6 +15,7 @@ workers/auto_shot_capture.py
 from __future__ import annotations
 
 import os
+import re
 import threading
 import time
 from collections import deque
@@ -168,6 +169,8 @@ class AutoShotCaptureEngine:
         on_log: Optional[LogFn] = None,
         on_state_change: Optional[StateChangeFn] = None,
         on_clip_saved: Optional[ClipSavedFn] = None,
+        filename_prefix: str = "session",
+        video_container: str = "mp4",
     ) -> None:
         self.output_dir = output_dir or DEFAULT_AUTO_CLIP_DIR
         self.session_date = session_date or date.today()
@@ -204,6 +207,12 @@ class AutoShotCaptureEngine:
         self._on_log = on_log
         self._on_state_change = on_state_change
         self._on_clip_saved = on_clip_saved
+        safe_prefix = re.sub(r"[^A-Za-z0-9_-]+", "_", str(filename_prefix or "session"))
+        self._filename_prefix = safe_prefix.strip("_") or "session"
+        requested_container = str(video_container or "mp4").strip().lower()
+        self._video_container = "webm" if requested_container == "webm" else "mp4"
+        self._save_done_event = threading.Event()
+        self._save_done_event.set()
 
         os.makedirs(self.output_dir, exist_ok=True)
 
@@ -362,6 +371,48 @@ class AutoShotCaptureEngine:
         elif state == ShotFsmState.APPROACH:
             self.notify_discard("session_end")
 
+    def wait_for_pending_save(self, timeout: float = 8.0) -> bool:
+        """Wait until the asynchronous VideoWriter has closed its output file."""
+        return bool(self._save_done_event.wait(timeout=max(0.0, float(timeout))))
+
+    def save_buffered_window(self, t_impact: Optional[int] = None) -> bool:
+        """Force one privacy-safe clip from the current rolling buffer.
+
+        This is the webcam fail-safe used when pose-derived angular velocity is
+        unavailable.  A supplied impact index is clamped to the buffered range;
+        without one, the window ends at the newest frame so a user can stop the
+        session immediately after the shot and still receive a replay.
+        """
+        if self._save_in_flight or not self._buffer:
+            return False
+
+        first = int(self._buffer[0].frame_index)
+        latest_bf = self._buffer.latest
+        if latest_bf is None:
+            return False
+        latest = int(latest_bf.frame_index)
+
+        # Prefer a full pre/post window whenever the buffer is long enough.
+        center_lo = first + int(self.pre_frames)
+        center_hi = latest - int(self.post_frames)
+        if center_lo <= center_hi:
+            preferred = center_hi if t_impact is None else int(t_impact)
+            target = max(center_lo, min(center_hi, preferred))
+        else:
+            preferred = latest if t_impact is None else int(t_impact)
+            target = max(first, min(latest, preferred))
+
+        with self._state_lock:
+            if self._state not in (ShotFsmState.IDLE, ShotFsmState.APPROACH):
+                return False
+        if self.state == ShotFsmState.IDLE:
+            self.notify_approach()
+        self._log(
+            f"会话收尾兜底：从脱敏缓冲强制生成动作窗，"
+            f"target=#{target}，buffer=#{first}..#{latest}。"
+        )
+        return self.notify_impact_locked(target)
+
     def notify_approach(self, *, omega: Optional[float] = None) -> bool:
         """检测到助跑发力（角速度峰）→ IDLE → APPROACH。"""
         if not self.accepts_impact_triggers():
@@ -461,10 +512,12 @@ class AutoShotCaptureEngine:
         if self._save_in_flight:
             return
         self._save_in_flight = True
+        self._save_done_event.clear()
 
         frames = self._slice_core_window(t_impact)
         if not frames:
             self._save_in_flight = False
+            self._save_done_event.set()
             self._locked_t_impact = None
             self._transition(ShotFsmState.IDLE)
             self._log("落盘取消：滚动缓冲中无可用帧（可能会话刚启动）。")
@@ -510,7 +563,10 @@ class AutoShotCaptureEngine:
 
     def _build_clip_filename(self, attempt_n: int) -> str:
         date_token = self.session_date.strftime("%Y%m%d")
-        return f"session_{date_token}_attempt_{attempt_n}.mp4"
+        return (
+            f"{self._filename_prefix}_{date_token}_attempt_{attempt_n}."
+            f"{self._video_container}"
+        )
 
     def _write_clip_thread(
         self,
@@ -524,7 +580,7 @@ class AutoShotCaptureEngine:
         error: Optional[str] = None
         frame_count = len(frames)
         try:
-            ok = self._write_mp4(frames, out_path, fps)
+            ok = self._write_video(frames, out_path, fps)
             if not ok:
                 error = "VideoWriter 打开或写入失败"
         except Exception as exc:  # noqa: BLE001 - 写盘失败绝不能拖死推理环
@@ -558,12 +614,14 @@ class AutoShotCaptureEngine:
                 )
             except Exception:  # noqa: BLE001
                 pass
+        self._save_done_event.set()
 
     @staticmethod
-    def _write_mp4(frames: Sequence[np.ndarray], out_path: str, fps: float) -> bool:
+    def _write_video(frames: Sequence[np.ndarray], out_path: str, fps: float) -> bool:
         """将缓冲帧写入 Attempt 切片。
 
         调用方保证 ``frames`` 均已通过管道最前端的面部脱敏拦截器；
+        Web 通道使用浏览器原生支持的 WebM/VP8；桌面归档继续使用 MP4V。
         本方法只负责编码，不再接触原始带脸画面。
         """
         if not frames:
@@ -572,20 +630,33 @@ class AutoShotCaptureEngine:
         if h <= 0 or w <= 0:
             return False
         os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(out_path, fourcc, float(fps), (int(w), int(h)))
-        if not writer.isOpened():
-            return False
-        try:
-            for frame in frames:
-                if frame is None or frame.size == 0:
-                    continue
-                if frame.shape[0] != h or frame.shape[1] != w:
-                    frame = cv2.resize(frame, (w, h))
-                writer.write(frame)
-        finally:
-            writer.release()
-        return os.path.isfile(out_path) and os.path.getsize(out_path) > 0
+        suffix = os.path.splitext(out_path)[1].lower()
+        codecs = ("VP80", "VP90") if suffix == ".webm" else ("mp4v",)
+        for codec in codecs:
+            if os.path.exists(out_path):
+                try:
+                    os.remove(out_path)
+                except OSError:
+                    pass
+            fourcc = cv2.VideoWriter_fourcc(*codec)
+            writer = cv2.VideoWriter(
+                out_path, fourcc, float(fps), (int(w), int(h))
+            )
+            if not writer.isOpened():
+                writer.release()
+                continue
+            try:
+                for frame in frames:
+                    if frame is None or frame.size == 0:
+                        continue
+                    if frame.shape[0] != h or frame.shape[1] != w:
+                        frame = cv2.resize(frame, (w, h))
+                    writer.write(frame)
+            finally:
+                writer.release()
+            if os.path.isfile(out_path) and os.path.getsize(out_path) > 0:
+                return True
+        return False
 
     # ------------------------------------------------------------------
     # 内部工具

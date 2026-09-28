@@ -124,13 +124,15 @@ def test_pose_tracker_10pct_dropout_stream_stable():
         assert status in ("Green", "Yellow", "Red")
 
 
-def test_judge_knee_status_threshold_unchanged():
-    """三色判定阈值 V3.5：135–165 绿；仅 >165 进直腿黄/红带。"""
+def test_judge_knee_status_uses_thesis_frozen_threshold():
+    """论文冻结口径：140–160 绿；130–170 为黄带外沿。"""
     assert judge_knee_status(150)[0] == "Green"
-    assert judge_knee_status(135)[0] == "Green"
-    assert judge_knee_status(166)[0] == "Yellow"
-    assert judge_knee_status(120)[0] == "Yellow"
-    assert judge_knee_status(110)[0] == "Red"
+    assert judge_knee_status(140)[0] == "Green"
+    assert judge_knee_status(160)[0] == "Green"
+    assert judge_knee_status(130)[0] == "Yellow"
+    assert judge_knee_status(170)[0] == "Yellow"
+    assert judge_knee_status(129.9)[0] == "Red"
+    assert judge_knee_status(170.1)[0] == "Red"
     assert judge_knee_status(None)[0] == "Red"
 
 
@@ -171,11 +173,11 @@ def test_roi_folding_survives_missing_joint_frames():
     """ROI 折叠角：中间帧缺踝仍可经补帧得到极值。"""
     frames = []
     for i in range(10):
-        # 关节点放在 Y-Z 矢状面（膝角算法已废弃纯 XY/3D arccos）
+        # 关节点放在权威 X-Y 图像平面，膝内角 90°、折叠深度 90°。
         rec = {
-            "right_hip": [0.0, 1.0, 0.0],
+            "right_hip": [0.0, -1.0, 0.0],
             "right_knee": [0.0, 0.0, 0.0],
-            "right_ankle": [0.0, 0.0, 0.5],
+            "right_ankle": [1.0, 0.0, 0.0],
             "visibility": {
                 "right_hip": 1.0,
                 "right_knee": 1.0,
@@ -190,6 +192,7 @@ def test_roi_folding_survives_missing_joint_frames():
     assert ok is True
     assert fold is not None
     assert np.isfinite(fold)
+    assert fold == pytest.approx(90.0)
 
 
 # ---------------------------------------------------------------------------

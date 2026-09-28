@@ -1,0 +1,12 @@
+{
+  "schema_version": 3,
+  "threshold_version": "THESIS_KNEE_140_160_V1",
+  "population": "youth_amateur_v35",
+  "impact_knee_angle_deg": {
+    "green_low": 140.0,
+    "green_high": 160.0,
+    "yellow_low": 130.0,
+    "yellow_high": 170.0,
+    "fallback": 150.0
+  }
+}

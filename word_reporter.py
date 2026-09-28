@@ -89,6 +89,7 @@ from docx.shared import Inches, Pt, RGBColor
 
 _MODE_REALTIME_LABEL = "\u5b9e\u65f6\u53cd\u9988"  # ????
 _MODE_DELAYED_LABEL = "\u5ef6\u65f6\u53cd\u9988"  # ????
+_MODE_CONTROL_LABEL = "\u65e0\u53cd\u9988\u91c7\u96c6"  # 无反馈采集
 
 _FONT_HEADING_EASTASIA = "\u9ed1\u4f53"  # ??
 _FONT_BODY_EASTASIA = "\u5fae\u8f6f\u96c5\u9ed1"  # ????
@@ -218,6 +219,7 @@ REPORT_ROOT_DIR = os.path.join(SCRIPT_DIR, "student feedback report")
 MODE_FOLDER_NAME = {
     "realtime": _MODE_REALTIME_LABEL,
     "delayed": _MODE_DELAYED_LABEL,
+    "control": _MODE_CONTROL_LABEL,
 }
 
 # Target width (inches) when inserting the picture into the Word page: 5.5in

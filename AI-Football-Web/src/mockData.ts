@@ -21,9 +21,8 @@ import type {
 
 /** 根据膝关节角度计算三级阈值等级（140-160 绿；130-140 或 160-170 黄；其余红） */
 export function getThresholdLevel(angle: number): ThresholdLevel {
-  // V3.5：触球膝角仅 >165° 进入直腿扣分带
-  if (angle >= 135 && angle <= 165) return 'green'
-  if ((angle >= 120 && angle < 135) || (angle > 165 && angle <= 172)) return 'yellow'
+  if (angle >= 140 && angle <= 160) return 'green'
+  if ((angle >= 130 && angle < 140) || (angle > 160 && angle <= 170)) return 'yellow'
   return 'red'
 }
 
@@ -195,8 +194,7 @@ export const MOCK_SCORE_HISTORY: ScoreRecord[] = [
 
 /** 学校列表 */
 export const MOCK_SCHOOLS: School[] = [
-  { id: 'school-1', name: '学校一' },
-  { id: 'school-2', name: '学校二' },
+  { id: 'school-xixia-4', name: '西夏区第四小学' },
 ]
 
 /** 实验组别列表 */
@@ -208,28 +206,24 @@ export const MOCK_GROUPS: ExperimentGroup[] = [
 
 /** 班级列表 */
 export const MOCK_CLASSES: ClassInfo[] = [
-  { id: 'class-1', name: '五年一班', schoolId: 'school-1', groupId: 'group-a' },
-  { id: 'class-2', name: '五年二班', schoolId: 'school-1', groupId: 'group-b' },
-  { id: 'class-3', name: '五年三班', schoolId: 'school-1', groupId: 'group-c' },
-  { id: 'class-4', name: '五年四班', schoolId: 'school-2', groupId: 'group-a' },
-  { id: 'class-5', name: '五年五班', schoolId: 'school-2', groupId: 'group-b' },
+  { id: 'class-grade5-1', name: '五年级一班', schoolId: 'school-xixia-4', groupId: 'group-a' },
+  { id: 'class-grade5-2', name: '五年级二班', schoolId: 'school-xixia-4', groupId: 'group-a' },
+  { id: 'class-grade5-3', name: '五年级三班', schoolId: 'school-xixia-4', groupId: 'group-a' },
+  { id: 'class-grade5-4', name: '五年级四班', schoolId: 'school-xixia-4', groupId: 'group-a' },
+  { id: 'class-grade4-1', name: '四年级一班', schoolId: 'school-xixia-4', groupId: 'group-a' },
+  { id: 'class-grade4-3', name: '四年级三班', schoolId: 'school-xixia-4', groupId: 'group-a' },
 ]
 
-/** 学生列表 */
-export const MOCK_STUDENTS: StudentInfo[] = [
-  { id: 'stu-1', studentNumber: 'B001', name: '张三', classId: 'class-1' },
-  { id: 'stu-2', studentNumber: 'B002', name: '李四', classId: 'class-1' },
-  { id: 'stu-3', studentNumber: 'B003', name: '王五', classId: 'class-2' },
-  { id: 'stu-4', studentNumber: 'B004', name: '赵六', classId: 'class-2' },
-]
+/** 学生列表：初始化为空，测试人员由实际采集流程产生。 */
+export const MOCK_STUDENTS: StudentInfo[] = []
 
 /** 班级合规率（百分比） */
 export const MOCK_COMPLIANCE_RATE = 78
 
 /** 错误类型分布（用于柱状图/饼图） */
 export const MOCK_ERROR_DISTRIBUTION: ErrorTypeDistribution[] = [
-  { level: 'green', label: '达标 (135°-165°)', count: 156 },
-  { level: 'yellow', label: '接近 (120°-135° / 165°-172°)', count: 64 },
+  { level: 'green', label: '达标 (140°-160°)', count: 156 },
+  { level: 'yellow', label: '接近 (130°-140° / 160°-170°)', count: 64 },
   { level: 'red', label: '错误 (<130° 或 >170°)', count: 32 },
 ]
 
@@ -281,28 +275,37 @@ export const MOCK_TEACHING_SUGGESTIONS: TeachingSuggestion[] = [
 /* ------------------------------------------------------------------ */
 
 /** 学校预设常用选项（教师仍可在此基础上自由新增自定义学校/机构名称） */
-export const PRESET_SCHOOL_NAMES: string[] = ['学校一', '学校二']
+export const PRESET_SCHOOL_NAMES: string[] = ['西夏区第四小学']
 
 /** 班级 / 实验组别预设常用选项（教师仍可在此基础上自由新增自定义分组/班级名称） */
-export const PRESET_CLASS_GROUP_NAMES: string[] = ['四年级1班-实验A组', '四年级2班-实验B组', '四年级3班-常规C组']
+export const PRESET_CLASS_GROUP_NAMES: string[] = [
+  '五年级一班',
+  '五年级二班',
+  '五年级三班',
+  '五年级四班',
+  '四年级一班',
+  '四年级三班',
+]
 
-/** 默认全局教学环境设置：默认学校一 + 四年级1班-实验A组 + 默认开启本地落盘归档总闸 */
+/** 默认全局教学环境设置：西夏区第四小学 + 五年级一班 + 默认开启本地落盘归档总闸 */
 export const DEFAULT_GLOBAL_SETTINGS: GlobalSettings = {
   schoolName: PRESET_SCHOOL_NAMES[0],
   classGroupName: PRESET_CLASS_GROUP_NAMES[0],
   enableDataArchiving: true,
+  studyTimepoint: 'T0',
+  plannedAttempts: 15,
 }
 
 /* ------------------------------------------------------------------ */
 /* 100% 自定义学校 / 班级分组：localStorage 持久化工具函数              */
 /* ------------------------------------------------------------------ */
 
-const CUSTOM_SCHOOLS_STORAGE_KEY = 'aiff_custom_schools_v1'
-const CUSTOM_CLASS_GROUPS_STORAGE_KEY = 'aiff_custom_class_groups_v1'
+const CUSTOM_SCHOOLS_STORAGE_KEY = 'aiff_custom_schools_v2'
+const CUSTOM_CLASS_GROUPS_STORAGE_KEY = 'aiff_custom_class_groups_v2'
 /** 被教师主动删除的预设学校（避免刷新后预设重新出现） */
-const HIDDEN_SCHOOLS_STORAGE_KEY = 'aiff_hidden_schools_v1'
+const HIDDEN_SCHOOLS_STORAGE_KEY = 'aiff_hidden_schools_v2'
 /** 被教师主动删除的预设班级/组别 */
-const HIDDEN_CLASS_GROUPS_STORAGE_KEY = 'aiff_hidden_class_groups_v1'
+const HIDDEN_CLASS_GROUPS_STORAGE_KEY = 'aiff_hidden_class_groups_v2'
 
 /** 从 localStorage 安全读取一份字符串数组，任何异常（未支持/解析失败）都静默兜底为空数组 */
 function readStringListFromStorage(storageKey: string): string[] {
@@ -444,8 +447,8 @@ export function removeClassGroupOption(name: string): string[] {
 /* 教练端「班级/实验组对比」下拉：可新增 / 隐藏（幽灵班级清理）          */
 /* ------------------------------------------------------------------ */
 
-const CUSTOM_COHORT_COMPARE_STORAGE_KEY = 'aiff_custom_cohort_compare_v1'
-const HIDDEN_COHORT_COMPARE_STORAGE_KEY = 'aiff_hidden_cohort_compare_v1'
+const CUSTOM_COHORT_COMPARE_STORAGE_KEY = 'aiff_custom_cohort_compare_v2'
+const HIDDEN_COHORT_COMPARE_STORAGE_KEY = 'aiff_hidden_cohort_compare_v2'
 
 /** 读取对比面板自定义新增的班级/实验组名称 */
 export function loadCustomCohortCompareNames(): string[] {
@@ -575,7 +578,7 @@ export function generateNextKneeAngle(previousAngle: number): number {
 /* ------------------------------------------------------------------ */
 
 /** 延时反馈系统「学生归档池」的 localStorage 存储键名 */
-export const DELAYED_FEEDBACK_SESSIONS_STORAGE_KEY = 'delayed_feedback_sessions'
+export const DELAYED_FEEDBACK_SESSIONS_STORAGE_KEY = 'delayed_feedback_sessions_v2'
 
 /**
  * 从 localStorage 安全读取延时反馈系统的学生归档池（跨课时持久化）。
@@ -628,7 +631,7 @@ export function clearZenSessionsFromLocalStorage(): void {
 /* ------------------------------------------------------------------ */
 
 /** 全局训练数据库的 localStorage 存储键名（与需求文档命名保持一致） */
-export const GLOBAL_RECORDS_STORAGE_KEY = 'global_football_records'
+export const GLOBAL_RECORDS_STORAGE_KEY = 'global_football_records_v2'
 
 /** 从 localStorage 安全读取全局训练数据库的完整记录列表，任何异常都静默兜底为空数组 */
 export function loadGlobalRecordsFromLocalStorage(): GlobalTrainingRecord[] {

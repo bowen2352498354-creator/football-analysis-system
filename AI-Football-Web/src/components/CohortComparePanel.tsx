@@ -577,6 +577,12 @@ export interface CohortComparePanelProps {
   cohortOptions: string[]
   /** 全局过滤后的唯一数据源；对比菜单选项与空态与此联动 */
   filteredDataset?: Array<{ classGroup?: string | null }>
+  filterScope?: {
+    school?: string
+    experimentalGroup?: string
+    dateFrom?: string | null
+    dateTo?: string | null
+  }
   className?: string
 }
 
@@ -706,6 +712,7 @@ function CohortOptionPicker({
 export default function CohortComparePanel({
   cohortOptions,
   filteredDataset,
+  filterScope,
   className = '',
 }: CohortComparePanelProps) {
   const liveOptions = useMemo(() => {
@@ -778,7 +785,19 @@ export default function CohortComparePanel({
     async function run() {
       setLoading(true)
       try {
-        const params = new URLSearchParams({ cohort_a: cohortA, cohort_b: cohortB })
+        const params = new URLSearchParams({
+          cohort_a: cohortA,
+          cohort_b: cohortB,
+          strict_quality: 'true',
+        })
+        if (filterScope?.school && filterScope.school !== 'all') {
+          params.set('school', filterScope.school)
+        }
+        if (filterScope?.experimentalGroup && filterScope.experimentalGroup !== 'all') {
+          params.set('experimental_group', filterScope.experimentalGroup)
+        }
+        if (filterScope?.dateFrom) params.set('date_from', filterScope.dateFrom)
+        if (filterScope?.dateTo) params.set('date_to', filterScope.dateTo)
         const response = await fetch(
           `${API_BASE_URL}/api/analytics/compare_cohorts?${params.toString()}`,
           { signal: controller.signal },
@@ -816,7 +835,7 @@ export default function CohortComparePanel({
       cancelled = true
       controller.abort()
     }
-  }, [cohortA, cohortB])
+  }, [cohortA, cohortB, filterScope])
 
   const ready = Boolean(cohortA && cohortB && cohortA !== cohortB)
   const sufficient = Boolean(payload?.sufficient_data)
@@ -890,7 +909,10 @@ export default function CohortComparePanel({
 
         {ready && payload?.sample_counts && (
           <span className="text-[11px] text-white/30">
-            n={payload.sample_counts.a ?? 0} vs {payload.sample_counts.b ?? 0}
+            学生 n={payload.sample_counts.a ?? 0} vs {payload.sample_counts.b ?? 0}
+            {payload.attempt_counts
+              ? ` · 尝试 ${payload.attempt_counts.a ?? 0} vs ${payload.attempt_counts.b ?? 0}`
+              : ''}
           </span>
         )}
         {loading && <Loader2 className="h-3.5 w-3.5 animate-spin text-emerald-400" />}
@@ -942,6 +964,22 @@ export default function CohortComparePanel({
           删除仅隐藏对比选项，不会清除硬盘归档数据
         </span>
       </div>
+
+      {sufficient && payload?.descriptive && (
+        <div className="mt-2 grid grid-cols-1 gap-2 border-y border-white/8 py-2 text-[11px] sm:grid-cols-2">
+          {([
+            [shortA, payload.descriptive.cohort_a],
+            [shortB, payload.descriptive.cohort_b],
+          ] as const).map(([label, stats]) => (
+            <p key={label} className="text-white/45">
+              <span className="font-semibold text-white/70">{label}</span>
+              {' · '}均值 {stats?.mean ?? '--'}
+              {' · '}SD {stats?.sd ?? '--'}
+              {' · '}95% CI [{stats?.ci95_low ?? '--'}, {stats?.ci95_high ?? '--'}]
+            </p>
+          ))}
+        </div>
+      )}
 
       {filterEmpty ? (
         <div className="mt-3">

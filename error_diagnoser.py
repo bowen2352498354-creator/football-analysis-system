@@ -41,6 +41,8 @@ from typing import Any, Optional
 
 import numpy as np
 
+from empirical_thresholds import get_impact_knee_thresholds
+
 from biomech_primitives import (
     ANKLE_IMPACT_HALF_WINDOW_MS,
     ANKLE_STIFFNESS_LOCKED,
@@ -145,7 +147,7 @@ BACKSWING_STRAIGHT_LEG_DEG = 140.0  # 膝内角 > 140° → B1 几乎没折叠
 BACKSWING_OVERFOLD_DEG = 70.0  # 膝内角 < 70° → 过度折叠（评分扣分；不单出 ERR）
 BACKSWING_FOLD_IDEAL_LOW_DEG = 80.0  # 合理发力下沿（↔ fold depth 100°）
 BACKSWING_FOLD_IDEAL_HIGH_DEG = 110.0  # 合理发力上沿（↔ fold depth 70°）
-IMPACT_STRAIGHT_LEG_DEG = 165.0  # 触球膝角 > 165° → 直腿扣分
+IMPACT_STRAIGHT_LEG_DEG = get_impact_knee_thresholds()[1]
 THIGH_RETRACTION_NEAR_ZERO_DEG = 8.0  # 大腿后伸 ≈ 0° → B2（仅浅折叠时）
 # 【V3.9】最大形变落差角：>20° → C1 严重松弛（取代旧方差 / 背屈骤降双判）
 ANKLE_DEFLECTION_FAIL_DEG = ANKLE_DEFLECTION_YELLOW_MAX_DEG  # > 20° → RED / C1

@@ -4,13 +4,14 @@ import { RadarChart } from 'echarts/charts'
 import {
   LegendComponent,
   RadarComponent,
+  TitleComponent,
   TooltipComponent,
 } from 'echarts/components'
 import { CanvasRenderer } from 'echarts/renderers'
 import type { EChartsType } from 'echarts/core'
 import type { Quantified5dScores, RadarScores } from '../types'
 
-echarts.use([RadarChart, RadarComponent, TooltipComponent, LegendComponent, CanvasRenderer])
+echarts.use([RadarChart, RadarComponent, TooltipComponent, LegendComponent, TitleComponent, CanvasRenderer])
 
 /** 五维维度元数据：与后端 radar_scores 键一一对应 */
 export const FIVE_D_DIMENSIONS = [

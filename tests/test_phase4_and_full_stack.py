@@ -143,12 +143,24 @@ def test_fps_passthrough_widens_ankle_window_in_scorer():
 
 
 def test_phase1_to4_full_pipeline_no_hallucinated_defaults():
-    """综合：PCR 实测 → Scorer → AIGC；缺测不注入；标定可进导出。"""
-    # 1) PCR measured
+    """综合：肩宽比 → Scorer → AIGC；缺测不注入；标定可进导出。"""
+    # 1) 支撑脚横距 30px / 肩宽 60px = 0.5×肩宽
     impact = {
-        "t_impact": 1,
-        "support_ankle_px": (210.0, 250.0),
-        "ball_pixel_bbox": [100.0, 200.0, 184.0, 284.0],
+        "t_impact": 0,
+        "frames": [
+            {
+                "left_ankle": [70.0, 200.0, 0.0],
+                "right_foot_index": [100.0, 200.0, 0.0],
+                "left_shoulder": [100.0, 80.0, 0.0],
+                "right_shoulder": [160.0, 80.0, 0.0],
+                "left_hip": [100.0, 140.0, 0.0],
+                "left_knee": [100.0, 170.0, 0.0],
+                "right_hip": [130.0, 140.0, 0.0],
+                "right_knee": [130.0, 170.0, 0.0],
+                "right_ankle": [130.0, 200.0, 0.0],
+            }
+        ],
+        "swing_leg": "right",
         "toe_angle": 5.0,
         "impact_knee_angle": 150.0,
         "support_knee_angle": 155.0,
@@ -158,10 +170,13 @@ def test_phase1_to4_full_pipeline_no_hallucinated_defaults():
     }
     trajectory = {"max_folding_angle": 78.0, "whipping_velocity": 500.0, "fps": 30.0}
     _, detail = calculate_biomechanical_score(impact, trajectory)
-    assert detail["indicators"]["distance_cm"]["provenance"] == PROVENANCE_MEASURED
-    assert detail["indicators"]["distance_cm"]["value"] == 17.0
+    distance = detail["indicators"]["distance_cm"]
+    assert distance["provenance"] == PROVENANCE_CALIBRATED
+    assert distance["value"] == 0.5
+    assert distance["support_ratio"] == 0.5
+    assert distance["distance_cm_estimate"] == 15.0
     msg = build_aigc_user_message({"score_detail": detail})
-    assert "17.0" in msg
+    assert "0.5" in msg
 
     # 2) 缺测横距不得进 AIGC
     _, detail_miss = calculate_biomechanical_score(
@@ -236,31 +251,36 @@ def test_generate_report_must_wrap_score_detail_for_aigc():
 
 
 def test_pose_frames_feed_measured_fold_ankle_and_world_lateral_to_aigc():
-    """有姿态帧时：折叠角/踝刚度/世界横距应进入 AIGC 可复述载荷（非默认中心值）。"""
+    """有姿态帧时：折叠角/踝刚度/肩宽比应进入 AIGC 可复述载荷。"""
     frames = []
     for i in range(20):
         # 后摆：膝角逐步减小；触球附近踝角稳定
         knee_interior = 100.0 - i * 1.5  # → max_folding ≈ 180-70 = 110 at late frames
         fold = max(70.0, knee_interior)
-        # 右摆腿：hip / knee / ankle 构成折角；足尖用于踝刚度
+        rad = __import__("math").radians(fold)
+        ankle_x = 0.4 * __import__("math").sin(rad)
+        ankle_y = 0.4 - 0.4 * __import__("math").cos(rad)
+        # 右摆腿在 X-Y 图像平面构成折角；足尖用于踝刚度。
         rec = {
             "timestamp_sec": i / 30.0,
             "right_hip": [0.0, 0.0, 0.0],
             "right_knee": [0.0, 0.4, 0.0],
-            "right_ankle": [0.0, 0.4 + 0.4 * __import__("math").cos(__import__("math").radians(fold)),
-                            0.4 * __import__("math").sin(__import__("math").radians(fold))],
-            "right_foot_index": [0.05, 0.85, 0.05],
+            "right_ankle": [ankle_x, ankle_y, 0.0],
+            "right_foot_index": [ankle_x + 0.05, ankle_y + 0.1, 0.0],
             "left_ankle": [-0.18, 0.9, 0.0],
             "left_hip": [-0.1, 0.0, 0.0],
             "left_knee": [-0.1, 0.4, 0.0],
             "left_foot_index": [-0.18, 1.0, 0.05],
+            "left_shoulder": [-0.15, -0.2, 0.0],
+            "right_shoulder": [0.15, -0.2, 0.0],
             "visibility": {k: 1.0 for k in (
                 "right_hip", "right_knee", "right_ankle", "right_foot_index",
                 "left_ankle", "left_hip", "left_knee", "left_foot_index",
+                "left_shoulder", "right_shoulder",
             )},
             "world": {},
         }
-        # 世界坐标：左踝与右足尖横距 0.17m = 17cm
+        # 世界坐标：横距 0.17 / 肩宽 0.30 = 0.5667×肩宽。
         rec["world"] = {
             "left_ankle": [-0.17, 0.0, 0.0],
             "right_foot_index": [0.0, 0.0, 0.0],
@@ -270,6 +290,8 @@ def test_pose_frames_feed_measured_fold_ankle_and_world_lateral_to_aigc():
             "left_hip": [-0.1, -0.4, 0.0],
             "left_knee": [-0.12, -0.2, 0.0],
             "left_foot_index": [-0.17, 0.05, 0.0],
+            "left_shoulder": [-0.15, -0.5, 0.0],
+            "right_shoulder": [0.15, -0.5, 0.0],
         }
         frames.append(rec)
 
@@ -280,6 +302,7 @@ def test_pose_frames_feed_measured_fold_ankle_and_world_lateral_to_aigc():
         "fps": 30.0,
         "ball_center": frames[t_impact]["world"]["right_foot_index"],
         "support_lateral_dist_cm": 17.0,
+        "swing_leg": "right",
         "toe_angle": 5.0,
         "impact_knee_angle": 150.0,
         "support_knee_angle": 155.0,
@@ -292,6 +315,7 @@ def test_pose_frames_feed_measured_fold_ankle_and_world_lateral_to_aigc():
         "angular_velocities": [0.0] * len(frames),
         "whipping_velocity": 500.0,
         "support_lateral_dist_cm": 17.0,
+        "swing_leg": "right",
     }
     _, detail = calculate_biomechanical_score(impact, trajectory)
     # 与 api_server 相同包装
@@ -300,6 +324,7 @@ def test_pose_frames_feed_measured_fold_ankle_and_world_lateral_to_aigc():
     fold = payload["indicators"]["max_folding_angle"]
     ankle = payload["indicators"]["ankle_rigidity"]
     assert dist.get("measured") is True and dist.get("value") is not None
+    assert dist.get("support_ratio") == 0.5667
     assert fold.get("measured") is True and fold.get("value") is not None
     assert ankle.get("measured") is True and ankle.get("value") is not None
     assert is_aigc_measurable_provenance(dist["provenance"])

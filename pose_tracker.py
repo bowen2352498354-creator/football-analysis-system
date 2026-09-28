@@ -381,28 +381,24 @@ def calculate_angle(a, b, c, *, is_knee_extension: bool = False):
 
 
 def judge_knee_status(angle):
-    """根据 V3.5 儿童/业余三级容错阈值，判定触球膝角状态。
+    """根据论文冻结的三级容错阈值，判定触球膝角状态。
 
     判定规则（与 DeterministicScorer / empirical_thresholds 对齐）：
-        Green（达标）：135° <= 角度 <= 165°（仅 >165° 才进入直腿扣分带）
-        Yellow（接近）：120° <= 角度 < 135° 或 165° < 角度 <= 172°
-        Red（错误）：角度 < 120° 或 角度 > 172°
+        Green（达标）：140° <= 角度 <= 160°
+        Yellow（接近）：130° <= 角度 < 140° 或 160° < 角度 <= 170°
+        Red（错误）：角度 < 130° 或 角度 > 170°
 
     返回：
         (status_text, status_color)：状态文字与对应的 BGR 颜色元组。
     """
-    try:
-        angle_v = float(angle)
-    except (TypeError, ValueError):
-        return "Red", COLOR_RED
-    if not np.isfinite(angle_v):
-        return "Red", COLOR_RED
-    if 135 <= angle_v <= 165:
+    from empirical_thresholds import classify_impact_knee_angle
+
+    status = classify_impact_knee_angle(angle)
+    if status == "GREEN_OPTIMAL":
         return "Green", COLOR_GREEN
-    elif (120 <= angle_v < 135) or (165 < angle_v <= 172):
+    if status == "YELLOW_APPROACHING":
         return "Yellow", COLOR_YELLOW
-    else:
-        return "Red", COLOR_RED
+    return "Red", COLOR_RED
 
 
 def compute_right_knee_diagnosis(frame, single_person_landmarks):
@@ -708,7 +704,10 @@ def serialize_pose_frame_record(
             continue
         record[name] = _image_xyz(lm)
         try:
-            visibility[name] = float(getattr(lm, "visibility", 1.0) or 1.0)
+            raw_visibility = getattr(lm, "visibility", 1.0)
+            visibility[name] = float(
+                1.0 if raw_visibility is None else raw_visibility
+            )
         except (TypeError, ValueError):
             visibility[name] = 1.0
     record["visibility"] = visibility

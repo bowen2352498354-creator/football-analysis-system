@@ -23,7 +23,7 @@
     {
       "label": "🖥️ 启动前端 (npm run dev)",
       "type": "shell",
-      "command": "npm run dev",
+      "command": "npm run dev -- --open",
       "options": {
         "cwd": "${workspaceFolder}/AI-Football-Web"
       },

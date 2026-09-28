@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import Navbar from './components/Navbar'
 import RealtimeWorkspace from './components/RealtimeWorkspace'
@@ -7,12 +7,38 @@ import CoachDashboard from './components/CoachDashboard'
 import { DEFAULT_GLOBAL_SETTINGS } from './mockData'
 import type { ApiStatus, GlobalSettings, ViewMode } from './types'
 
+const GLOBAL_SETTINGS_STORAGE_KEY = 'aiff_global_settings_v3'
+
+function loadGlobalSettings(): GlobalSettings {
+  try {
+    const raw = window.localStorage.getItem(GLOBAL_SETTINGS_STORAGE_KEY)
+    if (!raw) return DEFAULT_GLOBAL_SETTINGS
+    const parsed = JSON.parse(raw) as Partial<GlobalSettings>
+    const validTimepoint = ['T0', 'T1', 'T2', 'T3', 'T4'].includes(String(parsed.studyTimepoint))
+    return {
+      ...DEFAULT_GLOBAL_SETTINGS,
+      ...parsed,
+      studyTimepoint: validTimepoint ? parsed.studyTimepoint! : DEFAULT_GLOBAL_SETTINGS.studyTimepoint,
+      plannedAttempts:
+        typeof parsed.plannedAttempts === 'number' && parsed.plannedAttempts > 0
+          ? Math.min(999, Math.round(parsed.plannedAttempts))
+          : DEFAULT_GLOBAL_SETTINGS.plannedAttempts,
+    }
+  } catch {
+    return DEFAULT_GLOBAL_SETTINGS
+  }
+}
+
 /** 主应用架构：深色沉浸主题 + 三视图切换 */
 function App() {
   const [activeView, setActiveView] = useState<ViewMode>('realtime')
   const [apiStatus] = useState<ApiStatus>('online')
   // 全局教学环境设置（学校 + 班级/组别）：在 App 顶层统一管理，供 Navbar 编辑、各工作台只读消费
-  const [globalSettings, setGlobalSettings] = useState<GlobalSettings>(DEFAULT_GLOBAL_SETTINGS)
+  const [globalSettings, setGlobalSettings] = useState<GlobalSettings>(loadGlobalSettings)
+
+  useEffect(() => {
+    window.localStorage.setItem(GLOBAL_SETTINGS_STORAGE_KEY, JSON.stringify(globalSettings))
+  }, [globalSettings])
 
   const handleDownloadTestData = () => {
     const payload = {
@@ -49,6 +75,9 @@ function App() {
           transition={{ duration: 0.25, ease: 'easeOut' }}
         >
           {activeView === 'realtime' && <RealtimeWorkspace globalSettings={globalSettings} />}
+          {activeView === 'control' && (
+            <RealtimeWorkspace globalSettings={globalSettings} experimentMode="control" />
+          )}
           {activeView === 'zen' && (
             <div className="flex h-full min-h-0 flex-1 flex-col overflow-hidden">
               <ZenWorkspace globalSettings={globalSettings} />

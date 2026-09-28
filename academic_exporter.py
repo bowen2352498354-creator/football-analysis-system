@@ -31,6 +31,7 @@ V3.1 「论文专供：全数字化 SPSS 标准宽表一键导出 (MSEM / HLM / 
 from __future__ import annotations
 
 import os
+import json
 import sys
 import time
 from collections.abc import Iterable, Mapping, Sequence
@@ -97,6 +98,8 @@ LONG_FORMAT_COLUMNS = [
     "class_name",
     "group_type_code",
     "test_date",
+    "timepoint",
+    "attempt_id",
     "attempt_sequence",
     "total_score",
     "knee_flexion_angle",
@@ -111,6 +114,15 @@ LONG_FORMAT_COLUMNS = [
     "camera_height_cm",
     "calibrator_status",
     "is_baseline_trusted",
+    "quality_grade",
+    "research_eligible",
+    "protocol_version",
+    "analysis_version",
+    "threshold_version",
+    "measurement_version",
+    "model_version",
+    "source_type",
+    "protocol_deviation",
 ]
 
 PROVENANCE_MEASURED = "measured"
@@ -121,6 +133,53 @@ PROVENANCE_CALIBRATED = "calibrated"
 MEASURED_PROVENANCE_SET = frozenset(
     {PROVENANCE_MEASURED, PROVENANCE_CALIBRATED}
 )
+
+
+def build_research_exclusion_log(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    require_versioned: bool = True,
+    measured_only: bool = False,
+) -> list[dict[str, Any]]:
+    """Return one auditable row for every record excluded from formal export."""
+    from research_integrity import research_exclusion_reasons
+
+    rows: list[dict[str, Any]] = []
+    for record in records:
+        if not isinstance(record, Mapping):
+            continue
+        reasons = research_exclusion_reasons(record, require_version=require_versioned)
+        if measured_only:
+            _, support_prov = _resolve_record_metric_with_provenance(
+                record,
+                value_keys=(
+                    "supportFootDistance",
+                    "support_foot_distance",
+                    "distance_cm",
+                    "support_lateral_dist_cm",
+                ),
+                provenance_keys=(
+                    "supportFootDistanceProvenance",
+                    "support_foot_distance_provenance",
+                    "distance_cm_provenance",
+                ),
+                estimate_fn=_estimate_support_foot_distance,
+                score=record.get("score"),
+            )
+            if support_prov not in MEASURED_PROVENANCE_SET:
+                reasons.append("support_distance_not_measured_or_calibrated")
+        if reasons:
+            rows.append(
+                {
+                    "attemptId": str(record.get("attemptId") or record.get("id") or ""),
+                    "studentId": str(record.get("studentId") or ""),
+                    "classGroup": str(record.get("classGroup") or ""),
+                    "timepoint": str(record.get("timepoint") or ""),
+                    "timestamp": str(record.get("timestamp") or ""),
+                    "reasons": list(dict.fromkeys(reasons)),
+                }
+            )
+    return rows
 
 # 综合评分缺失时的中性兜底值（保证 total_score 列绝不出现空值/NaN，
 # 又不会因为极端的 0 分/100 分而扭曲后续的方差分析结果）
@@ -224,6 +283,8 @@ def build_long_format_dataframe(
     records: list[dict],
     *,
     measured_only: bool = False,
+    strict_quality: bool = False,
+    require_versioned: bool = False,
 ) -> pd.DataFrame:
     """把 global_training_db.json 的原始记录列表，清洗转换成标准长表格式。
 
@@ -237,6 +298,14 @@ def build_long_format_dataframe(
     for record in records:
         if not isinstance(record, dict):
             continue
+        if strict_quality and (
+            _is_soft_deleted(record) or not _is_strict_research_eligible(record)
+        ):
+            continue
+        if strict_quality and bool(record.get("protocolDeviation")):
+            continue
+        if require_versioned and not str(record.get("protocolVersion") or "").strip():
+            continue
 
         school = str(record.get("school") or "未设置学校")
         class_group = str(record.get("classGroup") or "未设置班级")
@@ -247,8 +316,12 @@ def build_long_format_dataframe(
         score = _clean_score(record.get("score"))
 
         group_type_code = record.get("groupTypeCode")
-        if group_type_code not in (1, 2):
-            group_type_code = 1 if record_type == "realtime" else 2
+        if group_type_code not in (1, 2, 3):
+            group_type_code = encode_experimental_group(
+                record.get("experimental_group")
+                or record.get("experimentalGroup")
+                or record_type
+            )
 
         test_date = record.get("testDate") or _extract_test_date(timestamp)
 
@@ -345,6 +418,8 @@ def build_long_format_dataframe(
                 "class_name": class_group,
                 "group_type_code": int(group_type_code),
                 "test_date": test_date,
+                "timepoint": _coerce_timepoint_label(record.get("timepoint")) or "",
+                "attempt_id": str(record.get("attemptId") or record.get("id") or ""),
                 "total_score": round(float(score), 1),
                 "knee_flexion_angle": round(float(knee_flexion_angle), 1),
                 "knee_flexion_angle_provenance": knee_prov,
@@ -356,6 +431,15 @@ def build_long_format_dataframe(
                 "camera_height_cm": camera_height_out,
                 "calibrator_status": calibrator_status,
                 "is_baseline_trusted": int(1 if is_trusted else 0),
+                "quality_grade": str(record.get("qualityGrade") or ""),
+                "research_eligible": int(record.get("researchEligible") is True),
+                "protocol_version": str(record.get("protocolVersion") or "legacy_unknown"),
+                "analysis_version": str(record.get("analysisVersion") or "legacy_unknown"),
+                "threshold_version": str(record.get("thresholdVersion") or "legacy_unknown"),
+                "measurement_version": str(record.get("measurementVersion") or "legacy_unknown"),
+                "model_version": str(record.get("modelVersion") or "legacy_unknown"),
+                "source_type": str(record.get("sourceType") or record_type or "unknown"),
+                "protocol_deviation": int(bool(record.get("protocolDeviation"))),
                 "_timestamp_sort_key": timestamp,
                 "_group_key": f"{school}__{class_group}__{student_id}",
             }
@@ -391,7 +475,21 @@ def export_academic_matrix(
     try:
         os.makedirs(EXPORT_DIR, exist_ok=True)
 
-        df = build_long_format_dataframe(records, measured_only=measured_only)
+        exclusion_rows = build_research_exclusion_log(
+            records, require_versioned=True, measured_only=measured_only
+        )
+        timestamp_label = time.strftime("%Y%m%d")
+        suffix = "_measured" if measured_only else ""
+        exclusion_filename = f"Academic_Exclusion_Log_{timestamp_label}{suffix}.json"
+        exclusion_path = os.path.join(EXPORT_DIR, exclusion_filename)
+        with open(exclusion_path, "w", encoding="utf-8") as handle:
+            json.dump(exclusion_rows, handle, ensure_ascii=False, indent=2)
+        df = build_long_format_dataframe(
+            records,
+            measured_only=measured_only,
+            strict_quality=True,
+            require_versioned=True,
+        )
 
         if df.empty:
             return {
@@ -401,15 +499,14 @@ def export_academic_matrix(
                     if not measured_only
                     else "按 measured_only 过滤后无可用行：请确认归档记录已写入实测 provenance。"
                 ),
+                "exclusionLogPath": os.path.abspath(exclusion_path),
+                "excludedCount": len(exclusion_rows),
             }
 
-        timestamp_label = time.strftime("%Y%m%d")
-        suffix = "_measured" if measured_only else ""
         filename = f"Academic_SPSS_Matrix_{timestamp_label}{suffix}.csv"
         full_path = os.path.join(EXPORT_DIR, filename)
 
         df.to_csv(full_path, index=False, encoding="utf-8-sig")
-
         student_count = df["student_id"].nunique() if "student_id" in df.columns else 0
 
         _safe_print(f"[academic_exporter] 学术统计矩阵已导出：{full_path}（共 {len(df)} 行）")
@@ -421,6 +518,8 @@ def export_academic_matrix(
             "rowCount": int(len(df)),
             "studentCount": int(student_count),
             "measuredOnly": bool(measured_only),
+            "exclusionLogPath": os.path.abspath(exclusion_path),
+            "excludedCount": len(exclusion_rows),
         }
     except Exception as exc:  # noqa: BLE001
         _safe_print(f"[academic_exporter] 导出学术统计矩阵失败：{exc}")
@@ -552,6 +651,48 @@ def _is_soft_deleted(record: Mapping[str, Any] | Any) -> bool:
         return bool(raw)
     text = str(raw or "").strip().lower()
     return text in {"1", "true", "yes", "y"}
+
+
+def _is_research_eligible(record: Mapping[str, Any] | Any) -> bool:
+    """Exclude newly quality-gated B/C attempts while preserving legacy rows."""
+    if record is None:
+        return False
+    if isinstance(record, Mapping):
+        explicit = record.get("researchEligible", record.get("research_eligible"))
+        grade = record.get("qualityGrade", record.get("quality_grade"))
+        gate = record.get("qualityGate", record.get("quality_gate"))
+    else:
+        explicit = getattr(
+            record, "researchEligible", getattr(record, "research_eligible", None)
+        )
+        grade = getattr(record, "qualityGrade", getattr(record, "quality_grade", None))
+        gate = getattr(record, "qualityGate", getattr(record, "quality_gate", None))
+    if explicit is False:
+        return False
+    if isinstance(explicit, str) and explicit.strip().lower() in {"0", "false", "no"}:
+        return False
+    if not grade and isinstance(gate, Mapping):
+        grade = gate.get("grade")
+    return str(grade or "").strip().upper() not in {"B", "C"}
+
+
+def _is_strict_research_eligible(record: Mapping[str, Any] | Any) -> bool:
+    """Official export policy: only explicit A-grade, eligible attempts pass."""
+    if not _is_research_eligible(record):
+        return False
+    if isinstance(record, Mapping):
+        grade = record.get("qualityGrade", record.get("quality_grade"))
+        gate = record.get("qualityGate", record.get("quality_gate"))
+        explicit = record.get("researchEligible", record.get("research_eligible"))
+    else:
+        grade = getattr(record, "qualityGrade", getattr(record, "quality_grade", None))
+        gate = getattr(record, "qualityGate", getattr(record, "quality_gate", None))
+        explicit = getattr(
+            record, "researchEligible", getattr(record, "research_eligible", None)
+        )
+    if not grade and isinstance(gate, Mapping):
+        grade = gate.get("grade")
+    return str(grade or "").strip().upper() == "A" and explicit is True
 
 
 def _coerce_timepoint_label(value: Any) -> Optional[str]:
@@ -890,7 +1031,20 @@ class AcademicDataExporter:
 
     @classmethod
     def from_db(cls) -> "AcademicDataExporter":
-        """打开本地 ``cluster_rct.db``；若射门表为空则桥接 global_training_db.json。"""
+        """Prefer the quality-gated Web archive, then fall back to the ORM store.
+
+        New A/B/C records carry explicit quality and T0-T4 metadata in
+        ``global_training_db.json``. Using that archive first prevents older ORM
+        rows without quality provenance from shadowing the controlled dataset.
+        """
+        try:
+            global_path = os.path.join(SCRIPT_DIR, "global_training_db.json")
+            web_exporter = cls.from_global_json(global_path, require_versioned=True)
+            if os.path.exists(global_path):
+                return web_exporter
+        except Exception as exc:  # noqa: BLE001
+            _safe_print(f"[academic_exporter] Web 质控归档装载失败，尝试 ORM：{exc}")
+
         try:
             from db import init_db, session_scope
 
@@ -906,11 +1060,14 @@ class AcademicDataExporter:
         except Exception as exc:  # noqa: BLE001
             _safe_print(f"[academic_exporter] from_db ORM 装载失败，回退 JSON：{exc}")
 
-        return cls.from_global_json()
+        return cls(shot_logs=[], student_profiles=[], timepoint_sessions=[])
 
     @classmethod
     def from_global_json(
-        cls, json_path: Optional[str] = None
+        cls,
+        json_path: Optional[str] = None,
+        *,
+        require_versioned: bool = False,
     ) -> "AcademicDataExporter":
         """从 global_training_db.json（或显式路径）桥接异构归档为宽表输入。"""
         path = json_path or os.path.join(SCRIPT_DIR, "global_training_db.json")
@@ -921,7 +1078,17 @@ class AcademicDataExporter:
             with open(path, "r", encoding="utf-8") as handle:
                 raw = json.load(handle)
             if isinstance(raw, list):
-                records = [r for r in raw if isinstance(r, dict)]
+                records = [
+                    r
+                    for r in raw
+                    if isinstance(r, dict)
+                    and _is_strict_research_eligible(r)
+                    and not bool(r.get("protocolDeviation"))
+                    and (
+                        not require_versioned
+                        or bool(str(r.get("protocolVersion") or "").strip())
+                    )
+                ]
         return cls.from_global_records(records)
 
     @classmethod
@@ -934,7 +1101,9 @@ class AcademicDataExporter:
         active_records = [
             record
             for record in records
-            if isinstance(record, Mapping) and not _is_soft_deleted(record)
+            if isinstance(record, Mapping)
+            and not _is_soft_deleted(record)
+            and _is_research_eligible(record)
         ]
         # 按学生收集测试日，推断 T0–T4
         date_buckets: dict[str, list[str]] = {}
@@ -1353,7 +1522,7 @@ class AcademicDataExporter:
     ) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         for shot in self.shot_logs:
-            if _is_soft_deleted(shot):
+            if _is_soft_deleted(shot) or not _is_research_eligible(shot):
                 continue
             anon = str(shot.get("anonymous_id") or "").strip()
             if not anon:

@@ -103,6 +103,8 @@ export interface SynchronizedVideoWorkspaceProps {
   fps?: number
   /** 点击波形跳转后，若视频暂停则自动 play（默认 true） */
   autoPlayOnSeek?: boolean
+  /** 完整动作片段首次加载时从起点播放，仍保留触球标记和波形跳转 */
+  startFromBeginning?: boolean
   /** 视频视口内叠层（实时推理帧 / HUD） */
   children?: ReactNode
   overlay?: ReactNode
@@ -292,6 +294,7 @@ export default function SynchronizedVideoWorkspace({
   phases = null,
   fps = DEFAULT_FPS,
   autoPlayOnSeek = true,
+  startFromBeginning = false,
   children,
   overlay,
   preferLiveOverlay = false,
@@ -419,13 +422,6 @@ export default function SynchronizedVideoWorkspace({
     seekToTimestamp(ts, opts)
   }
 
-  /** 兼容旧调用：localIndex 视为 dataIndex */
-  const seekToLocalFrame = (localIndex: number) => {
-    seekToDataIndex(localIndex, { autoPlay: false })
-    setIsPlaying(false)
-    videoRef.current?.pause()
-  }
-
   /** 外部传入绝对帧 → 绝对秒再 seek */
   const seekToAbsoluteFrame = (absoluteFrame: number) => {
     const rate = fpsRef.current
@@ -454,6 +450,7 @@ export default function SynchronizedVideoWorkspace({
 
   // 报告带回触球索引后，对齐射门瞬间并以 0.5x 自动循环（A 组干预驻留）
   useEffect(() => {
+    if (startFromBeginning) return
     if (series.length < 2) return
     if (typeof impactIndexInWindow === 'number' && Number.isFinite(impactIndexInWindow)) {
       seekToDataIndex(impactIndexInWindow, { autoPlay: true })
@@ -475,7 +472,7 @@ export default function SynchronizedVideoWorkspace({
       setIsPlaying(true)
       setSeekBadge(`射门瞬间 · F#${Math.round(tImpact)}`)
     }
-  }, [tImpact, impactIndexInWindow, series.length])
+  }, [tImpact, impactIndexInWindow, series.length, startFromBeginning])
 
   // 视频 loadeddata：强制 seek 到触球绝对秒（红色虚线），避免停在第 0 帧助跑
   useEffect(() => {
@@ -483,6 +480,17 @@ export default function SynchronizedVideoWorkspace({
     if (!video || !videoSrc) return
 
     const seekImpactOnReady = () => {
+      if (startFromBeginning) {
+        forceInterventionPlaybackRate()
+        seekToTimestamp(0, { autoPlay: true })
+        void video.play().catch(() => {
+          /* muted + autoPlay 仍可能被策略拦截 */
+        })
+        setIsPlaying(true)
+        setSeekBadge('完整动作回放 · 从助跑开始')
+        return
+      }
+
       const current = seriesRef.current
       let targetTs: number | null = null
       let badge = '射门瞬间'
@@ -516,7 +524,7 @@ export default function SynchronizedVideoWorkspace({
     return () => {
       video.removeEventListener('loadeddata', seekImpactOnReady)
     }
-  }, [videoSrc, tImpact, impactIndexInWindow, series])
+  }, [videoSrc, tImpact, impactIndexInWindow, series, startFromBeginning])
 
   /** 从 ECharts 事件提取 dataIndex（优先），供 absolute_timestamps 查表 */
   const dataIndexFromChartEvent = (params: unknown): number | null => {
@@ -840,7 +848,11 @@ export default function SynchronizedVideoWorkspace({
     })
   }, [playheadFrame, playheadVisible, impactTimestamp, series, safeOffset, safeFps])
 
-  const showNativeVideo = Boolean(videoSrc) && !preferLiveOverlay
+  // Attempt replay is authoritative once available. startFromBeginning marks
+  // that path and must win if a stale stopping/live-overlay render arrives in
+  // the same React batch as the completed report.
+  const replayOwnsStage = Boolean(videoSrc) && startFromBeginning
+  const showNativeVideo = Boolean(videoSrc) && (replayOwnsStage || !preferLiveOverlay)
   const focusHighlight = useMemo(
     () => pickFocusHighlight(jointHighlights),
     [jointHighlights],
@@ -1199,9 +1211,10 @@ export default function SynchronizedVideoWorkspace({
           <div className="absolute inset-0">
             {videoSrc && (
               <video
+                key={videoSrc}
                 ref={videoRef}
                 src={videoSrc}
-                className={`absolute inset-0 h-full w-full bg-black object-contain ${
+                className={`absolute inset-0 z-[2] h-full w-full bg-black object-contain ${
                   showNativeVideo ? 'opacity-100' : 'pointer-events-none opacity-0'
                 }`}
                 playsInline
@@ -1228,7 +1241,7 @@ export default function SynchronizedVideoWorkspace({
             />
           </div>
           {/* 实时推理画面：分析中优先；无本地视频源时作为主视口 */}
-          {(preferLiveOverlay || !videoSrc) && (
+          {!replayOwnsStage && (preferLiveOverlay || !videoSrc) && (
             <div className="absolute inset-0 z-[1]">{children}</div>
           )}
           {!preferLiveOverlay && !videoSrc && !children && (

@@ -23,7 +23,7 @@ def test_empirical_youth_bands():
 
 
 def test_near_standard_youth_shot_stays_above_70():
-    """趋近标准的儿童动作：肩宽比≈0.80（略偏远黄灯）、折叠≈85、触球膝 162 → >70。"""
+    """趋近标准的儿童动作：肩宽比≈0.80（略偏远黄灯）、折叠≈85、触球膝 158 → >70。"""
     # 折叠深度 85° 落在绿带 70–100（XY-2D / Z 坍缩口径）
     # 横距比 0.80 落在肩宽黄带 (0.70, 0.90]
     impact = {
@@ -32,7 +32,7 @@ def test_near_standard_youth_shot_stays_above_70():
         "support_lateral_dist_cm": 24.0,
         "support_distance_method": "shoulder_width_ratio",
         "toe_angle": 8.0,
-        "impact_knee_angle": 162.0,  # ≤165 不扣直腿
+        "impact_knee_angle": 158.0,
         "support_knee_angle": 155.0,
         "hip_torsion_angle": 25.0,
         "ankle_angles_window": [140.0, 140.2, 140.1],
@@ -81,12 +81,12 @@ def test_deduction_reason_uses_same_measured_fold_angle():
     assert fold_d["penalty"] <= 8.0
 
 
-def test_impact_knee_straight_leg_only_above_165():
+def test_impact_knee_penalty_starts_above_frozen_green_band():
     impact = {
         "t_impact": 1,
         "distance_cm": 17.5,
         "toe_angle": 5.0,
-        "impact_knee_angle": 163.0,
+        "impact_knee_angle": 159.0,
         "support_knee_angle": 155.0,
         "hip_torsion_angle": 25.0,
         "ankle_angles_window": [140.0, 140.1, 140.0],
@@ -95,7 +95,7 @@ def test_impact_knee_straight_leg_only_above_165():
     score_ok, detail_ok = calculate_biomechanical_score(impact, trajectory)
     assert detail_ok["indicators"]["impact_knee_angle"]["penalty"] == 0.0
 
-    impact["impact_knee_angle"] = 168.0
+    impact["impact_knee_angle"] = 165.0
     score_bad, detail_bad = calculate_biomechanical_score(impact, trajectory)
     assert detail_bad["indicators"]["impact_knee_angle"]["penalty"] > 0.0
     assert detail_bad["indicators"]["impact_knee_angle"]["penalty"] <= 8.0

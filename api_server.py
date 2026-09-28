@@ -65,9 +65,10 @@ v1.1 前后端全栈联调阶段：后台服务网关（FastAPI + Uvicorn）
 
 【科技伦理与隐私保护红线】（与 pose_tracker.py 完全一致）：
     所有视频帧的姿态推理、骨骼绘制、面部高斯模糊打码全部在服务端内存中实时完成，
-    处理完的画面通过 WebSocket 直接推给浏览器展示，不会把原始帧或处理后的帧写入
-    磁盘做长期持久化保存；uploads/ 目录仅临时存放用户主动上传的本地视频文件，
-    用于本次分析读取帧数据，不属于"实时展示视频"的范畴。
+    处理完的画面通过 WebSocket 直接推给浏览器展示；摄像头双通道仅把已经完成人脸
+    脱敏的动作窗临时写入 auto_capture_clips/ 供精分析和回放，Web 临时切片超过
+    24 小时会在服务启动时清理。原始摄像头帧绝不落盘；正式归档只保存已完成人脸
+    脱敏和骨骼标注的击球定格图。uploads/ 目录仅临时存放用户主动上传的本地视频文件。
 
 ============================================================================
 【如何启动这个后端服务】（请在终端里执行，而不是直接用 F5 调试运行）：
@@ -110,6 +111,7 @@ os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 import asyncio
 import base64
 import collections
+import hashlib
 import io
 import json
 import math
@@ -183,7 +185,8 @@ import numpy as np
 from fastapi import FastAPI, UploadFile, File, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 # 【核心复用】直接把 pose_tracker.py 当作一个模块导入，复用里面已经写好的
@@ -198,9 +201,35 @@ import llm_agent
 
 # 【V2.5】确定性评分 + Action ROI + 黄金审计日志
 import error_diagnoser
+from capture_quality import evaluate_capture_quality
+from diagnostic_trace import (
+    record_feedback_trace,
+    summarize_capture_quality,
+    summarize_llm_result,
+    summarize_records,
+    summarize_score_detail,
+)
+from prescription_context import build_history_context, build_prescription_evidence
+from experiment_ledger import (
+    DEFAULT_PLANNED_ATTEMPTS,
+    canonical_group,
+    normalize_timepoint,
+    read_attempts,
+    record_attempt,
+)
+from research_integrity import (
+    build_intervention_audit,
+    build_measurement_provenance_summary,
+    build_version_metadata,
+    filter_individual_attempts_by_date,
+    summarize_individual_attempts,
+)
 
 # 【核心复用】直接复用 word_reporter.py 里封装好的本地归档 + Word 报告生成逻辑。
 import word_reporter
+import class_print_reporter
+import report_asset_store
+import self_check_service
 
 # 【v4.0 核心复用】直接复用 academic_exporter.py 里封装好的「论文专供：学术统计
 # 矩阵一键自动导出」清洗 + 落盘逻辑，完全不在本文件重复实现任何转换算法。
@@ -254,6 +283,8 @@ except (AttributeError, ValueError):
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR = os.path.join(SCRIPT_DIR, "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+AUTO_CLIP_DIR = os.path.join(SCRIPT_DIR, "auto_capture_clips")
+os.makedirs(AUTO_CLIP_DIR, exist_ok=True)
 
 # 【v2.0 新增：跨课时双重持久化】延时反馈系统 (Web) 归档池的落盘文件路径。
 # 【重要说明，避免和旧版桌面工具混淆】项目根目录下原本已经存在一个
@@ -271,6 +302,9 @@ WEB_SESSION_LOG_PATH = os.path.join(SCRIPT_DIR, "B_group_web_sessions_log.json")
 # 完整的结构化记录，供教练端数据看板 (CoachDashboard.tsx) 通过
 # GET /api/get_all_records 一键拉取全量历史归档数据进行可视化复盘。
 GLOBAL_DB_PATH = os.path.join(SCRIPT_DIR, "global_training_db.json")
+CLASS_PRINT_REPORT_ROOT = os.path.join(
+    SCRIPT_DIR, "student feedback report", "班级打印报告"
+)
 _global_db_lock = threading.Lock()
 
 # 【疲劳熔断】课堂时序监控状态（纯 Python，不依赖 PyQt QObject 信号总线）
@@ -295,6 +329,20 @@ STABILITY_WINDOW_SIZE = 30
 # 击球关键帧标注图输出的 JPEG 质量：报告场景只需要生成一张静态图，
 # 可以用更高的质量换取更清晰的矢量标注展示效果。
 IMPACT_FRAME_JPEG_QUALITY = 90
+
+
+def _file_sha256(path: Optional[str]) -> Optional[str]:
+    """Return a file SHA-256 without loading the entire video into memory."""
+    if not path or not os.path.isfile(path):
+        return None
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError:
+        return None
+    return digest.hexdigest()
 
 # 【新增：黑屏问题自动诊断】画面平均亮度（0-255）低于这个阈值，判定为"疑似全黑帧"。
 # 这是 Windows 上最常见的一类"黑屏但无任何报错"的真实原因：cv2.VideoCapture 明明
@@ -416,6 +464,10 @@ class AnalysisSession:
         # 队列背压、WebSocket 边界、线程管理、任务状态机。
         # 管线实例在 start() 时构造（run 前所有轨迹属性访问都走下方转发代理）。
         self.pipeline: Optional[ShotAnalysisPipeline] = None
+        self._preview_pipeline: Optional[ShotAnalysisPipeline] = None
+        self._capture_diagnostics_snapshot: Optional[dict] = None
+        self._precision_clip_info: Optional[dict] = None
+        self._precision_lock = threading.Lock()
 
     def start(self):
         self.task_status = TASK_STATUS_PROCESSING
@@ -454,6 +506,9 @@ class AnalysisSession:
         self._completed_event.set()
 
     def get_records_snapshot(self) -> list[dict]:
+        if self._precision_clip_info is not None and self.pipeline is not None:
+            with self.pipeline._records_lock:
+                return list(self.pipeline.records)
         with self._records_lock:
             return list(self.records)
 
@@ -467,6 +522,7 @@ class AnalysisSession:
         msg_type = payload.get("type")
         if (not self._drop_frames_on_backpressure) or msg_type in (
             "camera_lost",
+            "clip_saved",
             "error",
             "notice",
             "stopped",
@@ -544,6 +600,75 @@ class AnalysisSession:
             return {"ball_speed_kmh": None, "launch_angle_deg": None, "meta": {}}
         return self.pipeline.get_ball_outcome()
 
+    def get_capture_diagnostics(self) -> dict:
+        if self._capture_diagnostics_snapshot is not None:
+            return dict(self._capture_diagnostics_snapshot)
+        capture_pipeline = self._preview_pipeline or self.pipeline
+        if capture_pipeline is None:
+            return {}
+        return capture_pipeline.get_capture_diagnostics()
+
+    def get_quality_summaries(self) -> tuple[dict, dict]:
+        """Return aligned summaries for the raw capture and scored attempt."""
+        capture_pipeline = self._preview_pipeline or self.pipeline
+        attempt_pipeline = self.pipeline
+        capture_summary = summarize_capture_quality(capture_pipeline)
+        attempt_summary = summarize_capture_quality(attempt_pipeline)
+        return capture_summary, attempt_summary
+
+    def prepare_precision_analysis(self) -> bool:
+        """Re-run the latest webcam attempt through the file analysis pipeline."""
+        if self.source != "webcam":
+            return False
+        with self._precision_lock:
+            if self._precision_clip_info is not None:
+                return True
+            preview = self._preview_pipeline or self.pipeline
+            if preview is None:
+                return False
+            clip_info = preview.get_latest_auto_capture_clip()
+            clip_path = str((clip_info or {}).get("path") or "")
+            if not clip_path or not os.path.isfile(clip_path):
+                return False
+
+            self._capture_diagnostics_snapshot = preview.get_capture_diagnostics()
+            precision = ShotAnalysisPipeline(
+                session_id=f"{self.session_id}-precision",
+                source="file",
+                video_path=clip_path,
+                camera_index=self.camera_index,
+                push_fn=lambda _payload: None,
+                on_completed=lambda: None,
+            )
+            precision.run()
+            if len(precision._trajectory_angles) < 5:
+                safe_print(
+                    "【api_server】摄像头 attempt 精分析有效帧不足，继续使用实时轨迹。"
+                )
+                return False
+            self._preview_pipeline = preview
+            self.pipeline = precision
+            self._precision_clip_info = dict(clip_info or {})
+            return True
+
+    def get_replay_info(self) -> Optional[dict]:
+        preview = self._preview_pipeline or self.pipeline
+        info = self._precision_clip_info
+        if info is None and preview is not None:
+            info = preview.get_latest_auto_capture_clip()
+        if not isinstance(info, dict):
+            return None
+        path = str(info.get("path") or "")
+        if not path or not os.path.isfile(path):
+            return None
+        return {
+            "filename": os.path.basename(path),
+            "attempt_number": info.get("attempt_number"),
+            "frame_count": info.get("frame_count"),
+            "capture_t_impact": info.get("t_impact"),
+            "sha256": _file_sha256(path),
+        }
+
     def inject_ball_outcome_into_score_detail(self, score_detail=None) -> dict:
         if self.pipeline is None:
             return dict(score_detail or {})
@@ -590,6 +715,17 @@ class AnalysisSession:
 @asynccontextmanager
 async def _app_lifespan(_app: FastAPI):
     """启动时初始化软删除列，并拉起 12 小时自动备份守护线程。"""
+    # Web 摄像头回放只保留脱敏后的临时 attempt；启动时清理 24 小时前的文件。
+    stale_before = time.time() - 24 * 60 * 60
+    try:
+        for name in os.listdir(AUTO_CLIP_DIR):
+            if not name.startswith("web_"):
+                continue
+            path = os.path.join(AUTO_CLIP_DIR, name)
+            if os.path.isfile(path) and os.path.getmtime(path) < stale_before:
+                os.remove(path)
+    except OSError as cleanup_exc:
+        safe_print(f"【api_server】临时摄像头切片清理失败（不影响启动）：{cleanup_exc}")
     try:
         from db import init_db, start_auto_backup_daemon
 
@@ -609,6 +745,11 @@ app = FastAPI(
     version="1.1.0",
     lifespan=_app_lifespan,
 )
+app.mount(
+    "/auto-clips",
+    StaticFiles(directory=AUTO_CLIP_DIR),
+    name="auto-clips",
+)
 
 # 开启 CORS：允许本地 Vite 开发服务器（5173/5183 等常见端口）跨域访问。
 # 开发阶段直接放开所有来源，避免因为 Vite 随机切换端口而反复改配置；
@@ -619,6 +760,7 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition", "X-Report-Student-Count", "X-Skipped-Student-Count"],
 )
 
 
@@ -682,7 +824,11 @@ async def upload_video(file: UploadFile = File(...)):
         finally:
             cap.release()
 
-        return {"video_path": saved_path, "original_filename": file.filename}
+        return {
+            "video_path": saved_path,
+            "original_filename": file.filename,
+            "video_sha256": hashlib.sha256(content).hexdigest(),
+        }
     except Exception as e:
         # 最外层兜底：绝不让未捕获异常把服务进程打挂；统一回传可读 JSON 500
         if saved_path and os.path.exists(saved_path):
@@ -739,15 +885,26 @@ async def websocket_analyze(websocket: WebSocket):
     current_session: Optional[AnalysisSession] = None
     pump_task: Optional[asyncio.Task] = None
 
-    async def pump_frames(session: AnalysisSession):
+    async def pump_frames(session: AnalysisSession, suppress_feedback: bool = False):
         """持续从后台线程的队列里取出处理好的帧，转发给浏览器，
         直到收到 "stopped" 这一条收尾消息为止。
         """
         loop = asyncio.get_event_loop()
         while True:
             payload = await loop.run_in_executor(None, session.frame_queue.get)
+            outgoing = payload
+            if suppress_feedback and payload.get("type") == "frame":
+                outgoing = {
+                    "type": "frame",
+                    "image": "",
+                    "angle": None,
+                    "status": None,
+                    "angular_velocity": None,
+                    "stability_index": None,
+                    "timestamp": payload.get("timestamp"),
+                }
             try:
-                await websocket.send_text(json.dumps(payload, ensure_ascii=False))
+                await websocket.send_text(json.dumps(outgoing, ensure_ascii=False))
             except Exception:
                 # 浏览器端已经断开连接，直接停止转发即可，不需要抛出异常
                 break
@@ -780,6 +937,10 @@ async def websocket_analyze(websocket: WebSocket):
                 source = data.get("source", "webcam")
                 video_path = data.get("video_path")
                 camera_index = int(data.get("camera_index", 0))
+                suppress_feedback = bool(
+                    data.get("suppress_feedback")
+                    or canonical_group(data.get("experimental_group")) == "GROUP_C_CONTROL"
+                )
 
                 current_session = AnalysisSession(
                     session_id=session_id, source=source, video_path=video_path, camera_index=camera_index
@@ -800,7 +961,9 @@ async def websocket_analyze(websocket: WebSocket):
                         }
                     )
                 )
-                pump_task = asyncio.create_task(pump_frames(current_session))
+                pump_task = asyncio.create_task(
+                    pump_frames(current_session, suppress_feedback=suppress_feedback)
+                )
 
             elif action == "stop":
                 if current_session is not None:
@@ -826,6 +989,18 @@ class GenerateReportRequest(BaseModel):
 
     session_id: str = Field(..., min_length=1, max_length=128)
     student_number: str = Field(default="", max_length=64)
+    school: str = Field(default="", max_length=128)
+    class_group: str = Field(default="", max_length=128)
+    classGroup: str = Field(default="", max_length=128)
+    experimental_group: str = Field(default="GROUP_A_REALTIME", max_length=32)
+    experimentalGroup: str = Field(default="", max_length=32)
+    timepoint: str = Field(default="T0", max_length=8)
+    lesson_id: str = Field(default="", max_length=64)
+    lessonId: str = Field(default="", max_length=64)
+    suppress_feedback: bool = False
+    suppressFeedback: bool = False
+    planned_attempts: int = Field(default=DEFAULT_PLANNED_ATTEMPTS, ge=1, le=999)
+    plannedAttempts: Optional[int] = Field(default=None, ge=1, le=999)
 
     @field_validator("session_id")
     @classmethod
@@ -851,6 +1026,39 @@ def generate_report(payload: GenerateReportRequest):
         5) 返回结构化报告 JSON（分数以确定性引擎为准）。
     """
     session = SESSIONS.get(payload.session_id)
+    trace_id = uuid.uuid4().hex
+    experimental_group = canonical_group(
+        payload.experimentalGroup or payload.experimental_group
+    )
+    study_timepoint = normalize_timepoint(payload.timepoint)
+    lesson_id = str(
+        payload.lessonId or payload.lesson_id or time.strftime("%Y-%m-%d")
+    ).strip()[:64]
+    planned_attempts = payload.plannedAttempts or payload.planned_attempts
+    feedback_suppressed = bool(
+        payload.suppress_feedback
+        or payload.suppressFeedback
+        or experimental_group == "GROUP_C_CONTROL"
+    )
+    record_feedback_trace(
+        "generate_report_start",
+        trace_id=trace_id,
+        session_id=payload.session_id,
+        source=getattr(session, "source", None) if session is not None else None,
+        payload={
+            "student_number": payload.student_number,
+            "session_found": session is not None,
+            "task_status": getattr(session, "task_status", None) if session is not None else None,
+            "video_path": os.path.basename(getattr(session, "video_path", "") or "")
+            if session is not None
+            else "",
+            "camera_index": getattr(session, "camera_index", None) if session is not None else None,
+            "experimental_group": experimental_group,
+            "timepoint": study_timepoint,
+            "lesson_id": lesson_id,
+            "feedback_suppressed": feedback_suppressed,
+        },
+    )
 
     # ---------- 竞态锁：未完成则挂起等待 ----------
     if session is not None and session.task_status != TASK_STATUS_COMPLETED:
@@ -873,6 +1081,61 @@ def generate_report(payload: GenerateReportRequest):
                 flush=True,
             )
 
+    precision_analysis_used = False
+    replay_info = None
+    if session is not None and session.task_status == TASK_STATUS_COMPLETED:
+        try:
+            precision_analysis_used = session.prepare_precision_analysis()
+            replay_info = session.get_replay_info()
+        except Exception as precision_exc:  # noqa: BLE001
+            safe_print(
+                f"【api_server】摄像头 attempt 精分析失败，回退实时轨迹：{precision_exc}"
+            )
+    if session is not None and getattr(session, "source", None) == "file":
+        source_video_hash = _file_sha256(getattr(session, "video_path", None))
+    else:
+        source_video_hash = (
+            str((replay_info or {}).get("sha256") or "").strip().lower()
+        ) or None
+    record_feedback_trace(
+        "precision_attempt_ready",
+        trace_id=trace_id,
+        session_id=payload.session_id,
+        source=getattr(session, "source", None) if session is not None else None,
+        payload={
+            "precision_analysis_used": precision_analysis_used,
+            "replay_info": replay_info,
+            "fallback_to_live_trajectory": bool(
+                session is not None
+                and getattr(session, "source", None) == "webcam"
+                and not precision_analysis_used
+            ),
+        },
+    )
+
+    capture_quality_summary: dict = {}
+    attempt_quality_summary: dict = {}
+    if session is not None:
+        capture_quality_summary, attempt_quality_summary = session.get_quality_summaries()
+    quality_gate = evaluate_capture_quality(
+        capture=capture_quality_summary,
+        attempt=attempt_quality_summary,
+        source=str(getattr(session, "source", "unknown") or "unknown"),
+        precision_analysis_used=precision_analysis_used,
+        replay_available=replay_info is not None,
+    )
+    record_feedback_trace(
+        "capture_quality_gate",
+        trace_id=trace_id,
+        session_id=payload.session_id,
+        source=getattr(session, "source", None) if session is not None else None,
+        payload={
+            "quality_gate": quality_gate,
+            "capture": capture_quality_summary,
+            "attempt": attempt_quality_summary,
+        },
+    )
+
     records = session.get_records_snapshot() if session is not None else []
 
     hit_stats = {"green": 0, "yellow": 0, "red": 0}
@@ -892,6 +1155,133 @@ def generate_report(payload: GenerateReportRequest):
     # pose_tracker.py 逐帧真实计算出的物理测量值（并非启发式估算），供教练端
     # 「双轴互动运动学成长期刊图」右侧蓝色虚线轴与学术统计矩阵导出直接消费。
     avg_knee_angle = round(sum(sample_angles) / len(sample_angles), 1) if sample_angles else None
+    record_feedback_trace(
+        "trajectory_snapshot",
+        trace_id=trace_id,
+        session_id=payload.session_id,
+        source=getattr(session, "source", None) if session is not None else None,
+        payload={
+            "hit_stats": hit_stats,
+            "total_attempts": total_attempts,
+            "avg_knee_angle": avg_knee_angle,
+            "records": summarize_records(records),
+            "capture_quality": capture_quality_summary,
+            "attempt_quality": attempt_quality_summary,
+            "quality_gate": quality_gate,
+            "status_counting_unit": "pose_frame",
+            "status_counting_note": (
+                "hit_stats and total_attempts currently count classified pose frames, "
+                "not distinct shot attempts"
+            ),
+            "sync_frame_count": getattr(session, "sync_frame_count", None)
+            if session is not None
+            else None,
+            "t_impact": getattr(session, "t_impact", None) if session is not None else None,
+            "trajectory_angles_count": len(getattr(session, "_trajectory_angles", []) or [])
+            if session is not None
+            else 0,
+            "trajectory_pose_frames_count": len(
+                getattr(session, "_trajectory_pose_frames", []) or []
+            )
+            if session is not None
+            else 0,
+        },
+    )
+
+    # Phase 3 quality choke point: C-grade data never reaches the scorer or LLM.
+    if quality_gate.get("grade") == "C":
+        attempt_ledger = record_attempt(
+            session_id=payload.session_id,
+            student_number=payload.student_number,
+            school=payload.school,
+            class_group=payload.class_group or payload.classGroup,
+            experimental_group=experimental_group,
+            timepoint=study_timepoint,
+            lesson_id=lesson_id,
+            source=str(getattr(session, "source", "unknown") or "unknown"),
+            quality_gate=quality_gate,
+            score=None,
+            planned_attempts=planned_attempts,
+        )
+        generated_at = time.strftime("%Y-%m-%d %H:%M:%S")
+        recommendations = quality_gate.get("recommendations") or []
+        action_plan = "；".join(str(item) for item in recommendations)
+        overview = str(quality_gate.get("summary") or "本次采集质量不达标。")
+        full_text = (
+            f"学号 {payload.student_number or '未填写'} 本次采集质量检查\n\n"
+            f"质量等级：C（{quality_gate.get('score', 0):.1f}/100）\n"
+            f"{overview}\n"
+            + (f"重新采集建议：{action_plan}" if action_plan else "")
+        )
+        angular_velocities_out = (
+            [float(v) for v in session._trajectory_omega]
+            if session is not None
+            else []
+        )
+        analysis_fps = (
+            float(session.pipeline._video_fps)
+            if session is not None and session.pipeline is not None
+            else None
+        )
+        response_payload = {
+            "score": None,
+            "scoreAvailable": False,
+            "totalAttempts": total_attempts,
+            "overview": overview,
+            "biomechanical_analysis": "",
+            "magic_metaphor": "",
+            "action_plan": action_plan,
+            "painPoint": overview,
+            "prescription": action_plan,
+            "fullText": full_text,
+            "generatedAt": generated_at,
+            "hitStats": hit_stats,
+            "impactFrameImage": None,
+            "avgKneeAngle": None,
+            "t_impact": getattr(session, "t_impact", None) if session is not None else None,
+            "tImpact": getattr(session, "t_impact", None) if session is not None else None,
+            "frame_count": len(angular_velocities_out),
+            "frameCount": len(angular_velocities_out),
+            "analysisFps": analysis_fps,
+            "analysisSource": "webcam_attempt_precision"
+            if precision_analysis_used
+            else getattr(session, "source", None),
+            "precisionAnalysisUsed": precision_analysis_used,
+            "shotAttemptCount": 1 if replay_info is not None else 0,
+            "replayVideoPath": (
+                f"/auto-clips/{replay_info['filename']}"
+                if replay_info is not None
+                else None
+            ),
+            "replayClip": replay_info,
+            "sourceVideoHash": source_video_hash,
+            "angular_velocities": angular_velocities_out,
+            "angularVelocities": angular_velocities_out,
+            "time_series_velocity": angular_velocities_out,
+            "timeSeriesVelocity": angular_velocities_out,
+            "task_status": TASK_STATUS_COMPLETED,
+            "scoreDetail": None,
+            "scoringEngine": "capture_quality_gate",
+            "reportStatus": "rejected",
+            "formalReportAllowed": False,
+            "referenceFeedbackAllowed": False,
+            "researchEligible": False,
+            "qualityGate": quality_gate,
+            "experimentalGroup": experimental_group,
+            "timepoint": study_timepoint,
+            "lessonId": lesson_id,
+            "feedbackSuppressed": feedback_suppressed,
+            "attemptLedger": attempt_ledger,
+        }
+        SESSIONS.pop(payload.session_id, None)
+        record_feedback_trace(
+            "generate_report_rejected_by_quality_gate",
+            trace_id=trace_id,
+            session_id=payload.session_id,
+            source=getattr(session, "source", None) if session is not None else None,
+            payload=response_payload,
+        )
+        return response_payload
 
     # 实验防干扰：报告生成路径再次校验基线锁定
     SESSION_METADATA_STORE.warn_if_unlocked(log_fn=safe_print)
@@ -947,28 +1337,111 @@ def generate_report(payload: GenerateReportRequest):
         score_detail = stamp_baseline_watermark(
             score_detail, analysis_session_id=payload.session_id
         )
+        score_detail["quality_gate"] = quality_gate
+    record_feedback_trace(
+        "scoring_result",
+        trace_id=trace_id,
+        session_id=payload.session_id,
+        source=getattr(session, "source", None) if session is not None else None,
+        payload={
+            "deterministic_score": deterministic_score,
+            "t_impact_locked": t_impact_locked,
+            "has_heatmap_base64": bool(heatmap_base64),
+            "has_spatial_trajectory": bool(spatial_trajectory),
+            "score_detail": summarize_score_detail(score_detail),
+        },
+    )
 
     # 【关键接线】必须把 DeterministicScorer 的 score_detail 交给 AIGC（已含脏数据 fallback）。
     diagnosis_for_aigc = None
-    if isinstance(score_detail, dict):
-        diagnosis_for_aigc = {"score_detail": score_detail}
-    print(
-        "【api_server】即将发给大模型的完整诊断 JSON：\n"
-        + json.dumps(diagnosis_for_aigc, indent=4, ensure_ascii=False, default=str)
+    history_context: dict[str, Any] = {}
+    prescription_evidence: dict[str, Any] = {}
+    if isinstance(score_detail, dict) and not feedback_suppressed:
+        class_group = payload.class_group or payload.classGroup
+        history_context = build_history_context(
+            _load_global_records(),
+            student_number=payload.student_number,
+            school=payload.school,
+            class_group=class_group,
+            current_score_detail=score_detail,
+        )
+        prescription_evidence = build_prescription_evidence(
+            {"score_detail": score_detail},
+            history_context=history_context,
+            quality_gate=quality_gate,
+        )
+        score_detail["prescription_evidence"] = prescription_evidence
+        diagnosis_for_aigc = {
+            "score_detail": score_detail,
+            "history_context": history_context,
+            "prescription_evidence": prescription_evidence,
+            "quality_gate": quality_gate,
+        }
+    record_feedback_trace(
+        "aigc_diagnosis_ready",
+        trace_id=trace_id,
+        session_id=payload.session_id,
+        source=getattr(session, "source", None) if session is not None else None,
+        payload={
+            "has_diagnosis_json": isinstance(diagnosis_for_aigc, dict),
+            "score_detail": summarize_score_detail(score_detail),
+            "prescription_evidence": prescription_evidence,
+        },
     )
-    ai_result = llm_agent.generate_session_report(
-        hit_stats=hit_stats,
-        student_number=payload.student_number,
-        sample_angles=sample_angles,
-        deterministic_score=deterministic_score,
-        diagnosis_json=diagnosis_for_aigc,
-    )
+    if feedback_suppressed:
+        ai_result = {
+            "score": float(deterministic_score or 0.0),
+            "overview": "",
+            "biomechanical_analysis": "",
+            "magic_metaphor": "",
+            "action_plan": "",
+            "aigc_source": "suppressed_control",
+        }
+    else:
+        print(
+            "【api_server】即将发给大模型的完整诊断 JSON：\n"
+            + json.dumps(diagnosis_for_aigc, indent=4, ensure_ascii=False, default=str)
+        )
+        ai_result = llm_agent.generate_session_report(
+            hit_stats=hit_stats,
+            student_number=payload.student_number,
+            sample_angles=sample_angles,
+            deterministic_score=deterministic_score,
+            diagnosis_json=diagnosis_for_aigc,
+            trace_id=trace_id,
+            session_id=payload.session_id,
+            source=getattr(session, "source", None) if session is not None else None,
+        )
 
     # 分数以确定性引擎为准；无轨迹时回退 LLM 分
+    record_feedback_trace(
+        "aigc_report_result",
+        trace_id=trace_id,
+        session_id=payload.session_id,
+        source=getattr(session, "source", None) if session is not None else None,
+        payload={
+            "ai_result": summarize_llm_result(ai_result),
+            "aigc_source": ai_result.get("aigc_source") or ai_result.get("aigcSource"),
+        },
+    )
+
     final_score = (
         float(deterministic_score)
         if deterministic_score is not None
         else float(ai_result["score"])
+    )
+    attempt_ledger = record_attempt(
+        session_id=payload.session_id,
+        student_number=payload.student_number,
+        school=payload.school,
+        class_group=payload.class_group or payload.classGroup,
+        experimental_group=experimental_group,
+        timepoint=study_timepoint,
+        lesson_id=lesson_id,
+        source=str(getattr(session, "source", "unknown") or "unknown"),
+        quality_gate=quality_gate,
+        score=final_score,
+        planned_attempts=planned_attempts,
     )
 
     generated_at = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -989,22 +1462,38 @@ def generate_report(payload: GenerateReportRequest):
     )
     aigc_source = ai_result.get("aigc_source") or ai_result.get("aigcSource") or "fallback"
     clinical_brief = ai_result.get("clinical_brief") or ai_result.get("clinicalBrief")
-    full_text = (
-        f"学号 {payload.student_number or '未填写'} 本次综合练习诊断报告\n\n"
-        f"发力稳定性评分：{final_score:.2f} 分（共采集 {total_attempts} 次有效触球数据）。\n"
-        + (f"【综合评价】{overview}\n" if overview else "")
-        + (f"【动力链病理分析】{biomechanical_analysis}\n" if biomechanical_analysis else "")
-        + (f"【具身隐喻处方】{magic_metaphor}\n" if magic_metaphor else "")
-        + (f"【下一步训练指令】{action_plan}" if action_plan else "")
+    priority_target = (
+        ai_result.get("priority_target")
+        or ai_result.get("priorityTarget")
+        or prescription_evidence.get("priorityTarget")
     )
+    full_text = (
+        f"学号 {payload.student_number or '未填写'} {study_timepoint} 无反馈采集记录\n\n"
+        "本记录仅供研究人员进行实验质控与统计，不向被试展示动作评分或训练建议。"
+        if feedback_suppressed
+        else (
+            f"学号 {payload.student_number or '未填写'} 本次综合练习诊断报告\n\n"
+            f"发力稳定性评分：{final_score:.2f} 分（共采集 {total_attempts} 次有效触球数据）。\n"
+            + (f"【综合评价】{overview}\n" if overview else "")
+            + (f"【动力链病理分析】{biomechanical_analysis}\n" if biomechanical_analysis else "")
+            + (f"【具身隐喻处方】{magic_metaphor}\n" if magic_metaphor else "")
+            + (f"【下一步训练指令】{action_plan}" if action_plan else "")
+        )
+    )
+    if quality_gate.get("grade") == "B":
+        full_text = (
+            "【采集质量提示】本次仅为低置信度参考反馈，不进入正式科研统计。\n\n"
+            + full_text
+        )
 
-    # 【大小腿夹角可视化】优先折叠极值帧 + 摆动腿关键点重标定；几何不合格则降级提示
+    # 【大小腿夹角可视化】正式报告固定触球帧 + 摆动腿关键点重标定；几何不合格则降级提示
     impact_frame_image = None
-    if session is not None:
+    if session is not None and not feedback_suppressed:
         try:
             ann_frame, ann_metrics = session.rebuild_leg_annotation(
                 score_detail if isinstance(score_detail, dict) else None,
                 t_impact=t_impact_locked if t_impact_locked is not None else session.t_impact,
+                force_impact_frame=True,
             )
             if ann_frame is not None and ann_metrics is not None:
                 session.impact_frame = ann_frame
@@ -1087,7 +1576,7 @@ def generate_report(payload: GenerateReportRequest):
         except Exception as fatigue_exc:  # noqa: BLE001
             safe_print(f"【api_server】疲劳熔断写入失败（不影响报告）：{fatigue_exc}")
 
-    return {
+    response_payload = {
         "score": final_score,
         "totalAttempts": total_attempts,
         "overview": overview,
@@ -1108,6 +1597,16 @@ def generate_report(payload: GenerateReportRequest):
         "aigcSource": aigc_source,
         "clinical_brief": clinical_brief,
         "clinicalBrief": clinical_brief,
+        "prescriptionEvidence": prescription_evidence,
+        "prescription_evidence": prescription_evidence,
+        "priorityTarget": priority_target,
+        "priority_target": priority_target,
+        "historyContext": history_context,
+        "history_context": history_context,
+        "postprocessAudit": ai_result.get("postprocess_audit")
+        or ai_result.get("postprocessAudit"),
+        "fallbackReason": ai_result.get("fallback_reason")
+        or ai_result.get("fallbackReason"),
         "fullText": full_text,
         "generatedAt": generated_at,
         "hitStats": hit_stats,
@@ -1117,6 +1616,21 @@ def generate_report(payload: GenerateReportRequest):
         "tImpact": t_impact_locked,
         "frame_count": frame_count_out,
         "frameCount": frame_count_out,
+        "analysisFps": (
+            float(session.pipeline._video_fps)
+            if session is not None and session.pipeline is not None
+            else 30.0
+        ),
+        "analysisSource": "webcam_attempt_precision"
+        if precision_analysis_used
+        else getattr(session, "source", None),
+        "precisionAnalysisUsed": precision_analysis_used,
+        "shotAttemptCount": 1 if replay_info is not None else 0,
+        "replayVideoPath": (
+            f"/auto-clips/{replay_info['filename']}" if replay_info is not None else None
+        ),
+        "replayClip": replay_info,
+        "sourceVideoHash": source_video_hash,
         "angular_velocities": angular_velocities_out,
         "angularVelocities": angular_velocities_out,
         # Sprint 1：鞭打发力窗口 [t_impact±30] 角速度时序 + 触球点窗口内索引
@@ -1148,6 +1662,20 @@ def generate_report(payload: GenerateReportRequest):
         "spatialTrajectory": spatial_trajectory,
         "fatigue_warning": fatigue_warning,
         "fatigueWarning": fatigue_warning,
+        "reportStatus": "control_record"
+        if feedback_suppressed
+        else ("formal" if quality_gate.get("grade") == "A" else "reference"),
+        "formalReportAllowed": bool(quality_gate.get("formalReportAllowed")),
+        "referenceFeedbackAllowed": bool(
+            quality_gate.get("referenceFeedbackAllowed")
+        ),
+        "researchEligible": bool(quality_gate.get("researchEligible")),
+        "qualityGate": quality_gate,
+        "experimentalGroup": experimental_group,
+        "timepoint": study_timepoint,
+        "lessonId": lesson_id,
+        "feedbackSuppressed": feedback_suppressed,
+        "attemptLedger": attempt_ledger,
         # 实验防干扰：基线水印摘要（完整字段已写入 scoreDetail）
         "baseline_session_id": (
             score_detail.get("baseline_session_id")
@@ -1170,6 +1698,47 @@ def generate_report(payload: GenerateReportRequest):
             score_detail.get("calibrator_status")
             if isinstance(score_detail, dict)
             else "unlocked"
+        ),
+    }
+    record_feedback_trace(
+        "generate_report_response",
+        trace_id=trace_id,
+        session_id=payload.session_id,
+        source=getattr(session, "source", None) if session is not None else None,
+        payload={
+            "score": final_score,
+            "totalAttempts": total_attempts,
+            "aigc_source": aigc_source,
+            "report": summarize_llm_result(response_payload),
+            "score_detail": summarize_score_detail(score_detail),
+            "frame_count": frame_count_out,
+            "has_impact_frame_image": bool(impact_frame_image),
+            "has_heatmap_base64": bool(heatmap_base64),
+            "fatigue_warning": fatigue_warning,
+            "precision_analysis_used": precision_analysis_used,
+            "replay_info": replay_info,
+        },
+    )
+    return response_payload
+
+
+@app.get("/api/experiment/attempt_ledger")
+def get_experiment_attempt_ledger(
+    student_number: str = "",
+    experimental_group: str = "",
+    timepoint: str = "",
+    lesson_id: str = "",
+    planned_attempts: int = DEFAULT_PLANNED_ATTEMPTS,
+):
+    """Return metadata-only dose and quality-control records for the trial."""
+    return {
+        "success": True,
+        **read_attempts(
+            student_number=student_number,
+            experimental_group=experimental_group,
+            timepoint=timepoint,
+            lesson_id=lesson_id,
+            planned_attempts=max(1, min(999, int(planned_attempts))),
         ),
     }
 
@@ -1681,7 +2250,7 @@ class SaveWordReportRequest(BaseModel):
 
     model_config = ConfigDict(extra="ignore")
 
-    # "realtime" | "delayed" —— 对应一级归档子文件夹「实时反馈」/「延时反馈」
+    # "realtime" | "delayed" | "control" —— A/B/C 三臂归档目录
     mode: str = "realtime"
     # 学校/机构名称、班级/实验组别名称 —— 拼接成二级归档子文件夹
     school: str = ""
@@ -1706,6 +2275,24 @@ class SaveWordReportRequest(BaseModel):
     clinical_echo: Optional[str] = ""
     clinical_brief: Optional[Any] = None
     aigc_source: Optional[str] = None
+    prescriptionEvidence: Optional[dict[str, Any]] = Field(default_factory=dict)
+    historyContext: Optional[dict[str, Any]] = Field(default_factory=dict)
+    priorityTarget: Optional[dict[str, Any]] = Field(default_factory=dict)
+    postprocessAudit: Optional[dict[str, Any]] = Field(default_factory=dict)
+    fallbackReason: Optional[str] = None
+    reportStatus: Optional[str] = None
+    formalReportAllowed: Optional[bool] = None
+    referenceFeedbackAllowed: Optional[bool] = None
+    researchEligible: Optional[bool] = None
+    qualityGate: Optional[dict[str, Any]] = Field(default_factory=dict)
+    experimentalGroup: Optional[str] = None
+    timepoint: Optional[str] = "T0"
+    lessonId: Optional[str] = None
+    feedbackSuppressed: Optional[bool] = False
+    interventionAudit: Optional[dict[str, Any]] = Field(default_factory=dict)
+    sourceType: Optional[str] = None
+    videoHash: Optional[str] = None
+    attemptLedger: Optional[dict[str, Any]] = Field(default_factory=dict)
     comment: Optional[str] = ""
     # 报告生成时间戳（前端已格式化好的字符串），缺省时后端自动补当前时间
     generatedAt: Optional[str] = None
@@ -2762,6 +3349,21 @@ def save_word_report(payload: SaveWordReportRequest):
                 detail=str(dump_exc),
             )
 
+        quality_gate_payload = getattr(payload, "qualityGate", None) or {}
+        if not quality_gate_payload:
+            detail_for_quality = getattr(payload, "scoreDetail", None) or {}
+            if isinstance(detail_for_quality, dict):
+                nested_gate = detail_for_quality.get("quality_gate")
+                if isinstance(nested_gate, dict):
+                    quality_gate_payload = nested_gate
+        quality_grade = str(quality_gate_payload.get("grade") or "").upper()
+        if quality_grade == "C" or getattr(payload, "reportStatus", None) == "rejected":
+            return _word_report_error_response(
+                "本次采集质量为 C 级，未生成正式报告，不能写入科研归档。",
+                status_code=409,
+                detail="capture_quality_rejected",
+            )
+
         try:
             result = word_reporter.save_feedback_to_word(payload_dict if isinstance(payload_dict, dict) else {})
         except (KeyError, TypeError, ValueError, AttributeError) as gen_exc:
@@ -2805,7 +3407,18 @@ def save_word_report(payload: SaveWordReportRequest):
         # ---- 写盘已成功：后续归档库同步单独兜底，失败不影响 Word 成功响应 ----
         record = None
         try:
-            record_type = "delayed" if getattr(payload, "mode", None) == "delayed" else "realtime"
+            requested_mode = str(getattr(payload, "mode", None) or "realtime").lower()
+            record_type = requested_mode if requested_mode in {"realtime", "delayed", "control"} else "realtime"
+            experimental_group = canonical_group(
+                getattr(payload, "experimentalGroup", None)
+                or {"realtime": "GROUP_A", "delayed": "GROUP_B", "control": "GROUP_C"}[record_type]
+            )
+            study_timepoint = normalize_timepoint(getattr(payload, "timepoint", None))
+            lesson_id = str(
+                getattr(payload, "lessonId", None) or _extract_test_date(
+                    getattr(payload, "generatedAt", None) or time.strftime("%Y-%m-%d")
+                )
+            ).strip()[:64]
             overview = getattr(payload, "overview", None) or ""
             biomech = getattr(payload, "biomechanical_analysis", None) or ""
             magic = getattr(payload, "magic_metaphor", None) or ""
@@ -2866,8 +3479,28 @@ def save_word_report(payload: SaveWordReportRequest):
                 snapshot,
             )
 
+            record_id = str(uuid.uuid4())
+            impact_frame_payload = getattr(payload, "impactFrameImage", None)
+            impact_frame_asset = None
+            impact_frame_inline_fallback = None
+            if impact_frame_payload:
+                try:
+                    impact_frame_asset = report_asset_store.save_impact_frame(
+                        record_id,
+                        impact_frame_payload,
+                    )
+                except Exception as asset_exc:  # noqa: BLE001 - never discard the frame
+                    # The Word document has already been generated with this frame.  If
+                    # file persistence fails, retain the former inline representation so
+                    # the archived attempt remains recoverable and can be migrated later.
+                    impact_frame_inline_fallback = impact_frame_payload
+                    safe_print(
+                        "【api_server】击球关键帧资产化失败，已回退为内联归档"
+                        f"（record_id={record_id}）：{asset_exc}"
+                    )
+
             record = {
-                "id": str(uuid.uuid4()),
+                "id": record_id,
                 "timestamp": record_timestamp,
                 "school": getattr(payload, "school", None) or "",
                 "classGroup": getattr(payload, "classGroup", None) or "",
@@ -2883,19 +3516,77 @@ def save_word_report(payload: SaveWordReportRequest):
                 "painPoint": str(biomech or pain or "").strip() or None,
                 "prescription": str(action or prescription or "").strip() or None,
                 "aigc_source": getattr(payload, "aigc_source", None),
-                "impactFrameBase64": getattr(payload, "impactFrameImage", None),
+                "prescriptionEvidence": getattr(payload, "prescriptionEvidence", None),
+                "historyContext": getattr(payload, "historyContext", None),
+                "priorityTarget": getattr(payload, "priorityTarget", None),
+                "postprocessAudit": getattr(payload, "postprocessAudit", None),
+                "fallbackReason": getattr(payload, "fallbackReason", None),
+                "impactFrameAsset": impact_frame_asset,
+                "impactFrameUrl": (
+                    f"/api/coach/records/{record_id}/impact-frame"
+                    if impact_frame_asset or impact_frame_inline_fallback
+                    else None
+                ),
+                "impactFrameStorage": (
+                    "file"
+                    if impact_frame_asset
+                    else "legacy_inline"
+                    if impact_frame_inline_fallback
+                    else "missing"
+                ),
                 "heatmapBase64": getattr(payload, "heatmapBase64", None)
                 or getattr(payload, "heatmap_base64", None),
                 "path": saved_path,
                 "directory": saved_directory,
                 "testDate": _extract_test_date(record_timestamp),
-                "groupTypeCode": 1 if record_type == "realtime" else 2,
+                "groupTypeCode": {"realtime": 1, "delayed": 2, "control": 3}[record_type],
+                "experimental_group": experimental_group,
+                "experimentalGroup": experimental_group,
+                "timepoint": study_timepoint,
+                "lessonId": lesson_id,
+                "feedbackSuppressed": bool(getattr(payload, "feedbackSuppressed", False)),
+                "sourceType": str(
+                    getattr(payload, "sourceType", None)
+                    or (detail_dict or {}).get("source_type")
+                    or "unknown"
+                ),
+                "videoHash": str(
+                    getattr(payload, "videoHash", None) or ""
+                ).strip().lower()
+                or None,
+                "attemptLedger": getattr(payload, "attemptLedger", None) or None,
                 "kneeFlexionAngle": knee_val,
                 "kneeFlexionAngleProvenance": knee_prov,
                 "supportFootDistance": support_val,
                 "supportFootDistanceProvenance": support_prov,
                 "primaryErrorCode": _derive_primary_error_code(biomechanical_errors),
+                "qualityGrade": quality_grade or None,
+                "qualityScore": quality_gate_payload.get("score"),
+                "qualityGate": quality_gate_payload or None,
+                "reportStatus": getattr(payload, "reportStatus", None),
+                "researchEligible": (
+                    bool(getattr(payload, "researchEligible", None))
+                    if getattr(payload, "researchEligible", None) is not None
+                    else quality_grade not in {"B", "C"}
+                ),
             }
+            if impact_frame_inline_fallback:
+                record["impactFrameBase64"] = impact_frame_inline_fallback
+            record.update(build_version_metadata(detail_dict))
+            record["measurementProvenance"] = build_measurement_provenance_summary(
+                detail_dict
+            )
+            intervention_audit = build_intervention_audit(
+                experimental_group,
+                feedback_suppressed=bool(
+                    getattr(payload, "feedbackSuppressed", False)
+                ),
+                supplied=getattr(payload, "interventionAudit", None),
+            )
+            record["interventionAudit"] = intervention_audit
+            record["protocolDeviation"] = bool(
+                intervention_audit.get("protocolDeviation")
+            )
             if snapshot.get("supportFootDistance") is not None and support_prov in (
                 "measured",
                 "calibrated",
@@ -2977,8 +3668,53 @@ def save_word_report(payload: SaveWordReportRequest):
         )
 
 
+def _find_active_global_record(record_id: str) -> Optional[dict]:
+    clean_id = str(record_id or "").strip()
+    if not clean_id:
+        return None
+    with _global_db_lock:
+        record = next(
+            (
+                item
+                for item in _load_global_records()
+                if isinstance(item, dict) and str(item.get("id") or "") == clean_id
+            ),
+            None,
+        )
+    if not isinstance(record, dict) or _is_soft_deleted_record(record):
+        return None
+    return record
+
+
+def _record_without_inline_impact_frame(record: dict) -> dict:
+    """Return a list-safe copy and replace historical Base64 with a detail URL."""
+
+    projected = dict(record)
+    has_impact_frame = bool(
+        projected.get("impactFrameAsset")
+        or projected.get("impactFrameBase64")
+        or projected.get("impactFrameImage")
+    )
+    if has_impact_frame:
+        record_id = str(projected.get("id") or "").strip()
+        if record_id:
+            projected["impactFrameUrl"] = (
+                f"/api/coach/records/{record_id}/impact-frame"
+            )
+        if not projected.get("impactFrameStorage"):
+            projected["impactFrameStorage"] = (
+                "file" if projected.get("impactFrameAsset") else "legacy_inline"
+            )
+    projected.pop("impactFrameBase64", None)
+    projected.pop("impactFrameImage", None)
+    return projected
+
+
 @app.get("/api/get_all_records")
-def get_all_records(include_deleted: bool = False):
+def get_all_records(
+    include_deleted: bool = False,
+    include_inline_assets: bool = False,
+):
     """供教练端数据看板一键拉取全量历史归档数据（实时反馈 A 组 + 延时反馈 B 组）。
 
     默认仅返回 ``is_deleted == False``；软删记录继续躺在硬盘 JSON 中，
@@ -2987,11 +3723,230 @@ def get_all_records(include_deleted: bool = False):
     with _global_db_lock:
         records = [r for r in _load_global_records() if isinstance(r, dict)]
 
-    if include_deleted:
-        return {"success": True, "records": records, "count": len(records)}
+    selected = records if include_deleted else _active_global_records(records)
+    if not include_inline_assets:
+        selected = [_record_without_inline_impact_frame(record) for record in selected]
 
-    active = _active_global_records(records)
-    return {"success": True, "records": active, "count": len(active)}
+    return {"success": True, "records": selected, "count": len(selected)}
+
+
+_DETAIL_METRIC_META: dict[str, tuple[str, str]] = {
+    "distance_cm": ("支撑脚横距", "cm"),
+    "support_lateral_dist_cm": ("支撑脚横向距离", "cm"),
+    "support_ap_offset_cm": ("支撑脚前后偏移", "cm"),
+    "max_folding_angle": ("后摆折叠角", "°"),
+    "impact_knee_angle": ("触球膝角", "°"),
+    "support_knee_angle": ("支撑膝角", "°"),
+    "toe_angle": ("脚尖方向角", "°"),
+    "hip_torsion_angle": ("髋部扭转角", "°"),
+    "ankle_rigidity": ("脚踝刚性方差", "σ²"),
+    "whipping_velocity": ("摆腿鞭打速度", "°/s"),
+}
+
+
+def _coach_attempt_detail(record: dict) -> dict:
+    score_detail = record.get("scoreDetail")
+    if not isinstance(score_detail, dict):
+        score_detail = record.get("score_detail")
+    if not isinstance(score_detail, dict):
+        score_detail = {}
+    indicators = score_detail.get("indicators")
+    if not isinstance(indicators, dict):
+        indicators = {}
+
+    metrics: list[dict[str, Any]] = []
+    for key, (label, unit) in _DETAIL_METRIC_META.items():
+        entry = indicators.get(key)
+        if not isinstance(entry, dict):
+            entry = {}
+        value = None
+        for value_key in ("value", "scoring_value", "variance"):
+            value = _safe_float(entry.get(value_key))
+            if value is not None:
+                break
+        if value is None:
+            value = _safe_float(record.get(key))
+        if value is None and key == "impact_knee_angle":
+            value = _safe_float(record.get("kneeFlexionAngle"))
+        if value is None:
+            continue
+        metrics.append(
+            {
+                "key": key,
+                "label": label,
+                "value": round(value, 3),
+                "unit": unit,
+                "status": entry.get("status"),
+                "provenance": entry.get("provenance")
+                or entry.get("provenance_tier"),
+            }
+        )
+
+    priority_target = record.get("priorityTarget")
+    if not isinstance(priority_target, dict):
+        priority_target = {}
+    overview = str(record.get("overview") or "").strip()
+    biomechanical_analysis = str(
+        record.get("biomechanical_analysis") or record.get("painPoint") or ""
+    ).strip()
+    correction_cue = str(
+        record.get("magic_metaphor") or record.get("correction_metaphor") or ""
+    ).strip()
+    action_plan = str(
+        record.get("action_plan") or record.get("prescription") or ""
+    ).strip()
+    structured_aigc = any(
+        (overview, biomechanical_analysis, correction_cue, action_plan)
+    )
+
+    try:
+        self_check_task = self_check_service.ensure_self_check_task(record)
+        self_check_task["persistenceAvailable"] = True
+    except Exception as task_exc:  # noqa: BLE001 - report remains viewable
+        safe_print(
+            "【api_server】自查任务持久化失败，返回临时任务："
+            f"record_id={record.get('id')}，{task_exc}"
+        )
+        self_check_task = self_check_service.build_task_preview(record)
+
+    has_impact = bool(
+        record.get("impactFrameAsset")
+        or record.get("impactFrameBase64")
+        or record.get("impactFrameImage")
+    )
+    record_id = str(record.get("id") or "")
+    radar = _extract_radar_dict(record)
+    errors = record.get("biomechanicalErrors") or record.get("biomechanical_errors")
+    if not isinstance(errors, list):
+        errors = []
+
+    return {
+        "id": record_id,
+        "studentId": record.get("studentId") or record.get("anonymous_id") or "",
+        "timestamp": record.get("timestamp") or "",
+        "testDate": _record_test_date(record),
+        "school": record.get("school") or "",
+        "classGroup": record.get("classGroup") or "",
+        "type": record.get("type") or "",
+        "groupTypeCode": record.get("groupTypeCode"),
+        "score": record.get("score"),
+        "qualityGrade": record.get("qualityGrade"),
+        "qualityScore": record.get("qualityScore"),
+        "qualityGate": record.get("qualityGate"),
+        "reportStatus": record.get("reportStatus"),
+        "researchEligible": record.get("researchEligible"),
+        "impactFrameAvailable": has_impact,
+        "impactFrameUrl": (
+            f"/api/coach/records/{record_id}/impact-frame" if has_impact else None
+        ),
+        "impactFrameAsset": record.get("impactFrameAsset"),
+        "fiveDimensionScores": radar if isinstance(radar, dict) else None,
+        "metrics": metrics,
+        "biomechanicalErrors": [str(item) for item in errors if item],
+        "aigcPrescription": {
+            "overview": overview,
+            "biomechanicalAnalysis": biomechanical_analysis,
+            "correctionCue": correction_cue,
+            "actionPlan": action_plan,
+            "dosage": str(priority_target.get("dosage") or "").strip(),
+            "safetyNotice": str(priority_target.get("safetyNotice") or "").strip(),
+            "source": record.get("aigc_source"),
+            "legacyText": str(record.get("aiFeedback") or "").strip(),
+        },
+        "legacyReport": not structured_aigc and bool(record.get("aiFeedback")),
+        "priorityTarget": priority_target or None,
+        "selfCheckTask": self_check_task,
+        "wordReportPath": record.get("path"),
+    }
+
+
+@app.get("/api/coach/records/{record_id}/detail")
+def get_coach_record_detail(record_id: str):
+    """Return the complete, stable report payload for one active attempt."""
+
+    record = _find_active_global_record(record_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="record not found")
+    return {"success": True, "record": _coach_attempt_detail(record)}
+
+
+class UpdateSelfCheckRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    slotNo: Optional[int] = None
+    checked: Optional[bool] = None
+    coachVerified: Optional[bool] = None
+    note: Optional[str] = None
+
+
+@app.put("/api/coach/records/{record_id}/self-check")
+def update_coach_record_self_check(
+    record_id: str,
+    payload: UpdateSelfCheckRequest,
+):
+    record = _find_active_global_record(record_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="record not found")
+    if payload.slotNo is None and payload.coachVerified is None:
+        raise HTTPException(status_code=400, detail="no self-check change supplied")
+    try:
+        task = self_check_service.update_self_check_task(
+            record,
+            slot_no=payload.slotNo,
+            checked=payload.checked,
+            coach_verified=payload.coachVerified,
+            note=payload.note,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        safe_print(f"【api_server】保存自查打卡失败：record_id={record_id}，{exc}")
+        raise HTTPException(status_code=503, detail="self-check persistence unavailable") from exc
+    task["persistenceAvailable"] = True
+    return {"success": True, "task": task}
+
+
+@app.get("/api/coach/records/{record_id}/impact-frame")
+def get_coach_record_impact_frame(record_id: str):
+    """Return one archived impact frame without exposing arbitrary disk paths.
+
+    New records resolve their validated file asset.  Historical records that
+    still contain ``impactFrameBase64`` remain readable during the migration
+    window, so introducing file storage does not break existing reports.
+    """
+
+    record = _find_active_global_record(record_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="record not found")
+
+    asset = record.get("impactFrameAsset")
+    if isinstance(asset, dict):
+        try:
+            asset_path = report_asset_store.resolve_asset_path(asset)
+        except report_asset_store.AssetStorageError:
+            asset_path = None
+        if asset_path is not None and asset_path.is_file():
+            media_type = str(asset.get("mimeType") or "image/jpeg")
+            return FileResponse(
+                path=str(asset_path),
+                media_type=media_type,
+                headers={"Cache-Control": "private, max-age=86400"},
+            )
+
+    legacy_payload = record.get("impactFrameBase64") or record.get("impactFrameImage")
+    if legacy_payload:
+        try:
+            decoded = report_asset_store.decode_image_payload(str(legacy_payload))
+        except report_asset_store.AssetStorageError:
+            decoded = None
+        if decoded is not None:
+            return Response(
+                content=decoded["bytes"],
+                media_type=str(decoded["mimeType"]),
+                headers={"Cache-Control": "private, max-age=3600"},
+            )
+
+    raise HTTPException(status_code=404, detail="impact frame not available")
 
 
 class DeleteCoachRecordRequest(BaseModel):
@@ -3148,7 +4103,7 @@ def coach_list_records(
     Query：
         date_from / date_to —— YYYY-MM-DD，闭区间；
         student_id —— 被试编号模糊匹配；
-        group —— 实验组别：realtime | delayed | A | B（亦接受 classGroup 中文别名）；
+        group —— 实验组别：realtime | delayed | control | A | B | C；
         class_group —— 行政班/组别精确过滤；
         include_deleted —— 默认 False，隐藏软删除废记录。
 
@@ -3172,6 +4127,11 @@ def coach_list_records(
         "group_b": "delayed",
         "group_b_delayed": "delayed",
         "实验b组": "delayed",
+        "control": "control",
+        "c": "control",
+        "group_c": "control",
+        "group_c_control": "control",
+        "常规c组": "control",
     }
     group_norm = group_aliases.get(group_q, group_q) if group_q else ""
 
@@ -3199,7 +4159,7 @@ def coach_list_records(
             if student_q not in sid:
                 continue
 
-        if group_norm in ("realtime", "delayed"):
+        if group_norm in ("realtime", "delayed", "control"):
             rtype = str(record.get("type") or "").strip().lower()
             code = record.get("groupTypeCode")
             inferred = (
@@ -3207,11 +4167,13 @@ def coach_list_records(
                 if rtype == "realtime" or code == 1
                 else "delayed"
                 if rtype == "delayed" or code == 2
+                else "control"
+                if rtype == "control" or code == 3
                 else ""
             )
             if inferred != group_norm:
                 continue
-        elif group_q and group_norm not in ("realtime", "delayed"):
+        elif group_q and group_norm not in ("realtime", "delayed", "control"):
             # 非 A/B 别名时，按 classGroup 子串匹配
             cg = str(record.get("classGroup") or record.get("cluster_id") or "")
             if group_q not in cg.lower():
@@ -3856,20 +4818,20 @@ def export_academic_matrix(measured_only: bool = False):
     try:
         exporter = academic_exporter.AcademicDataExporter.from_db()
         result = exporter.export_spss_matrix_file()
-        if measured_only:
-            # 宽表暂无逐字段 provenance；并行落盘实测长表供科研过滤
-            records = _load_global_records()
-            long_result = academic_exporter.export_academic_matrix(
-                records, measured_only=True
-            )
-            if long_result.get("success"):
-                result = {
-                    **result,
-                    "longFormatPath": long_result.get("path"),
-                    "longFormatFilename": long_result.get("filename"),
-                    "longFormatRowCount": long_result.get("rowCount"),
-                    "measuredOnly": True,
-                }
+        # 宽表旁路始终生成版本化长表与排除日志，供论文审计。
+        records = _load_global_records()
+        long_result = academic_exporter.export_academic_matrix(
+            records, measured_only=measured_only
+        )
+        result = {
+            **result,
+            "longFormatPath": long_result.get("path"),
+            "longFormatFilename": long_result.get("filename"),
+            "longFormatRowCount": long_result.get("rowCount"),
+            "exclusionLogPath": long_result.get("exclusionLogPath"),
+            "excludedCount": long_result.get("excludedCount", 0),
+            "measuredOnly": bool(measured_only),
+        }
     except Exception as exc:  # noqa: BLE001
         safe_print(f"【api_server】导出 V3.1 科研宽表失败：{exc}")
         # 回退：旧成长表，避免教练端完全无法导出
@@ -3899,7 +4861,10 @@ def export_academic_matrix(measured_only: bool = False):
         "measuredOnly": bool(result.get("measuredOnly", measured_only)),
         "longFormatPath": result.get("longFormatPath"),
         "longFormatFilename": result.get("longFormatFilename"),
+        "exclusionLogPath": result.get("exclusionLogPath"),
+        "excludedCount": result.get("excludedCount", 0),
         "downloadUrl": "/api/export/spss_matrix",
+        "qualityPolicy": "A-grade_researchEligible_versioned_noProtocolDeviation",
     }
 
 
@@ -3907,7 +4872,7 @@ def export_academic_matrix(measured_only: bool = False):
 def export_spss_wide_matrix():
     """【V3.1 Cluster-RCT · MSEM】导出全数字化 SPSS 标准宽表 CSV（浏览器直接下载）。
 
-    数据源优先级：``cluster_rct.db`` → 桥接 ``global_training_db.json``。
+    数据源优先级：带质量门控的 ``global_training_db.json`` → ``cluster_rct.db``。
     主键 ``anonymous_id`` 一行一人；T0–T4 前缀展平；组别/疲劳/锁踝全数字编码；
     含 ``Heatmap_Dispersion_Index`` / ``Ankle_Rigidity_Score`` 衍生中介；
     表尾 ``Class_Dummy_1``…``Class_Dummy_5`` 群聚固定效应哑变量。
@@ -3938,6 +4903,7 @@ def export_spss_wide_matrix():
             "Content-Disposition": f'attachment; filename="{filename}"',
             "X-Export-Row-Count": str(len(wide_df)),
             "X-Export-Column-Count": str(len(wide_df.columns)),
+            "X-Export-Quality-Policy": "A-grade_researchEligible_notDeleted",
         },
     )
 
@@ -4002,6 +4968,9 @@ class GenerateIndividualSummaryRequest(BaseModel):
     scoreHistory: list[float] = Field(default_factory=list)
     # 禁止 dict[str, int]：聚合占比/均值可能带小数 → 一律 float
     errorCounter: dict[str, float] = Field(default_factory=dict)
+    attempts: list[dict[str, Any]] = Field(default_factory=list)
+    dateFrom: Optional[str] = None
+    dateTo: Optional[str] = None
 
     @field_validator("scoreHistory", mode="before")
     @classmethod
@@ -4014,27 +4983,405 @@ class GenerateIndividualSummaryRequest(BaseModel):
     def _coerce_error_counter(cls, value):
         return _coerce_float_dict_soft(value, default_empty=True) or {}
 
+    @field_validator("dateFrom", "dateTo", mode="before")
+    @classmethod
+    def _coerce_summary_date(cls, value):
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            datetime.strptime(text, "%Y-%m-%d")
+        except ValueError as exc:
+            raise ValueError("日期必须使用 YYYY-MM-DD 格式") from exc
+        return text
 
-@app.post("/api/generate_individual_summary")
-def generate_individual_summary_endpoint(payload: GenerateIndividualSummaryRequest):
-    """「个体纵向进化追踪」档案：基于该生全周期历史评分与错误分类统计，
-    调用 DeepSeek 生成结构化的「稳定发力优势」与「需克服习惯性盲区」总结。
-    """
-    # LLM 侧按「次数」展示时取整；校验层保持 float 以免 422
+
+def _build_individual_summary_payload(
+    payload: GenerateIndividualSummaryRequest,
+    *,
+    record_index: Optional[dict[str, dict]] = None,
+) -> dict[str, Any]:
+    """Build the canonical on-screen/Word individual summary payload."""
+    try:
+        scoped_attempts = filter_individual_attempts_by_date(
+            payload.attempts or [], payload.dateFrom, payload.dateTo
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    evidence_summary = summarize_individual_attempts(scoped_attempts)
+    evidence_scores = evidence_summary.get("scoreSummary", {}).get("history") or []
+    evidence_errors = evidence_summary.get("errorCounts") or {}
+    # 兼容旧客户端；新客户端以逐次A级证据为权威来源。
+    score_history = evidence_scores or payload.scoreHistory
+    error_source = evidence_errors or payload.errorCounter
     error_counter_int = {
-        str(k): int(round(float(v))) for k, v in (payload.errorCounter or {}).items()
+        str(k): int(round(float(v))) for k, v in (error_source or {}).items()
     }
     ai_result = llm_agent.generate_individual_summary(
         student_id=payload.studentId,
-        score_history=payload.scoreHistory,
+        score_history=score_history,
         error_counter=error_counter_int,
+        longitudinal_summary=evidence_summary if payload.attempts else None,
     )
     generated_at = time.strftime("%Y-%m-%d %H:%M:%S")
+    formal_attempts = evidence_summary.get("attempts") or []
+    formal_ids = [
+        str(item.get("attemptId") or "")
+        for item in formal_attempts
+        if isinstance(item, dict) and item.get("attemptId")
+    ]
+    signature_source = "|".join(
+        [
+            str(payload.studentId or "anonymous"),
+            str(payload.dateFrom or ""),
+            str(payload.dateTo or ""),
+            *formal_ids,
+        ]
+    )
+    report_fingerprint = hashlib.sha256(signature_source.encode("utf-8")).hexdigest()[:24]
+    summary_source_id = f"summary:{report_fingerprint}"
+
+    representative_record = None
+    for attempt_id in reversed(formal_ids):
+        candidate = (
+            record_index.get(attempt_id)
+            if isinstance(record_index, dict)
+            else _find_active_global_record(attempt_id)
+        )
+        if candidate is None:
+            continue
+        if str(candidate.get("studentId") or "") != str(payload.studentId or ""):
+            continue
+        representative_record = candidate
+        break
+
+    representative_payload = None
+    if representative_record is not None:
+        representative_id = str(representative_record.get("id") or "")
+        has_impact = bool(
+            representative_record.get("impactFrameAsset")
+            or representative_record.get("impactFrameBase64")
+            or representative_record.get("impactFrameImage")
+        )
+        representative_payload = {
+            "id": representative_id,
+            "timestamp": representative_record.get("timestamp"),
+            "testDate": representative_record.get("testDate"),
+            "score": _safe_float(representative_record.get("score")),
+            "impactFrameAvailable": has_impact,
+            "impactFrameUrl": (
+                f"/api/coach/records/{representative_id}/impact-frame"
+                if has_impact
+                else None
+            ),
+        }
+
+    error_counts = evidence_summary.get("errorCounts") or {}
+    top_errors = [
+        {
+            "label": str(label),
+            "count": int(count),
+            "rate": float((evidence_summary.get("errorRates") or {}).get(label) or 0),
+        }
+        for label, count in list(error_counts.items())[:5]
+    ]
+    task_record = {
+        "id": summary_source_id,
+        "quantified5dScores": evidence_summary.get("fiveDimensionScores") or {},
+        "biomechanicalErrors": [item["label"] for item in top_errors],
+    }
+    try:
+        self_check_task = self_check_service.ensure_self_check_task(task_record)
+    except Exception as task_exc:  # noqa: BLE001
+        safe_print(f"【api_server】个人总体分析自查任务持久化失败：{task_exc}")
+        self_check_task = self_check_service.build_task_preview(task_record)
+
     return {
+        "reportId": report_fingerprint,
+        "studentId": payload.studentId,
+        "requestedPeriod": {"start": payload.dateFrom, "end": payload.dateTo},
+        "period": evidence_summary.get("period") or {"start": None, "end": None},
+        "scoreSummary": evidence_summary.get("scoreSummary") or {},
+        "fiveDimensionScores": evidence_summary.get("fiveDimensionScores") or {},
+        "representativeAttempt": representative_payload,
+        "topErrors": top_errors,
+        "selfCheckTask": self_check_task,
+        "overallAssessment": ai_result.get("overallAssessment") or "",
+        "progressAnalysis": ai_result.get("progressAnalysis") or "",
         "strengths": ai_result["strengths"],
         "weaknesses": ai_result["weaknesses"],
+        "prescription": ai_result.get("prescription") or "",
+        "dosage": ai_result.get("dosage") or "",
         "generatedAt": generated_at,
+        "evidenceSummary": evidence_summary if payload.attempts else None,
+        "formalAttemptCount": evidence_summary.get("formalAttemptCount", 0)
+        if payload.attempts
+        else len(score_history),
+        "excludedAttemptCount": evidence_summary.get("excludedAttemptCount", 0)
+        if payload.attempts
+        else 0,
     }
+
+
+@app.post("/api/generate_individual_summary")
+def generate_individual_summary_endpoint(payload: GenerateIndividualSummaryRequest):
+    """Generate one detailed longitudinal report using the canonical payload."""
+
+    return _build_individual_summary_payload(payload)
+
+
+class GenerateClassPrintReportRequest(BaseModel):
+    """Current coach-filter scope for one-click class Word generation."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    school: str = Field(min_length=1, max_length=128)
+    classGroup: str = Field(min_length=1, max_length=128)
+    group: Optional[str] = Field(default=None, max_length=32)
+    dateFrom: Optional[str] = None
+    dateTo: Optional[str] = None
+    studentsPerPage: int = 2
+
+    @field_validator("school", "classGroup", mode="before")
+    @classmethod
+    def _clean_required_scope(cls, value):
+        return str(value or "").strip()
+
+    @field_validator("dateFrom", "dateTo", mode="before")
+    @classmethod
+    def _coerce_print_date(cls, value):
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            datetime.strptime(text, "%Y-%m-%d")
+        except ValueError as exc:
+            raise ValueError("日期必须使用 YYYY-MM-DD 格式") from exc
+        return text
+
+    @field_validator("studentsPerPage", mode="before")
+    @classmethod
+    def _validate_density(cls, value):
+        density = int(value or 2)
+        if density not in (2, 3):
+            raise ValueError("每页人数只能选择 2 或 3")
+        return density
+
+    @model_validator(mode="after")
+    def _validate_print_period(self):
+        if self.dateFrom and self.dateTo and self.dateFrom > self.dateTo:
+            raise ValueError("开始日期不能晚于结束日期")
+        return self
+
+
+def _record_group_for_class_print(record: dict) -> str:
+    raw = str(
+        record.get("experimentalGroup")
+        or record.get("experimental_group")
+        or ""
+    ).strip().upper()
+    aliases = {
+        "A": "GROUP_A",
+        "REALTIME": "GROUP_A",
+        "GROUP_A_REALTIME": "GROUP_A",
+        "B": "GROUP_B",
+        "DELAYED": "GROUP_B",
+        "GROUP_B_DELAYED": "GROUP_B",
+        "C": "GROUP_C",
+        "CONTROL": "GROUP_C",
+        "GROUP_C_CONTROL": "GROUP_C",
+    }
+    if raw in ("GROUP_A", "GROUP_B", "GROUP_C"):
+        return raw
+    if raw in aliases:
+        return aliases[raw]
+    code = record.get("groupTypeCode")
+    if code == 1 or str(record.get("type") or "").lower() == "realtime":
+        return "GROUP_A"
+    if code == 2 or str(record.get("type") or "").lower() == "delayed":
+        return "GROUP_B"
+    if code == 3 or str(record.get("type") or "").lower() == "control":
+        return "GROUP_C"
+    return ""
+
+
+def _impact_bytes_for_summary(report: dict, record_index: dict[str, dict]) -> Optional[bytes]:
+    representative = report.get("representativeAttempt")
+    if not isinstance(representative, dict):
+        return None
+    record = record_index.get(str(representative.get("id") or ""))
+    if not isinstance(record, dict):
+        return None
+
+    asset = record.get("impactFrameAsset")
+    if isinstance(asset, dict):
+        try:
+            asset_path = report_asset_store.resolve_asset_path(asset)
+        except report_asset_store.AssetStorageError:
+            asset_path = None
+        if asset_path is not None and asset_path.is_file():
+            try:
+                return asset_path.read_bytes()
+            except OSError:
+                pass
+
+    legacy_payload = record.get("impactFrameBase64") or record.get("impactFrameImage")
+    if legacy_payload:
+        try:
+            decoded = report_asset_store.decode_image_payload(str(legacy_payload))
+        except report_asset_store.AssetStorageError:
+            decoded = None
+        if decoded is not None:
+            return decoded.get("bytes")
+    return None
+
+
+def _class_print_period_text(date_from: Optional[str], date_to: Optional[str]) -> str:
+    if date_from and date_to:
+        return f"{date_from} 至 {date_to}"
+    if date_from:
+        return f"{date_from} 起"
+    if date_to:
+        return f"截至 {date_to}"
+    return "全部有效记录"
+
+
+@app.post("/api/coach/class-print-report")
+def generate_class_print_report(payload: GenerateClassPrintReportRequest):
+    """Generate a cut-ready A4 Word file for the selected school and class."""
+
+    try:
+        scoped_records: list[dict] = []
+        requested_group = str(payload.group or "").strip().upper()
+        if requested_group == "ALL":
+            requested_group = ""
+        with _global_db_lock:
+            active_records = _active_global_records(_load_global_records())
+        for record in active_records:
+            if str(record.get("school") or "").strip() != payload.school:
+                continue
+            if str(record.get("classGroup") or "").strip() != payload.classGroup:
+                continue
+            if requested_group and _record_group_for_class_print(record) != requested_group:
+                continue
+            scoped_records.append(record)
+
+        try:
+            scoped_records = list(
+                filter_individual_attempts_by_date(
+                    scoped_records, payload.dateFrom, payload.dateTo
+                )
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        by_student: dict[str, list[dict]] = collections.defaultdict(list)
+        record_index: dict[str, dict] = {}
+        for record in scoped_records:
+            record_id = str(record.get("id") or "").strip()
+            student_id = str(
+                record.get("studentId")
+                or record.get("student_id")
+                or record.get("anonymous_id")
+                or ""
+            ).strip()
+            if record_id:
+                record_index[record_id] = record
+            if student_id:
+                by_student[student_id].append(record)
+
+        if not by_student:
+            raise HTTPException(status_code=404, detail="当前班级与筛选时段内没有可生成报告的学生记录")
+        if len(by_student) > 120:
+            raise HTTPException(status_code=400, detail="单次班级报告最多支持 120 名学生")
+
+        reports: list[dict[str, Any]] = []
+        skipped = 0
+        for student_id in sorted(by_student, key=lambda item: item.casefold()):
+            attempts = sorted(
+                by_student[student_id], key=lambda item: str(item.get("timestamp") or "")
+            )
+            evidence = summarize_individual_attempts(attempts)
+            if int(evidence.get("formalAttemptCount") or 0) <= 0:
+                skipped += 1
+                continue
+            report = _build_individual_summary_payload(
+                GenerateIndividualSummaryRequest(
+                    studentId=student_id,
+                    attempts=attempts,
+                    dateFrom=payload.dateFrom,
+                    dateTo=payload.dateTo,
+                ),
+                record_index=record_index,
+            )
+            report["impactFrameBytes"] = _impact_bytes_for_summary(report, record_index)
+            reports.append(report)
+
+        if not reports:
+            raise HTTPException(
+                status_code=422,
+                detail="当前班级与筛选时段内没有 A 级科研有效尝试，未生成打印报告",
+            )
+
+        generated_at = time.strftime("%Y-%m-%d %H:%M:%S")
+        safe_school = word_reporter.sanitize_path_component(payload.school, "未设置学校")
+        safe_class = word_reporter.sanitize_path_component(payload.classGroup, "未设置班级")
+        target_dir = os.path.join(CLASS_PRINT_REPORT_ROOT, f"{safe_school}-{safe_class}")
+        os.makedirs(target_dir, exist_ok=True)
+        filename = (
+            f"{time.strftime('%Y-%m-%d_%H-%M-%S')}_{safe_class}_"
+            f"个人总体分析_{payload.studentsPerPage}人每页_{uuid.uuid4().hex[:6]}.docx"
+        )
+        output_path = os.path.join(target_dir, filename)
+        class_print_reporter.create_class_print_report(
+            reports,
+            school=payload.school,
+            class_group=payload.classGroup,
+            period_text=_class_print_period_text(payload.dateFrom, payload.dateTo),
+            generated_at=generated_at,
+            students_per_page=payload.studentsPerPage,
+            output_path=output_path,
+        )
+        return FileResponse(
+            path=output_path,
+            filename=filename,
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            headers={
+                "X-Report-Student-Count": str(len(reports)),
+                "X-Skipped-Student-Count": str(skipped),
+                "Cache-Control": "no-store",
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001 - keep the coach dashboard responsive
+        safe_print(f"【api_server】班级 Word 报告生成失败：{exc}")
+        safe_print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"班级 Word 报告生成失败：{exc}") from exc
+
+
+class UpdateIndividualSummarySelfCheckRequest(UpdateSelfCheckRequest):
+    sourceRecordId: str
+
+
+@app.put("/api/coach/individual-summary/self-check")
+def update_individual_summary_self_check(
+    payload: UpdateIndividualSummarySelfCheckRequest,
+):
+    source_id = str(payload.sourceRecordId or "").strip()
+    if not source_id.startswith("summary:") or len(source_id) > 128:
+        raise HTTPException(status_code=400, detail="invalid summary task source")
+    try:
+        task = self_check_service.update_self_check_task(
+            {"id": source_id},
+            slot_no=payload.slotNo,
+            checked=payload.checked,
+            coach_verified=payload.coachVerified,
+            note=payload.note,
+        )
+    except (ValueError, LookupError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"success": True, "task": task}
 
 
 class OpenFolderRequest(BaseModel):
@@ -4078,8 +5425,105 @@ def open_folder(payload: OpenFolderRequest):
 # --------------------------------------------------------------------------
 
 
+class MeasurementValidationRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    pairs: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class GoldStandardCommitRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    previewToken: str = ""
+
+
+class GoldStandardValidateRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    datasetId: str = ""
+
+
+@app.get("/api/research/threshold-profile")
+def research_threshold_profile():
+    """Return the active, versioned traffic-light thresholds used by all layers."""
+    from empirical_thresholds import get_threshold_profile
+
+    return {"success": True, **get_threshold_profile()}
+
+
+@app.post("/api/research/gold-standard/import/preview")
+async def preview_gold_standard_import(file: UploadFile = File(...)):
+    """Parse and validate Kinovea/manual/mocap annotations without committing them."""
+    from gold_standard_store import preview_import
+
+    try:
+        content = await file.read()
+        return preview_import(file.filename or "annotations.csv", content)
+    except (ValueError, UnicodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/research/gold-standard/import/commit")
+def commit_gold_standard_import(payload: GoldStandardCommitRequest):
+    """Commit a successfully previewed annotation file as an immutable dataset."""
+    from gold_standard_store import commit_preview
+
+    try:
+        return commit_preview(payload.previewToken)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (ValueError, FileExistsError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/api/research/gold-standard/datasets")
+def get_gold_standard_datasets():
+    from gold_standard_store import list_datasets
+
+    datasets = list_datasets()
+    return {"success": True, "count": len(datasets), "datasets": datasets}
+
+
+@app.post("/api/research/gold-standard/validate")
+def validate_gold_standard_dataset(payload: GoldStandardValidateRequest):
+    """Align one imported dataset to archived attempts and persist a validity report."""
+    from gold_standard_store import generate_validation_report
+
+    try:
+        return generate_validation_report(payload.datasetId, _active_global_records())
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/research/gold-standard/reports/{dataset_id}")
+def get_gold_standard_report(dataset_id: str):
+    from gold_standard_store import latest_validation_report
+
+    report = latest_validation_report(dataset_id)
+    if report is None:
+        raise HTTPException(status_code=404, detail="该数据集尚未生成效度报告")
+    return report
+
+
+@app.post("/api/research/validate_measurements")
+def validate_measurements_endpoint(payload: MeasurementValidationRequest):
+    """Compare system outputs with blinded manual/motion-capture annotations."""
+    from measurement_validation import validate_measurement_pairs
+
+    return validate_measurement_pairs(payload.pairs)
+
+
 @app.get("/api/analytics/compare_cohorts")
-def analytics_compare_cohorts(cohort_a: str = "", cohort_b: str = ""):
+def analytics_compare_cohorts(
+    cohort_a: str = "",
+    cohort_b: str = "",
+    school: str = "",
+    experimental_group: str = "",
+    timepoints: str = "",
+    date_from: str = "",
+    date_to: str = "",
+    strict_quality: bool = True,
+):
     """【班级/实验组对比】科研分析聚合。
 
     Query：
@@ -4099,6 +5543,16 @@ def analytics_compare_cohorts(cohort_a: str = "", cohort_b: str = ""):
             cohort_a,
             cohort_b,
             records=_active_global_records(),
+            school=school.strip(),
+            experimental_group=experimental_group.strip(),
+            timepoints=tuple(
+                normalize_timepoint(item.strip())
+                for item in timepoints.split(",")
+                if item.strip()
+            ),
+            date_from=date_from.strip()[:10],
+            date_to=date_to.strip()[:10],
+            strict_quality=bool(strict_quality),
         )
         return payload
     except Exception as exc:  # noqa: BLE001

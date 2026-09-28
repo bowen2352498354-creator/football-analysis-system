@@ -1,7 +1,10 @@
 // 全局类型定义：足球AI可视化反馈系统
 
-/** 顶部导航三个视图模式 */
-export type ViewMode = 'realtime' | 'zen' | 'coach'
+/** 顶部导航四个视图模式：A/B/C 三臂 + 教练端 */
+export type ViewMode = 'realtime' | 'zen' | 'control' | 'coach'
+
+export type StudyTimepoint = 'T0' | 'T1' | 'T2' | 'T3' | 'T4'
+export type ExperimentalGroupCode = 'GROUP_A_REALTIME' | 'GROUP_B_DELAYED' | 'GROUP_C_CONTROL'
 
 /** 三级阈值容错等级：绿(达标) / 黄(接近) / 红(错误) */
 export type ThresholdLevel = 'green' | 'yellow' | 'red'
@@ -93,6 +96,35 @@ export interface GlobalSettings {
    * 报告，并同步汇入全局训练数据库（global_training_db.json + 教练端看板）。
    */
   enableDataArchiving: boolean
+  /** 本轮实验的纵向测量时点；所有新 attempt 必须显式携带 */
+  studyTimepoint: StudyTimepoint
+  /** 每位学生在当前时点计划完成的有效射门次数 */
+  plannedAttempts: number
+}
+
+export interface AttemptLedgerSummary {
+  studentNumber: string
+  experimentalGroup: ExperimentalGroupCode
+  timepoint: StudyTimepoint
+  lessonId: string
+  totalAttempts: number
+  validAttempts: number
+  invalidAttempts: number
+  plannedAttempts: number
+  remainingAttempts: number
+  doseComplete: boolean
+}
+
+export interface AttemptLedgerResult {
+  attempt?: {
+    id?: string
+    sessionId?: string
+    attemptOrdinal?: number
+    valid?: boolean
+    invalidReasons?: Array<{ code: string; label: string }>
+    qualityGrade?: 'A' | 'B' | 'C'
+  }
+  summary: AttemptLedgerSummary
 }
 
 /** 视频源模式：实时摄像头 或 本地视频文件回放分析 */
@@ -133,9 +165,72 @@ export interface ClinicalBriefPayload {
 }
 
 /** DeepSeek 生成的本次综合练习诊断报告（分析结束后展示） */
+export interface CaptureQualityIssue {
+  code: string
+  label: string
+  severity: 'warning' | 'critical' | string
+  actual?: unknown
+  requirement?: string
+}
+
+export interface CaptureQualityGate {
+  schemaVersion: string
+  grade: 'A' | 'B' | 'C'
+  score: number
+  summary: string
+  formalReportAllowed: boolean
+  referenceFeedbackAllowed: boolean
+  researchEligible: boolean
+  issues: CaptureQualityIssue[]
+  recommendations: string[]
+  metrics?: Record<string, number | string | null>
+}
+
+export interface PrescriptionMetricEvidence {
+  metricKey: string
+  label: string
+  measuredValue: number | null
+  unit: string
+  standardRange: { low: number | null; high: number | null; text: string }
+  deviationDirection: '偏低' | '偏高' | '区间内' | '未知' | string
+  penalty: number | null
+  status?: string | null
+  provenance?: string | null
+  confidence?: number | null
+  method?: string | null
+  errorCode?: string | null
+  reason?: string | null
+  historyComparison?: Record<string, number | string | null>
+}
+
+export interface PrescriptionPriorityTarget {
+  metricKey: string
+  label: string
+  measuredValue: number | null
+  unit: string
+  deviationDirection: string
+  standardRange?: { low: number | null; high: number | null; text: string }
+  penalty?: number | null
+  reason?: string | null
+  exercise: string
+  cue: string
+  dosage: string
+  retestCriterion: string
+}
+
+export interface PrescriptionEvidence {
+  version: string
+  selectionRule: string
+  topDeductions: PrescriptionMetricEvidence[]
+  priorityTarget: PrescriptionPriorityTarget | null
+  quality?: Record<string, number | string | boolean | null>
+  historyContext?: Record<string, unknown>
+}
+
 export interface FinalDiagnosisReport {
   /** 发力稳定性综合评分（0-100） */
-  score: number
+  score: number | null
+  scoreAvailable?: boolean
   /** 本次分析总触球/采样次数 */
   totalAttempts: number
   /** 主要痛点描述（动力链病理分析 / 具身隐喻） */
@@ -163,6 +258,14 @@ export interface FinalDiagnosisReport {
   /** 引擎组装的 ClinicalBrief（供前端展示依据） */
   clinical_brief?: ClinicalBriefPayload | null
   clinicalBrief?: ClinicalBriefPayload | null
+  prescriptionEvidence?: PrescriptionEvidence | null
+  prescription_evidence?: PrescriptionEvidence | null
+  priorityTarget?: PrescriptionPriorityTarget | null
+  priority_target?: PrescriptionPriorityTarget | null
+  historyContext?: Record<string, unknown> | null
+  history_context?: Record<string, unknown> | null
+  postprocessAudit?: Record<string, unknown> | null
+  fallbackReason?: string | null
   /** 拼接完整的报告正文，用于打字机展示与导出 */
   fullText: string
   /** 报告生成时间 */
@@ -199,6 +302,41 @@ export interface FinalDiagnosisReport {
   /** 本次分析采样总帧数 */
   frame_count?: number | null
   frameCount?: number | null
+  /** 摄像头 attempt 精分析所用视频帧率 */
+  analysisFps?: number | null
+  /** webcam_attempt_precision 表示报告来自自动切片后的离线精分析 */
+  analysisSource?: string | null
+  precisionAnalysisUsed?: boolean
+  reportStatus?: 'formal' | 'reference' | 'rejected' | string
+  formalReportAllowed?: boolean
+  referenceFeedbackAllowed?: boolean
+  researchEligible?: boolean
+  protocolVersion?: string
+  analysisVersion?: string
+  thresholdVersion?: string
+  measurementVersion?: string
+  modelVersion?: string
+  sourceType?: string
+  /** 分析源视频或摄像头脱敏 attempt 片段的 SHA-256。 */
+  sourceVideoHash?: string | null
+  measurementProvenance?: Record<string, unknown> | null
+  interventionAudit?: Record<string, unknown> | null
+  protocolDeviation?: boolean
+  qualityGate?: CaptureQualityGate | null
+  experimentalGroup?: ExperimentalGroupCode
+  timepoint?: StudyTimepoint
+  lessonId?: string
+  feedbackSuppressed?: boolean
+  attemptLedger?: AttemptLedgerResult
+  shotAttemptCount?: number
+  /** 后端自动截取的脱敏回放片段，相对于 API_BASE_URL */
+  replayVideoPath?: string | null
+  replayClip?: {
+    filename?: string
+    attempt_number?: number
+    frame_count?: number
+    capture_t_impact?: number
+  } | null
   /**
    * 【V2.5 Kinovea 联动】摆动腿小腿角速度全程时序（deg/s），
    * 下标即 frame_index，供 SynchronizedVideoWorkspace 波形图与视频 scrub 同步。
@@ -353,13 +491,23 @@ export interface StudentReviewSummary {
 /* ------------------------------------------------------------------ */
 
 /** 单条归档记录所属的测试模式：实时反馈(A组) / 延时反馈(B组) */
-export type FeedbackRecordType = 'realtime' | 'delayed'
+export type FeedbackRecordType = 'realtime' | 'delayed' | 'control'
+
+/** 独立落盘的击球瞬间骨骼定格图；列表只传元数据，不传大段 Base64。 */
+export interface ImpactFrameAsset {
+  path: string
+  mimeType: 'image/jpeg' | 'image/png' | 'image/webp' | string
+  sha256: string
+  width: number
+  height: number
+  sizeBytes: number
+}
 
 /**
  * 【核心新增】全局训练数据库单条记录：每当一份 Word 报告成功写盘归档，
  * 后端 /api/save_word_report 都会自动追加一条这样的完整记录进
  * global_training_db.json，同时前端把同一份记录同步写进
- * localStorage['global_football_records'] 作为极速双保险，
+ * localStorage['global_football_records_v2'] 作为极速双保险，
  * 供教练端数据看板 (CoachDashboard.tsx) 统一读取消费。
  */
 export interface GlobalTrainingRecord {
@@ -377,6 +525,26 @@ export interface GlobalTrainingRecord {
   type: FeedbackRecordType
   /** 发力综合评分（0-100），可能为空 */
   score: number | null
+  qualityGrade?: 'A' | 'B' | 'C' | null
+  qualityScore?: number | null
+  qualityGate?: CaptureQualityGate | null
+  reportStatus?: 'formal' | 'reference' | 'rejected' | string | null
+  researchEligible?: boolean
+  protocolVersion?: string
+  analysisVersion?: string
+  thresholdVersion?: string
+  measurementVersion?: string
+  modelVersion?: string
+  sourceType?: string
+  videoHash?: string | null
+  measurementProvenance?: Record<string, unknown> | null
+  interventionAudit?: Record<string, unknown> | null
+  protocolDeviation?: boolean
+  prescriptionEvidence?: PrescriptionEvidence | null
+  historyContext?: Record<string, unknown> | null
+  priorityTarget?: PrescriptionPriorityTarget | null
+  postprocessAudit?: Record<string, unknown> | null
+  fallbackReason?: string | null
   /** DeepSeek 大模型给出的动作批注与改进建议（痛点分析 + 教练处方拼接） */
   aiFeedback: string
   /**
@@ -389,6 +557,11 @@ export interface GlobalTrainingRecord {
   biomechanicalErrors?: string[]
   /** 后端 OpenCV 矢量标注过的击球关键帧截图（Base64 data URI），可能为空 */
   impactFrameBase64?: string | null
+  /** 新版文件化关键帧元数据；旧记录可能缺失并继续使用 impactFrameBase64。 */
+  impactFrameAsset?: ImpactFrameAsset | null
+  /** 受控图片读取地址，禁止直接暴露本机绝对路径。 */
+  impactFrameUrl?: string | null
+  impactFrameStorage?: 'file' | 'legacy_inline' | 'missing' | string
   /** Sprint 1：支撑脚 / 摆腿时空热力图 PNG base64（可无 data URI 前缀） */
   heatmapBase64?: string | null
   heatmap_base64?: string | null
@@ -406,6 +579,8 @@ export interface GlobalTrainingRecord {
   testDate?: string
   /** 科研纵向节点 T0..T4（若后端/归档已写入） */
   timepoint?: string
+  /** 同一时点内按课次/日期隔离的剂量统计键 */
+  lessonId?: string
   phase?: string
   /** 击球瞬间膝关节屈曲角度（度），优先为真实测量均值，缺失历史记录会退化为估算值 */
   kneeFlexionAngle?: number | null
@@ -421,13 +596,17 @@ export interface GlobalTrainingRecord {
   ankle_rigidity?: number | null
   ankle_rigidity_variance?: number | null
   /** 实验对照组别编码：1 = 实时反馈 A 组，2 = 延时反馈 B 组 */
-  groupTypeCode?: 1 | 2
+  groupTypeCode?: 1 | 2 | 3
+  experimentalGroup?: ExperimentalGroupCode
+  experimental_group?: ExperimentalGroupCode
+  feedbackSuppressed?: boolean
   /** 主要错误分类编码：0=合规，1=支撑脚偏离，2=膝角不足，3=重心后坐 */
   primaryErrorCode?: 0 | 1 | 2 | 3
   /** 8 大黄金指标实测矩阵（历史记录可能缺失） */
   instepKickMetrics?: InstepKickMetrics | null
   /** 五维量化评分矩阵 */
   quantified5dScores?: Quantified5dScores | null
+  scoreDetail?: ScoreDetailPayload | null
   /** 踝角解析值（新旧字段双写兼容） */
   ankle_angle_resolved?: number | null
   ankleAngleResolved?: number | null
@@ -503,6 +682,85 @@ export interface CoachSanitizerRecord {
   lastCalibratedMetric?: string | null
 }
 
+export interface AttemptDetailMetric {
+  key: string
+  label: string
+  value: number
+  unit: string
+  status?: string | null
+  provenance?: string | null
+}
+
+export interface AttemptAigcPrescription {
+  overview: string
+  biomechanicalAnalysis: string
+  correctionCue: string
+  actionPlan: string
+  dosage: string
+  safetyNotice?: string
+  source?: string | null
+  legacyText?: string
+}
+
+export interface SelfCheckCheckin {
+  slotNo: number
+  checked: boolean
+  checkedAt?: string | null
+  note?: string | null
+}
+
+export interface SelfCheckTask {
+  taskId?: string | null
+  sourceRecordId: string
+  dimensionKey: string
+  illustrationKey: string
+  title: string
+  instruction: string
+  successCriterion: string
+  dosage: string
+  targetCount: number
+  templateVersion: string
+  coachVerified: boolean
+  persistenceAvailable?: boolean
+  checkins: SelfCheckCheckin[]
+  createdAt?: string | null
+  updatedAt?: string | null
+}
+
+export interface CoachAttemptReportDetail {
+  id: string
+  studentId: string
+  timestamp: string
+  testDate?: string
+  school?: string
+  classGroup?: string
+  type?: FeedbackRecordType | string
+  groupTypeCode?: number | null
+  score: number | null
+  qualityGrade?: 'A' | 'B' | 'C' | null
+  qualityScore?: number | null
+  qualityGate?: CaptureQualityGate | null
+  reportStatus?: string | null
+  researchEligible?: boolean | null
+  impactFrameAvailable: boolean
+  impactFrameUrl?: string | null
+  impactFrameAsset?: ImpactFrameAsset | null
+  fiveDimensionScores?: Quantified5dScores | null
+  metrics: AttemptDetailMetric[]
+  biomechanicalErrors: string[]
+  aigcPrescription: AttemptAigcPrescription
+  legacyReport?: boolean
+  priorityTarget?: PrescriptionPriorityTarget | null
+  selfCheckTask: SelfCheckTask
+  wordReportPath?: string | null
+}
+
+export interface CoachAttemptReportDetailResponse {
+  success: boolean
+  record?: CoachAttemptReportDetail
+  message?: string
+}
+
 /** GET /api/coach/records 响应 */
 export interface CoachRecordsResponse {
   success: boolean
@@ -547,11 +805,52 @@ export interface ClassPrescriptionReport {
   generatedAt: string
 }
 
-/** 个体纵向进化画像：AI 优缺点总结 */
+export interface IndividualSummaryScoreSummary {
+  history?: number[]
+  mean?: number | null
+  sd?: number | null
+  first?: number | null
+  latest?: number | null
+  change?: number | null
+  slopePerAttempt?: number | null
+}
+
+export interface IndividualSummaryRepresentativeAttempt {
+  id: string
+  timestamp?: string | null
+  testDate?: string | null
+  score?: number | null
+  impactFrameAvailable: boolean
+  impactFrameUrl?: string | null
+}
+
+export interface IndividualSummaryTopError {
+  label: string
+  count: number
+  rate: number
+}
+
+/** 个体纵向进化画像：可直接展示和导出的完整结构化报告。 */
 export interface IndividualSummaryReport {
+  reportId?: string
+  studentId?: string
+  requestedPeriod?: { start?: string | null; end?: string | null }
+  period?: { start?: string | null; end?: string | null }
+  scoreSummary?: IndividualSummaryScoreSummary
+  fiveDimensionScores?: Quantified5dScores | null
+  representativeAttempt?: IndividualSummaryRepresentativeAttempt | null
+  topErrors?: IndividualSummaryTopError[]
+  selfCheckTask?: SelfCheckTask | null
+  overallAssessment?: string
+  progressAnalysis?: string
   strengths: string
   weaknesses: string
+  prescription?: string
+  dosage?: string
   generatedAt: string
+  formalAttemptCount?: number
+  excludedAttemptCount?: number
+  evidenceSummary?: Record<string, unknown> | null
 }
 
 /**
@@ -611,6 +910,12 @@ export interface CohortCompareResponse {
   cohort_a?: string
   cohort_b?: string
   sample_counts?: { a?: number; b?: number }
+  attempt_counts?: { a?: number; b?: number }
+  descriptive?: {
+    cohort_a?: Record<string, number | null>
+    cohort_b?: Record<string, number | null>
+  }
+  filter_scope?: Record<string, unknown>
   trend?: {
     dates: string[]
     cohort_a: CohortTrendPoint[]

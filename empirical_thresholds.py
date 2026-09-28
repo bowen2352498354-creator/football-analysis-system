@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from copy import deepcopy
 from typing import Any, Optional
@@ -20,12 +21,14 @@ DEFAULT_THRESHOLDS_PATH = os.path.join(SCRIPT_DIR, "empirical_thresholds.json")
 # 【V3.5 儿童/业余容错】面向约 10 岁儿童与业余初学者大幅放宽；
 # max_folding_angle = 180 − 后摆膝内角（展示折叠深度时与膝内角互逆）。
 DEFAULT_THRESHOLDS: dict[str, Any] = {
-    "schema_version": 2,
+    "schema_version": 3,
+    "threshold_version": "THESIS_KNEE_140_160_V1",
     "population": "youth_amateur_v35",
     "notes": (
         "V3.8：支撑站位全面改用肩宽归一化比例（废除 PCR 绝对厘米）；"
         "GREEN 0.4–0.7；YELLOW 0.25–0.4/0.7–0.9；RED <0.25/>0.9。"
-        "后摆膝内角 90–130° 为合理发力；触球膝角仅 >165° 触发直腿扣分。"
+        "后摆膝内角 90–130° 为合理发力；触球膝角统一采用 140–160° 绿带、"
+        "130–170° 黄带外沿。"
     ),
     "support_foot_distance_cm": {
         # 【遗留兼容】旧 PCR cm 带；站位评分已切到 support_foot_ratio_shoulder
@@ -78,13 +81,14 @@ DEFAULT_THRESHOLDS: dict[str, Any] = {
         "yellow_low": 320.0,  # [320,450) 线性递增惩罚；<320 判红
         "yellow_penalty_ratio": 0.55,  # 黄带最大惩罚占该维满分比例
     },
-    # 依据: 触球瞬间摆动腿伸展态——仅 >165° 触发直腿严重扣分（儿童容错）
-    # 校准日期: 2026-08-03 | 数据集: youth_amateur_v35
+    # 论文冻结口径：触球瞬间摆动腿膝角 140–160° 为达标区间；
+    # 130–140° / 160–170° 为接近区间；区间外为偏离。
+    # 生效日期: 2026-09-11 | 阈值版本: THESIS_KNEE_140_160_V1
     "impact_knee_angle_deg": {
-        "green_low": 135.0,
-        "green_high": 165.0,
-        "yellow_low": 120.0,
-        "yellow_high": 172.0,
+        "green_low": 140.0,
+        "green_high": 160.0,
+        "yellow_low": 130.0,
+        "yellow_high": 170.0,
         "fallback": 150.0,  # 解算异常时的中性兜底（provenance 必须标 default/missing）
     },
     # 依据: 支撑腿微屈缓冲经验区间（儿童放宽上沿）
@@ -275,17 +279,56 @@ def get_whipping_thresholds(path: Optional[str] = None) -> tuple[float, float, f
 def get_impact_knee_thresholds(path: Optional[str] = None) -> tuple[float, float, float, float, float]:
     """返回 (green_low, green_high, yellow_low, yellow_high, fallback)。
 
-    直腿扣分仅在触球膝角 > green_high(165°) 后进入黄/红带。
+    论文冻结口径：140–160° 绿；130–140° / 160–170° 黄；其余红。
     """
     cfg = load_empirical_thresholds(path)
     block = cfg.get("impact_knee_angle_deg") or {}
     return (
-        float(block.get("green_low", 135.0)),
-        float(block.get("green_high", 165.0)),
-        float(block.get("yellow_low", 120.0)),
-        float(block.get("yellow_high", 172.0)),
+        float(block.get("green_low", 140.0)),
+        float(block.get("green_high", 160.0)),
+        float(block.get("yellow_low", 130.0)),
+        float(block.get("yellow_high", 170.0)),
         float(block.get("fallback", 150.0)),
     )
+
+
+def classify_impact_knee_angle(angle: Any, path: Optional[str] = None) -> str:
+    """按唯一权威阈值返回 GREEN_OPTIMAL / YELLOW_APPROACHING / RED_DEVIATED。"""
+    try:
+        angle_v = float(angle)
+    except (TypeError, ValueError):
+        return "RED_DEVIATED"
+    if not math.isfinite(angle_v):
+        return "RED_DEVIATED"
+    green_low, green_high, yellow_low, yellow_high, _ = get_impact_knee_thresholds(path)
+    if green_low <= angle_v <= green_high:
+        return "GREEN_OPTIMAL"
+    if yellow_low <= angle_v <= yellow_high:
+        return "YELLOW_APPROACHING"
+    return "RED_DEVIATED"
+
+
+def get_threshold_profile(path: Optional[str] = None) -> dict[str, Any]:
+    """返回可供 API/前端/效度验证共同消费的冻结阈值快照。"""
+    cfg = load_empirical_thresholds(path)
+    green_low, green_high, yellow_low, yellow_high, fallback = get_impact_knee_thresholds(path)
+    version = str(cfg.get("threshold_version") or "").strip()
+    if not version:
+        version = f"empirical-v{cfg.get('schema_version', 'unknown')}:{cfg.get('population', 'unknown')}"
+    return {
+        "thresholdVersion": version,
+        "schemaVersion": cfg.get("schema_version"),
+        "population": cfg.get("population"),
+        "impactKneeAngleDeg": {
+            "greenLow": green_low,
+            "greenHigh": green_high,
+            "yellowLow": yellow_low,
+            "yellowHigh": yellow_high,
+            "fallback": fallback,
+            "unit": "deg",
+            "boundaryPolicy": "closed",
+        },
+    }
 
 
 def get_support_knee_thresholds(path: Optional[str] = None) -> tuple[float, float, float, float, float]:
@@ -336,7 +379,7 @@ def get_radar_config(path: Optional[str] = None) -> dict:
 
 
 def assert_defaults_match_production() -> None:
-    """单元测试用：默认绿带必须与 V3.5 儿童/业余容错常数一致。"""
+    """单元测试用：默认绿带必须与当前论文冻结口径一致。"""
     assert DEFAULT_THRESHOLDS["support_foot_distance_cm"]["green_low"] == 15.0
     assert DEFAULT_THRESHOLDS["support_foot_distance_cm"]["green_high"] == 20.0
     assert DEFAULT_THRESHOLDS["support_foot_distance_cm"]["yellow_high"] == 35.0
@@ -348,7 +391,10 @@ def assert_defaults_match_production() -> None:
     assert DEFAULT_THRESHOLDS["max_folding_angle_deg"]["green_high"] == 100.0
     assert DEFAULT_THRESHOLDS["max_folding_angle_deg"]["yellow_low"] == 55.0
     assert DEFAULT_THRESHOLDS["max_folding_angle_deg"]["yellow_high"] == 120.0
-    assert DEFAULT_THRESHOLDS["impact_knee_angle_deg"]["green_high"] == 165.0
+    assert DEFAULT_THRESHOLDS["impact_knee_angle_deg"]["green_low"] == 140.0
+    assert DEFAULT_THRESHOLDS["impact_knee_angle_deg"]["green_high"] == 160.0
+    assert DEFAULT_THRESHOLDS["impact_knee_angle_deg"]["yellow_low"] == 130.0
+    assert DEFAULT_THRESHOLDS["impact_knee_angle_deg"]["yellow_high"] == 170.0
     assert DEFAULT_THRESHOLDS["ankle_rigidity_variance"]["locked_max"] == 10.0
     assert DEFAULT_THRESHOLDS["ankle_rigidity_variance"]["slight_max"] == 20.0
     assert DEFAULT_THRESHOLDS["ankle_rigidity_deflection"]["locked_max"] == 10.0

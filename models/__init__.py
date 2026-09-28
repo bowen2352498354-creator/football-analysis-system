@@ -25,6 +25,7 @@ from models.schemas import (
     TimepointSessionRead,
 )
 from models.shot_attempt_log import ShotAttemptLog
+from models.self_check_task import SelfCheckCheckin, SelfCheckTask
 from models.student_profile import EthicsIdentityMapping, StudentProfile
 from models.timepoint_session import (
     DoseComplianceReport,
@@ -44,6 +45,8 @@ __all__ = [
     "ShotAttemptLog",
     "ShotAttemptLogCreate",
     "ShotAttemptLogRead",
+    "SelfCheckCheckin",
+    "SelfCheckTask",
     "StudentProfile",
     "StudentProfileCreate",
     "StudentProfileRead",

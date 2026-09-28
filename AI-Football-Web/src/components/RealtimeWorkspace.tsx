@@ -24,13 +24,14 @@ import {
   RotateCcw,
   Timer,
   Hand,
+  ClipboardCheck,
+  ShieldCheck,
 } from 'lucide-react'
 import { useTypewriter } from '../hooks/useTypewriter'
 import {
   appendGlobalRecordToLocalStorage,
   getClassGroupDisplayName,
   getSchoolDisplayName,
-  getSmoothAngleBackground,
   LEVEL_COLOR_MAP,
   LEVEL_LABEL_MAP,
   MOCK_RADAR_SCORES,
@@ -57,6 +58,8 @@ import { TRAFFIC_LIGHT } from '../theme/trafficLight'
 interface RealtimeWorkspaceProps {
   /** 来自 Navbar 的全局教学环境设置（学校 + 班级/组别），本工作台只读消费 */
   globalSettings: GlobalSettings
+  /** control 模式复用同一采集管线，但完全屏蔽被试侧反馈 */
+  experimentMode?: 'realtime' | 'control'
 }
 
 /* ============================================================================
@@ -70,6 +73,14 @@ const WS_ANALYZE_URL = 'ws://localhost:8000/ws/analyze'
 
 /** A 组干预：诊断反馈展示态强制视觉驻留时长（毫秒），到期自动闭环回待机 */
 const FEEDBACK_DWELL_MS = 10_000
+
+function currentLessonId(): string {
+  const now = new Date()
+  const year = now.getFullYear()
+  const month = String(now.getMonth() + 1).padStart(2, '0')
+  const day = String(now.getDate()).padStart(2, '0')
+  return `${year}-${month}-${day}`
+}
 
 /** 后台推送的三级容错状态字符串（与 pose_tracker.py judge_knee_status 保持一致） */
 type BackendStatus = 'Green' | 'Yellow' | 'Red'
@@ -108,6 +119,15 @@ interface WsCameraLostMessage {
   type: 'camera_lost'
   message: string
 }
+interface WsClipSavedMessage {
+  type: 'clip_saved'
+  ok: boolean
+  attempt_number?: number
+  frame_count?: number
+  t_impact?: number
+  filename?: string
+  error?: string | null
+}
 type WsMessage =
   | WsFrameMessage
   | WsStartedMessage
@@ -115,6 +135,7 @@ type WsMessage =
   | WsErrorMessage
   | WsNoticeMessage
   | WsCameraLostMessage
+  | WsClipSavedMessage
 
 /** 「自动归档并生成 Word 报告」按钮的当前状态 */
 type WordSaveStatus = 'idle' | 'saving' | 'success' | 'error'
@@ -169,7 +190,11 @@ function statusToLevel(status: BackendStatus | null): ThresholdLevel | null {
  *   - 「结束分析」会真正调用后端 /api/generate_report 接口，由 DeepSeek 大模型
  *     生成本次训练的真实综合诊断报告。
  */
-export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceProps) {
+export default function RealtimeWorkspace({
+  globalSettings,
+  experimentMode = 'realtime',
+}: RealtimeWorkspaceProps) {
+  const isControlMode = experimentMode === 'control'
   /* ---------------------------- 顶栏控制区状态 ---------------------------- */
   const [videoSourceMode, setVideoSourceMode] = useState<VideoSourceMode>('webcam')
   const [localVideoFile, setLocalVideoFile] = useState<File | null>(null)
@@ -188,6 +213,10 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
   const [frameImage, setFrameImage] = useState<string | null>(null)
   const [kneeAngle, setKneeAngle] = useState<number | null>(null)
   const [backendStatus, setBackendStatus] = useState<BackendStatus | null>(null)
+  const pendingStatusRef = useRef<{ status: BackendStatus | null; frames: number }>({
+    status: null,
+    frames: 0,
+  })
 
   /* ---------------------------- 实时动力链角速度监控状态 ---------------------------- */
   /** 全程角速度轨迹（frame_index 递增），供 Kinovea 联动波形图使用 */
@@ -224,19 +253,29 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
 
   const isAnalyzing = analysisStatus === 'analyzing'
   /** 诊断反馈展示态：报告已生成且分析已结束（触发 10s 驻留 / 手动复盘） */
-  const isFeedbackStage = analysisStatus === 'finished' && Boolean(finalReport)
+  const isFeedbackStage = !isControlMode && analysisStatus === 'finished' && Boolean(finalReport)
   /** 测试完成且已有击球关键帧：主视口切到射门瞬间分析画面 */
   const impactAnalysisImage = finalReport?.impactFrameImage ?? null
   const showImpactAnalysisStage =
     Boolean(impactAnalysisImage) &&
     (analysisStatus === 'finished' || (!isAnalyzing && analysisStatus !== 'stopping' && Boolean(finalReport)))
-  const stageImage = showImpactAnalysisStage ? impactAnalysisImage : frameImage
+  const stageImage = isControlMode ? null : showImpactAnalysisStage ? impactAnalysisImage : frameImage
+  const replayVideoUrl = useMemo(() => {
+    if (isControlMode) return null
+    const path = finalReport?.replayVideoPath
+    if (!path) return null
+    if (/^https?:\/\//i.test(path)) return path
+    return `${API_BASE_URL}${path.startsWith('/') ? path : `/${path}`}`
+  }, [finalReport?.replayVideoPath, isControlMode])
   const level = useMemo(() => statusToLevel(backendStatus), [backendStatus])
-  const smoothBackground = useMemo(
-    () => getSmoothAngleBackground(kneeAngle ?? 150),
-    [kneeAngle],
-  )
+  const smoothBackground = useMemo(() => {
+    if (level === 'green') return 'rgb(16, 130, 90)'
+    if (level === 'yellow') return 'rgb(146, 104, 12)'
+    if (level === 'red') return 'rgb(140, 30, 50)'
+    return 'rgb(30, 41, 59)'
+  }, [level])
   const { displayText: reportDisplayText, isDone: isReportDone } = useTypewriter(finalReport?.fullText ?? '', 22)
+  const isQualityRejected = finalReport?.qualityGate?.grade === 'C' || finalReport?.reportStatus === 'rejected'
 
   const totalAttempts = hitStats.green + hitStats.yellow + hitStats.red
 
@@ -291,7 +330,10 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
 
       if (message.angle !== null && message.status !== null) {
         setKneeAngle(message.angle)
-        setBackendStatus(message.status)
+        const pending = pendingStatusRef.current
+        if (pending.status === message.status) pending.frames += 1
+        else pendingStatusRef.current = { status: message.status, frames: 1 }
+        if (pendingStatusRef.current.frames >= 3) setBackendStatus(message.status)
         const nextLevel = statusToLevel(message.status)
         if (nextLevel) {
           setHitStats((stats) => ({ ...stats, [nextLevel]: stats[nextLevel] + 1 }))
@@ -312,6 +354,8 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
     }
 
     if (message.type === 'started') {
+      pendingStatusRef.current = { status: null, frames: 0 }
+      setBackendStatus(null)
       setLastSessionId(message.session_id)
       return
     }
@@ -343,6 +387,15 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
     if (message.type === 'camera_lost') {
       // Sprint 5：摄像头自愈中——保持会话，仅提示教练
       setDiagnosticNotice(message.message || '摄像头信号丢失，尝试重连...')
+      return
+    }
+
+    if (message.type === 'clip_saved') {
+      setDiagnosticNotice(
+        message.ok
+          ? `已捕获第 ${message.attempt_number ?? 1} 次完整射门，结束后将进行精分析`
+          : `射门片段保存失败：${message.error || '将使用实时轨迹生成报告'}`,
+      )
     }
   }
 
@@ -354,15 +407,42 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
       const response = await fetch(`${API_BASE_URL}/api/generate_report`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ session_id: sessionId, student_number: studentNumber }),
+        body: JSON.stringify({
+          session_id: sessionId,
+          student_number: studentNumber,
+          school: getSchoolDisplayName(globalSettings),
+          class_group: getClassGroupDisplayName(globalSettings),
+          experimental_group: isControlMode ? 'GROUP_C_CONTROL' : 'GROUP_A_REALTIME',
+          timepoint: globalSettings.studyTimepoint,
+          lesson_id: currentLessonId(),
+          suppress_feedback: isControlMode,
+          planned_attempts: globalSettings.plannedAttempts,
+        }),
       })
       if (!response.ok) throw new Error(`报告接口返回状态码 ${response.status}`)
       const report = (await response.json()) as FinalDiagnosisReport & { hitStats: ThresholdHitStats }
       setFinalReport(report)
       setHitStats(report.hitStats)
+      if (isControlMode) {
+        const summary = report.attemptLedger?.summary
+        setDiagnosticNotice(
+          report.qualityGate?.grade === 'A'
+            ? `采集已记录：${summary?.validAttempts ?? 0}/${summary?.plannedAttempts ?? globalSettings.plannedAttempts} 次有效 attempt`
+            : `本次 attempt 已标记无效：${report.qualityGate?.summary || '采集质量未达标'}`,
+        )
+      } else if (report.qualityGate?.grade === 'B') {
+        setDiagnosticNotice(`采集质量 B 级：${report.qualityGate.summary}`)
+      } else if (report.qualityGate?.grade === 'C') {
+        const firstReason = report.qualityGate.issues?.[0]?.label
+        setDiagnosticNotice(
+          `${report.qualityGate.summary}${firstReason ? ` 主要原因：${firstReason}。` : ''}`,
+        )
+      } else {
+        setDiagnosticNotice(null)
+      }
 
       // 主视口定格到射门瞬间矢量标注帧（后端 impactFrameImage）
-      if (report.impactFrameImage) {
+      if (!isControlMode && report.impactFrameImage) {
         setFrameImage(report.impactFrameImage)
       }
 
@@ -370,7 +450,7 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
       // 一并挂上 absolute_timestamps，供波形 X 轴与 video.currentTime 精准对齐
       const windowSeries = report.time_series_velocity ?? report.timeSeriesVelocity
       const absTs = report.absolute_timestamps ?? report.absoluteTimestamps
-      if (Array.isArray(windowSeries) && windowSeries.length > 0) {
+      if (!isControlMode && Array.isArray(windowSeries) && windowSeries.length > 0) {
         setOmegaSeries(
           windowSeries.map((omega, index) => {
             const ts = Array.isArray(absTs) ? Number(absTs[index]) : NaN
@@ -392,7 +472,7 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
           : typeof winIdx === 'number' && Number.isFinite(winIdx)
             ? Math.round(winIdx)
             : null
-      if (seekAbs !== null) {
+      if (!isControlMode && seekAbs !== null) {
         setImpactSeek((prev) => ({
           frameIndex: seekAbs,
           token: (prev?.token ?? 0) + 1,
@@ -434,7 +514,14 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
    * 自动静默调用 handleSaveWordReport() 完成本机硬盘写盘 + 全局数据库同步。
    */
   useEffect(() => {
-    if (finalReport && globalSettings.enableDataArchiving && wordSaveStatus === 'idle') {
+    if (
+      finalReport &&
+      finalReport.researchEligible !== false &&
+      finalReport.reportStatus !== 'reference' &&
+      finalReport.reportStatus !== 'rejected' &&
+      globalSettings.enableDataArchiving &&
+      wordSaveStatus === 'idle'
+    ) {
       void handleSaveWordReport()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -558,6 +645,8 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
           action: 'start',
           source: videoSourceMode === 'file' ? 'file' : 'webcam',
           video_path: videoSourceMode === 'file' ? uploadedVideoPath : undefined,
+          experimental_group: isControlMode ? 'GROUP_C_CONTROL' : 'GROUP_A_REALTIME',
+          suppress_feedback: isControlMode,
         }),
       )
       setAnalysisStatus('analyzing')
@@ -616,17 +705,53 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
    */
   async function handleSaveWordReport() {
     if (!finalReport) return
+    if (isQualityRejected) {
+      setDiagnosticNotice('本次采集质量为 C 级，没有可归档的正式报告，请重新采集。')
+      return
+    }
     setWordSaveStatus('saving')
     try {
       const response = await fetch(`${API_BASE_URL}/api/save_word_report`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          mode: 'realtime',
+          mode: isControlMode ? 'control' : 'realtime',
           school: getSchoolDisplayName(globalSettings),
           classGroup: getClassGroupDisplayName(globalSettings),
           studentNumber: studentNumber || '未填写编号',
+          experimentalGroup: isControlMode ? 'GROUP_C_CONTROL' : 'GROUP_A_REALTIME',
+          timepoint: globalSettings.studyTimepoint,
+          lessonId: finalReport.lessonId ?? currentLessonId(),
+          feedbackSuppressed: isControlMode,
+          sourceType: videoSourceMode === 'file' ? 'local_video' : 'webcam',
+          videoHash: finalReport.sourceVideoHash ?? null,
+          interventionAudit: isControlMode
+            ? {
+                feedbackShown: false,
+                trafficLightShown: false,
+                replayShown: false,
+                aiAdviceShown: false,
+                immediateFeedbackShown: false,
+                delayedPresentation: false,
+                operatorPreviewOnly: true,
+              }
+            : {
+                feedbackShown: true,
+                feedbackShownAt: finalReport.generatedAt ?? new Date().toISOString(),
+                trafficLightShown: totalAttempts > 0,
+                replayShown: Boolean(finalReport.replayVideoPath || finalReport.impactFrameImage),
+                aiAdviceShown: Boolean(finalReport.fullText || finalReport.overview),
+                immediateFeedbackShown: true,
+                delayedPresentation: false,
+                operatorPreviewOnly: false,
+              },
+          attemptLedger: finalReport.attemptLedger ?? null,
           score: finalReport.score,
+          reportStatus: finalReport.reportStatus ?? null,
+          formalReportAllowed: finalReport.formalReportAllowed ?? null,
+          referenceFeedbackAllowed: finalReport.referenceFeedbackAllowed ?? null,
+          researchEligible: finalReport.researchEligible ?? null,
+          qualityGate: finalReport.qualityGate ?? null,
           totalAttempts: finalReport.totalAttempts,
           overview: finalReport.overview || finalReport.clinical_echo || finalReport.clinicalEcho || '',
           biomechanical_analysis:
@@ -667,6 +792,14 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
             finalReport.aigc_source || finalReport.aigcSource || null,
           clinical_brief:
             finalReport.clinical_brief || finalReport.clinicalBrief || null,
+          prescriptionEvidence:
+            finalReport.prescriptionEvidence || finalReport.prescription_evidence || null,
+          historyContext:
+            finalReport.historyContext || finalReport.history_context || null,
+          priorityTarget:
+            finalReport.priorityTarget || finalReport.priority_target || null,
+          postprocessAudit: finalReport.postprocessAudit || null,
+          fallbackReason: finalReport.fallbackReason || null,
           t_impact: finalReport.t_impact ?? finalReport.tImpact ?? null,
           tImpact: finalReport.t_impact ?? finalReport.tImpact ?? null,
           generatedAt: finalReport.generatedAt,
@@ -811,8 +944,8 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
-          {/* 自动闭环 / 手动复盘模式切换 */}
-          <div
+          {/* C 组没有复盘阶段，避免向被试暴露任何动作反馈。 */}
+          {!isControlMode && <div
             className="inline-flex items-center gap-0.5 rounded-full border border-slate-700/80 bg-slate-900/60 p-0.5"
             role="group"
             aria-label="复盘模式"
@@ -847,7 +980,7 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
               <Hand className="h-3 w-3" />
               手动复盘
             </button>
-          </div>
+          </div>}
 
           {isAnalyzing || analysisStatus === 'stopping' ? (
             <button
@@ -861,7 +994,7 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
               ) : (
                 <Square className="h-3.5 w-3.5" />
               )}
-              结束分析
+              {isControlMode ? '结束本次采集' : '结束分析'}
             </button>
           ) : isFeedbackStage ? (
             <button
@@ -898,7 +1031,7 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
               className="flex items-center gap-1.5 rounded-full bg-[var(--GREEN_OPTIMAL)] px-4 py-1.5 text-xs font-semibold text-slate-950 transition hover:brightness-110 active:scale-95 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-400"
             >
               <Play className="h-3.5 w-3.5" />
-              开始分析
+              {isControlMode && analysisStatus === 'finished' ? '继续采集' : isControlMode ? '开始采集' : '开始分析'}
             </button>
           )}
         </div>
@@ -923,24 +1056,97 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
 
       {/* ============================ V2.5 三栏沉浸式 Grid：28% / 44% / 28% ============================ */}
       <div className="workbench-grid">
-        <MetricPanel
-          renderMode="GROUP_B"
-          scoreDetail={finalReport?.scoreDetail ?? MOCK_SCORE_DETAIL_V31}
-          metrics={null}
-          errorCodes={resolvedErrorCodes}
-          radarScores={finalReport?.scoreDetail?.radar_scores ?? MOCK_RADAR_SCORES}
-          compareRadarScores={MOCK_RADAR_SCORES_COMPARE}
-          tImpact={finalReport?.tImpact ?? finalReport?.t_impact ?? null}
-          heatmapBase64={
-            finalReport?.heatmap_base64 ??
-            finalReport?.heatmapBase64 ??
-            finalReport?.scoreDetail?.heatmap_base64 ??
-            null
-          }
-        />
+        {isControlMode ? (
+          <ControlProtocolPanel
+            globalSettings={globalSettings}
+            studentNumber={studentNumber}
+            analysisStatus={analysisStatus}
+            qualityGrade={finalReport?.qualityGate?.grade ?? null}
+          />
+        ) : isQualityRejected ? (
+          <section className="workbench-card flex min-h-0 flex-col overflow-hidden">
+            <header className="border-b border-white/10 px-4 py-3">
+              <div className="flex items-center gap-2 text-sm font-semibold text-rose-300">
+                <AlertTriangle className="h-4 w-4" />
+                采集质量 C 级
+              </div>
+              <p className="mt-1 text-xs leading-relaxed text-slate-400">
+                已拦截正式评分，本次数据不会进入科研统计。
+              </p>
+            </header>
+            <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
+              <div className="mb-4 flex items-end justify-between border-b border-white/10 pb-4">
+                <span className="text-xs text-slate-400">质量得分</span>
+                <strong className="text-3xl text-rose-300">{finalReport?.qualityGate?.score ?? 0}</strong>
+              </div>
+              <p className="text-xs leading-relaxed text-slate-300">
+                {finalReport?.qualityGate?.summary}
+              </p>
+              <h3 className="mt-5 text-xs font-semibold text-slate-200">未通过项目</h3>
+              <div className="mt-2 space-y-2">
+                {(finalReport?.qualityGate?.issues ?? []).map((issue) => (
+                  <div key={issue.code} className="border-l-2 border-rose-400 pl-3 text-xs">
+                    <p className="font-medium text-slate-200">{issue.label}</p>
+                    <p className="mt-0.5 text-slate-500">要求：{issue.requirement || '达到采集标准'}</p>
+                  </div>
+                ))}
+              </div>
+              <h3 className="mt-5 text-xs font-semibold text-slate-200">重新采集建议</h3>
+              <div className="mt-2 space-y-2 text-xs leading-relaxed text-slate-400">
+                {(finalReport?.qualityGate?.recommendations ?? []).map((item) => (
+                  <p key={item}>{item}</p>
+                ))}
+              </div>
+            </div>
+          </section>
+        ) : (
+          <MetricPanel
+            renderMode="GROUP_B"
+            scoreDetail={finalReport?.scoreDetail ?? MOCK_SCORE_DETAIL_V31}
+            metrics={null}
+            errorCodes={resolvedErrorCodes}
+            radarScores={finalReport?.scoreDetail?.radar_scores ?? MOCK_RADAR_SCORES}
+            compareRadarScores={MOCK_RADAR_SCORES_COMPARE}
+            tImpact={finalReport?.tImpact ?? finalReport?.t_impact ?? null}
+            heatmapBase64={
+              finalReport?.heatmap_base64 ??
+              finalReport?.heatmapBase64 ??
+              finalReport?.scoreDetail?.heatmap_base64 ??
+              null
+            }
+          />
+        )}
 
+        {isControlMode ? (
+          <section className="workbench-card relative flex min-h-0 items-center justify-center overflow-hidden bg-black">
+            <div className="flex max-w-xs flex-col items-center gap-4 text-center">
+              <span className={`flex h-16 w-16 items-center justify-center rounded-full border ${
+                isAnalyzing || analysisStatus === 'stopping'
+                  ? 'border-emerald-400/40 bg-emerald-500/10 text-emerald-300'
+                  : 'border-white/10 bg-white/5 text-slate-500'
+              }`}>
+                {analysisStatus === 'stopping' ? (
+                  <Loader2 className="h-7 w-7 animate-spin" />
+                ) : (
+                  <ShieldCheck className="h-7 w-7" />
+                )}
+              </span>
+              <div>
+                <p className="text-sm font-semibold text-slate-200">常规 C 组 · {globalSettings.studyTimepoint}</p>
+                <p className="mt-2 text-xs text-slate-500">{STATUS_META[analysisStatus].label}</p>
+              </div>
+              <div className="h-1 w-40 overflow-hidden rounded-full bg-white/10">
+                <motion.div
+                  className="h-full bg-emerald-400"
+                  animate={{ width: isAnalyzing ? ['15%', '85%', '15%'] : analysisStatus === 'finished' ? '100%' : '0%' }}
+                  transition={isAnalyzing ? { duration: 2.4, repeat: Infinity, ease: 'easeInOut' } : { duration: 0.3 }}
+                />
+              </div>
+            </div>
+          </section>
+        ) : (
         <SynchronizedVideoWorkspace
-          videoSrc={videoSourceMode === 'file' ? localVideoObjectUrl : null}
+          videoSrc={videoSourceMode === 'file' ? localVideoObjectUrl : replayVideoUrl}
           velocitySeries={omegaSeries}
           absoluteTimestamps={
             finalReport?.absolute_timestamps ?? finalReport?.absoluteTimestamps ?? null
@@ -948,13 +1154,14 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
           tImpact={finalReport?.tImpact ?? finalReport?.t_impact ?? null}
           impactIndexInWindow={impactIndexInWindow}
           seriesFrameOffset={seriesFrameOffset}
-          fps={30}
+          fps={finalReport?.analysisFps ?? 30}
           autoPlayOnSeek
+          startFromBeginning={Boolean(replayVideoUrl)}
           /* 分析结束后切回本地视频，保证波形 scrub 能同步可见画面（不再被分析帧永久盖住） */
           preferLiveOverlay={
             isAnalyzing ||
             analysisStatus === 'stopping' ||
-            (showImpactAnalysisStage && videoSourceMode !== 'file')
+            (showImpactAnalysisStage && videoSourceMode !== 'file' && !replayVideoUrl)
           }
           externalSeek={impactSeek}
           jointHighlights={
@@ -964,7 +1171,9 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
           }
           title="Video Workspace"
           subtitle={
-            showImpactAnalysisStage
+            replayVideoUrl
+              ? '自动截取完整动作 · 离线精分析 · 触球时序同步回放'
+              : showImpactAnalysisStage
               ? '射门瞬间分析帧 · 髋-膝-踝矢量标注 · 触球窗口定格'
               : '鞭打发力角速度时序 · 触球窗口 t_impact±30 · 教练手绘电烙铁'
           }
@@ -993,7 +1202,7 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
               {showImpactAnalysisStage && (
                 <div className="pointer-events-none absolute top-3 left-3 flex items-center gap-1.5 rounded-full border border-[color-mix(in_srgb,var(--GREEN_OPTIMAL)_40%,transparent)] bg-black/70 px-2.5 py-1 text-[10px] font-semibold text-[var(--GREEN_OPTIMAL)] backdrop-blur-xl">
                   <Crosshair className="h-3 w-3" />
-                  射门瞬间 · 分析帧定格
+                  {replayVideoUrl ? '完整射门回放 · 精分析' : '射门瞬间 · 分析帧定格'}
                 </div>
               )}
 
@@ -1073,7 +1282,15 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
             )}
           </div>
         </SynchronizedVideoWorkspace>
+        )}
 
+        {isControlMode ? (
+          <ControlLedgerPanel
+            globalSettings={globalSettings}
+            report={finalReport}
+            wordSaveStatus={wordSaveStatus}
+          />
+        ) : (
         <AIAssistantPanel
           report={finalReport}
           scoreDetail={finalReport?.scoreDetail ?? null}
@@ -1100,7 +1317,7 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
                 <button
                   type="button"
                   onClick={handleSaveWordReport}
-                  disabled={wordSaveStatus === 'saving'}
+                  disabled={wordSaveStatus === 'saving' || isQualityRejected}
                   className={`flex items-center justify-center gap-2 rounded-xl py-2.5 text-xs font-bold transition active:scale-95 disabled:cursor-not-allowed disabled:opacity-70 ${
                     wordSaveStatus === 'success'
                       ? 'bg-[var(--GREEN_OPTIMAL)] text-slate-950'
@@ -1118,7 +1335,9 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
                   ) : (
                     <Save className="h-3.5 w-3.5" />
                   )}
-                  {wordSaveStatus === 'saving'
+                  {isQualityRejected
+                    ? '质量未达标，不归档'
+                    : wordSaveStatus === 'saving'
                     ? '写入 Word…'
                     : wordSaveStatus === 'success'
                       ? '已归档 Word'
@@ -1190,6 +1409,7 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
             )
           }
         />
+        )}
       </div>
 
       <AnimatePresence>
@@ -1218,6 +1438,107 @@ export default function RealtimeWorkspace({ globalSettings }: RealtimeWorkspaceP
         )}
       </AnimatePresence>
     </div>
+  )
+}
+
+function ControlProtocolPanel({
+  globalSettings,
+  studentNumber,
+  analysisStatus,
+  qualityGrade,
+}: {
+  globalSettings: GlobalSettings
+  studentNumber: string
+  analysisStatus: AnalysisStatus
+  qualityGrade: 'A' | 'B' | 'C' | null
+}) {
+  return (
+    <section className="workbench-card flex min-h-0 flex-col overflow-hidden">
+      <header className="border-b border-white/10 px-4 py-3">
+        <div className="flex items-center gap-2 text-sm font-semibold text-slate-200">
+          <ShieldCheck className="h-4 w-4 text-emerald-300" />
+          对照组采集协议
+        </div>
+        <p className="mt-1 text-xs text-slate-500">GROUP_C_CONTROL</p>
+      </header>
+      <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-4 text-xs">
+        {[
+          ['实验时点', globalSettings.studyTimepoint],
+          ['学生编号', studentNumber || '未填写'],
+          ['班级', getClassGroupDisplayName(globalSettings)],
+          ['当前状态', STATUS_META[analysisStatus].label],
+          ['采集质控', qualityGrade ? `${qualityGrade} 级` : '等待本次完成'],
+        ].map(([label, value]) => (
+          <div key={label} className="flex items-center justify-between gap-3 border-b border-white/5 pb-3">
+            <span className="text-slate-500">{label}</span>
+            <span className="max-w-[62%] truncate text-right font-medium text-slate-200">{value}</span>
+          </div>
+        ))}
+        <div className="mt-auto border-l-2 border-emerald-400/60 pl-3 leading-relaxed text-slate-400">
+          数据按统一姿态、运动学和质量门控管线处理。
+        </div>
+      </div>
+    </section>
+  )
+}
+
+function ControlLedgerPanel({
+  globalSettings,
+  report,
+  wordSaveStatus,
+}: {
+  globalSettings: GlobalSettings
+  report: FinalDiagnosisReport | null
+  wordSaveStatus: WordSaveStatus
+}) {
+  const summary = report?.attemptLedger?.summary
+  const valid = summary?.validAttempts ?? 0
+  const planned = summary?.plannedAttempts ?? globalSettings.plannedAttempts
+  const ratio = planned > 0 ? Math.min(100, (valid / planned) * 100) : 0
+  const attemptValid = report?.attemptLedger?.attempt?.valid
+  return (
+    <section className="workbench-card flex min-h-0 flex-col overflow-hidden">
+      <header className="border-b border-white/10 px-4 py-3">
+        <div className="flex items-center gap-2 text-sm font-semibold text-slate-200">
+          <ClipboardCheck className="h-4 w-4 text-sky-300" />
+          实验剂量台账
+        </div>
+        <p className="mt-1 text-xs text-slate-500">{globalSettings.studyTimepoint} · 有效 attempt 自动计数</p>
+      </header>
+      <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-4">
+        <div className="border-b border-white/10 pb-4">
+          <div className="flex items-end justify-between">
+            <span className="text-xs text-slate-500">有效次数</span>
+            <strong className="text-3xl tabular-nums text-slate-100">{valid}<span className="text-sm text-slate-500"> / {planned}</span></strong>
+          </div>
+          <div className="mt-3 h-2 overflow-hidden rounded-full bg-white/10">
+            <motion.div className="h-full bg-emerald-400" animate={{ width: `${ratio}%` }} />
+          </div>
+        </div>
+        <div className="grid grid-cols-2 gap-2 text-center">
+          <div className="rounded-md bg-white/5 p-3">
+            <p className="text-lg font-semibold tabular-nums text-slate-200">{summary?.invalidAttempts ?? 0}</p>
+            <p className="mt-1 text-[10px] text-slate-500">无效次数</p>
+          </div>
+          <div className="rounded-md bg-white/5 p-3">
+            <p className="text-lg font-semibold tabular-nums text-slate-200">{summary?.remainingAttempts ?? planned}</p>
+            <p className="mt-1 text-[10px] text-slate-500">剩余有效次数</p>
+          </div>
+        </div>
+        {report && (
+          <div className={`border-l-2 pl-3 text-xs leading-relaxed ${
+            attemptValid ? 'border-emerald-400 text-emerald-200' : 'border-amber-400 text-amber-200'
+          }`}>
+            {attemptValid
+              ? `Attempt #${report.attemptLedger?.attempt?.attemptOrdinal ?? '-'} 已计入正式样本。`
+              : `本次未计入正式样本：${report.attemptLedger?.attempt?.invalidReasons?.[0]?.label ?? '采集质量未达标'}`}
+          </div>
+        )}
+        <p className="mt-auto text-[10px] text-slate-600">
+          归档状态：{wordSaveStatus === 'success' ? '已落盘' : wordSaveStatus === 'saving' ? '正在落盘' : '等待完成'}
+        </p>
+      </div>
+    </section>
   )
 }
 
