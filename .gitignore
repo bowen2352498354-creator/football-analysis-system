@@ -12,6 +12,8 @@ student feedback report/
 report-assets/
 academic_data_export/
 gold_standard_data/
+diagnostic_traces/
+experiment_attempt_ledger.json
 telestration_annotations/
 *.docx
 *.csv
